@@ -26,6 +26,7 @@ Web-based dashboard for monitoring trunk-recorder status in real-time with live 
 - **UI themes** (Nostromo, Classic, Hot Dog Stand)
 - **HTTPS support**
 - **No external dependencies**!
+- **More and more stuff!!!**
 
 ## Install
 
@@ -38,7 +39,7 @@ Web-based dashboard for monitoring trunk-recorder status in real-time with live 
 ```bash
 cd [your trunk-recorder github source directory]
 cd user_plugins
-git clone [this repo]
+git clone https://github.com/taclane/tr-web.git
 cd [your trunk-recorder build directory]
 cmake ..
 make
@@ -49,7 +50,7 @@ sudo make install
 
 **Plugin Usage:**
 
-Add the plugin to your trunk-recorder `config.json`:
+Add the plugin to your trunk-recorder `config.json` to get started:
 
 ```json
 {
@@ -58,7 +59,6 @@ Add the plugin to your trunk-recorder `config.json`:
       "library": "libtr_web_plugin.so",
       "name": "tr-web",
       "port": 8080,
-      "bind": "0.0.0.0",
       "admin_username": "trunkadmin",
       "admin_password": "admintrunk"
     }

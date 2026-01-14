@@ -20,12 +20,12 @@ Web-based dashboard for monitoring trunk-recorder status in real-time with live 
 - **Historical charts** for decode rates and call activity (5m, 15m, 60m views)
 - **Recorder status** with detailed device information
 - **System information** including control channels, talkgroups, and unit tags
-- **Live console** output with ANSI color support
-- **Admin panel** with configuration editor and restart controls
+- **Live console** output
+- **Admin panel** with basic configuration editor and restart controls
 - **Two-tier authentication** (info-level and admin-level access)
-- **Three UI themes** (Nostromo, Classic, Hot Dog Stand)
-- **HTTPS support** with TLS 1.2+ enforcement
-- **No external dependencies** (pure C++ with OpenSSL)
+- **UI themes** (Nostromo, Classic, Hot Dog Stand)
+- **HTTPS support**
+- **No external dependencies**!
 
 ## Install
 

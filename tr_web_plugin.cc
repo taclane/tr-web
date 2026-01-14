@@ -69,7 +69,6 @@ class Tr_Web : public Plugin_Api {
     json cached_calls_;
     json cached_systems_;
     json cached_devices_;
-    json cached_config_;
     json cached_rates_;
 
     // Parsed trunk-recorder config.json (best-effort)
@@ -110,8 +109,7 @@ class Tr_Web : public Plugin_Api {
         DIRTY_RECORDERS = 1u << 1,
         DIRTY_CALLS     = 1u << 2,
         DIRTY_RATES     = 1u << 3,
-        DIRTY_DEVICES   = 1u << 4,
-        DIRTY_CONFIG    = 1u << 5
+        DIRTY_DEVICES   = 1u << 4
     };
 
     void enqueue_sse_event(const std::string& event, std::string data) {
@@ -123,8 +121,6 @@ class Tr_Web : public Plugin_Api {
         }
         event_queue_.emplace_back(event, std::move(data));
     }
-    
-    time_t last_broadcast_time_ = 0;
     
     // State maps (same as mqtt_status)
     std::map<short, std::string> tr_state_ = {
@@ -534,16 +530,6 @@ public:
         return 0;
     }
     
-    int poll_one() override {
-        // Broadcast updates every second
-        time_t now = time(NULL);
-        if (now - last_broadcast_time_ >= 1) {
-            broadcast_updates();
-            last_broadcast_time_ = now;
-        }
-        return 0;
-    }
-    
     int setup_systems(std::vector<System *> systems) override {
         json systems_json = json::array();
         for (auto* sys : systems) {
@@ -738,6 +724,14 @@ private:
             response["consoleLogs"] = get_console_logs();
             response["timestamp"] = time(NULL);
             response["sse_clients"] = server_.sse_client_count();
+            
+            // Clear pending console queue after initial inload
+            {
+                std::lock_guard<std::mutex> lock(console_pending_mutex_);
+                console_pending_.clear();
+                console_pending_dropped_ = 0;
+            }
+            
             res.set_content(response.dump(), "application/json");
         });
         
@@ -1075,11 +1069,6 @@ private:
             };
             res.set_content(health.dump(), "application/json");
         });
-    }
-    
-    void broadcast_updates() {
-        // This is called by poll_one() every second
-        // Most SSE events are sent from the individual callbacks
     }
     
     void resend_recorders() {

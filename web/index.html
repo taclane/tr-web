@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trunk-Recorder Status</title>
+    <style>/* INJECT_CSS */</style>
+</head>
+<body>
+    <div class="header">
+        <div style="display: flex; align-items: center; gap: 15px; color: var(--accent);">
+            <svg width="40" height="40" viewBox="0 0 1200 1200" xmlns="http://www.w3.org/2000/svg" style="flex-shrink: 0; fill: currentColor;">
+                <path d="m787.35 373.6v-291.25c9.5273-8.7461 15.938-20.941 15.938-35.004-0.003906-26.086-21.254-47.34-47.512-47.34-26.258 0-47.496 21.254-47.496 47.34 0 14.062 6.4062 26.258 15.938 35.004v287.03h-92.664v-104.69c0-17.34-14.219-31.402-31.559-31.402-17.496 0-31.559 14.062-31.559 31.402v104.69h-70.621v-57.816c0-26.09-21.254-47.184-47.34-47.184-26.09 0-47.34 21.098-47.34 47.184v66.875c-18.914 10.945-32.355 30.625-32.355 53.918v254.69c0 34.691 9.6836 78.59 21.562 97.656s21.562 62.965 21.562 97.656v254.53c0 34.691 28.441 63.133 63.121 63.133h245.94c34.691 0 63.133-28.441 63.133-63.133v-254.54c0-34.691 9.6953-78.59 21.562-97.656 11.867-19.066 21.562-62.965 21.562-97.656l0.003907-254.68c-0.011719-27.191-17.676-49.848-41.879-58.75zm-1.2617 305.62h-372.18v-31.559h372.19v31.559zm0-66.25h-372.18v-31.559h372.19v31.559zm0-66.41h-372.18v-31.559h372.19v31.559zm0-66.25h-372.18v-31.559h372.19v31.559z"/>
+            </svg>
+            <h1 style="margin: 0;">Trunk-Recorder Status</h1>
+        </div>
+        <div class="header-right">
+            <div class="theme-picker">
+                <label for="themeSelect" class="theme-label">Theme</label>
+                <select id="themeSelect" class="theme-select" aria-label="Theme">
+                    <option value="nostromo">Nostromo</option>
+                    <option value="classic">Classic</option>
+                    <option value="hotdog">Hot Dog Stand</option>
+                </select>
+            </div>
+            <div class="user-info" style="display: flex; align-items: center; gap: 10px; margin-right: 15px;">
+                <span id="authLevel" style="display: none;"></span>
+                <button id="logoutBtn" onclick="logout()" style="display: none; padding: 4px 12px; font-size: 12px; cursor: pointer;">Logout</button>
+            </div>
+            <div class="status-indicator">
+                <span class="status-dot" id="connectionStatus"></span>
+                <span id="connectionText">Connecting...</span>
+                <span class="last-update" id="lastUpdate"></span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="container">
+        <!-- Main Navigation Tabs -->
+        <div class="main-tabs">
+            <button class="main-tab active" data-tab="status" onclick="showMainTab('status')">Status</button>
+            <button class="main-tab" data-tab="recorders" onclick="showMainTab('recorders')">Recorders / Devices</button>
+            <button class="main-tab" data-tab="systems" onclick="showMainTab('systems')">Systems</button>
+            <button class="main-tab" data-tab="console" onclick="showMainTab('console')">Console</button>
+            <button class="main-tab" data-tab="admin" onclick="showMainTab('admin')">Admin</button>
+        </div>
+        
+        <!-- Status Panel -->
+        <div class="main-panel active" id="panel-status">
+            <div class="stats-row" id="globalStats">
+                <div class="stat-box">
+                    <div class="stat-value" id="statSystems">0</div>
+                    <div class="stat-label">Systems</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="statRecorders">0</div>
+                    <div class="stat-label">Recorders</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="statActiveCalls">0</div>
+                    <div class="stat-label">Active Calls</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="statRecording">0</div>
+                    <div class="stat-label">Recording</div>
+                </div>
+            </div>
+            
+            <div class="status-grid">
+                <!-- Top Left: Decode Rate History -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Decode Rate History</span>
+                    </div>
+                    <div class="chart-tabs">
+                        <button class="chart-tab active" data-period="5m" data-chart="rate" onclick="setChartPeriod('5m')">5 min</button>
+                        <button class="chart-tab" data-period="15m" data-chart="rate" onclick="setChartPeriod('15m')">15 min</button>
+                        <button class="chart-tab" data-period="60m" data-chart="rate" onclick="setChartPeriod('60m')">60 min</button>
+                    </div>
+                    <div class="chart-canvas-container chart-compact">
+                        <canvas id="rateChart" class="chart-canvas"></canvas>
+                    </div>
+                    <div class="chart-legend" id="chartLegend"></div>
+                </div>
+
+                <!-- Top Right: Call Rate History -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Call Rate History</span>
+                    </div>
+                    <div class="chart-tabs">
+                        <button class="chart-tab active" data-period="5m" data-chart="calls" onclick="setCallChartPeriod('5m')">5 min</button>
+                        <button class="chart-tab" data-period="15m" data-chart="calls" onclick="setCallChartPeriod('15m')">15 min</button>
+                        <button class="chart-tab" data-period="60m" data-chart="calls" onclick="setCallChartPeriod('60m')">60 min</button>
+                    </div>
+                    <div class="chart-canvas-container chart-compact">
+                        <canvas id="callRateChart" class="chart-canvas"></canvas>
+                    </div>
+                    <div class="chart-legend" id="callChartLegend"></div>
+                </div>
+
+                <!-- Bottom Row: Calls and Details -->
+                <div class="status-grid-bottom">
+                    <!-- Combined Active/Recent Calls -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">Calls</span>
+                            <div class="card-header-right">
+                                <span class="card-badge" id="activeCallCount">0 active</span>
+                                <span class="theme-label">Keep</span>
+                                <select id="recentRetention" class="theme-select" aria-label="Recent Calls retention">
+                                    <option value="10">10</option>
+                                    <option value="20" selected>20</option>
+                                    <option value="50">50</option>
+                                    <option value="100">100</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <table id="allCallsTable">
+                                <colgroup>
+                                    <col class="calls-col-callnum" />
+                                    <col class="calls-col-system" />
+                                    <col class="calls-col-tg" />
+                                    <col class="calls-col-alpha" />
+                                    <col class="calls-col-freq" />
+                                    <col class="calls-col-unit" />
+                                    <col class="calls-col-time" />
+                                    <col class="calls-col-state" />
+                                </colgroup>
+                                <thead>
+                                    <tr>
+                                        <th>Call#</th>
+                                        <th>System</th>
+                                        <th>TG</th>
+                                        <th>Alpha</th>
+                                        <th>Freq</th>
+                                        <th>Unit</th>
+                                        <th>Time/Len</th>
+                                        <th>State</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Details (Call Inspector) -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">Details</span>
+                        </div>
+                        <div class="details-table-container" id="detailsPane"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recorders / Devices Panel -->
+        <div class="main-panel" id="panel-recorders">
+            <div class="grid">
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Recorders</span>
+                        <span class="card-badge" id="recorderCount">0</span>
+                    </div>
+                    <div class="table-container">
+                        <table id="recordersTable">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>Type</th>
+                                    <th>Freq</th>
+                                    <th>State</th>
+                                    <th>Duration</th>
+                                    <th>Count</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Devices</span>
+                        <span class="card-badge" id="deviceCount">0</span>
+                    </div>
+                    <div class="device-grid" id="devicesGrid"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Systems Panel -->
+        <div class="main-panel" id="panel-systems">
+            <div class="card full-width">
+                <div class="card-header">
+                    <span class="card-title">Systems</span>
+                </div>
+                <div class="tabs" id="systemTabs"></div>
+                <div id="systemPanels"></div>
+            </div>
+        </div>
+        
+        <!-- Console Panel -->
+        <div class="main-panel" id="panel-console">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Console Output</span>
+                    <div class="card-header-right">
+                        <label class="checkbox">
+                            <input type="checkbox" id="wrapToggle" checked />
+                            <span>Wrap</span>
+                        </label>
+                        <button class="console-button" onclick="jumpToBottom()">Jump to Bottom</button>
+                    </div>
+                </div>
+                <div class="console-container" id="consoleOutput"></div>
+            </div>
+        </div>
+        
+        <!-- Admin Panel -->
+        <div class="main-panel" id="panel-admin">
+            <div style="display: flex; gap: 0; height: calc(100vh - 180px);">
+                <!-- Admin Sidebar Menu -->
+                <div style="width: 200px; background: var(--bg-card); border-right: 1px solid var(--border); padding: 10px 0;">
+                    <button class="admin-menu-item active" data-section="status" onclick="showAdminSection('status')" style="width: 100%; text-align: left; padding: 12px 20px; background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 14px; border-left: 3px solid transparent; transition: all 0.2s;">
+                        System Status
+                    </button>
+                    <button class="admin-menu-item" data-section="editor" onclick="showAdminSection('editor')" style="width: 100%; text-align: left; padding: 12px 20px; background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 14px; border-left: 3px solid transparent; transition: all 0.2s;">
+                        Advanced Editor
+                    </button>
+                    <button class="admin-menu-item" data-section="history" onclick="showAdminSection('history')" style="width: 100%; text-align: left; padding: 12px 20px; background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 14px; border-left: 3px solid transparent; transition: all 0.2s;">
+                        Login History
+                    </button>
+                </div>
+                
+                <!-- Admin Content Area -->
+                <div style="flex: 1; overflow-y: auto; padding: 20px;">
+                    <!-- System Status Section -->
+                    <div class="admin-section active" id="admin-status">
+                        <div class="card full-width">
+                            <div class="card-header">
+                                <span class="card-title">System Control</span>
+                            </div>
+                            <div style="padding: 20px;">
+                                <p style="margin-bottom: 15px; color: var(--warning);"><strong>Warning:</strong> A restart script or service is required to apply configuration changes and ensure Trunk-Recorder returns online.</p>
+                                <button onclick="restartTrunkRecorder()" style="padding: 12px 24px; font-size: 16px; font-weight: bold; background: #dc3545; color: white; border: 2px solid #bd2130; border-radius: 6px; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='#c82333'" onmouseout="this.style.background='#dc3545'">⚠️ Restart Trunk-Recorder</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Advanced Editor Section -->
+                    <div class="admin-section" id="admin-editor" style="display: none;">
+                        <div class="card full-width">
+                            <div class="card-header">
+                                <span class="card-title">Advanced Configuration Editor</span>
+                                <div class="card-header-right">
+                                    <span id="configStatus" style="margin-right: 10px; font-size: 0.9em;"></span>
+                                    <button class="console-button" onclick="reloadConfig()" style="margin-right: 5px;">Reload</button>
+                                    <button class="console-button" onclick="saveConfig()" style="background: var(--accent-green); border-color: var(--accent-green);">Save Config</button>
+                                </div>
+                            </div>
+                            <div style="padding: 10px; display: flex; flex-direction: column; height: calc(100vh - 300px);">
+                                <div class="json-editor-container" style="display: flex; min-height: 400px; max-height: calc(100vh - 400px); flex: 1; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; background: var(--bg-dark);">
+                                    <div id="lineNumbers" style="background: #1a1a1a; color: #666; padding: 12px 8px; text-align: right; font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 13px; line-height: 1.5; user-select: none; border-right: 1px solid var(--border); overflow: hidden; white-space: pre; min-width: 60px;"></div>
+                                    <div class="json-editor-wrapper" style="flex: 1; position: relative; overflow: auto;">
+                                        <pre id="configHighlight" class="json-highlight" aria-hidden="true"></pre>
+                                        <textarea id="configEditor" spellcheck="false" class="json-editor"></textarea>
+                                    </div>
+                                </div>
+                                <div id="configValidation" style="margin-top: 8px; padding: 10px; border-radius: 4px; display: none; line-height: 1.3;"></div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Login History Section -->
+                    <div class="admin-section" id="admin-history" style="display: none;">
+                        <div class="card full-width">
+                            <div class="card-header">
+                                <span class="card-title">Login History</span>
+                                <div class="card-header-right">
+                                    <button class="console-button" onclick="refreshLoginHistory()">Refresh</button>
+                                </div>
+                            </div>
+                            <table class="table">
+                                <thead>
+                                    <tr>
+                                        <th>Timestamp</th>
+                                        <th>Username</th>
+                                        <th>IP Address</th>
+                                        <th>Access Level</th>
+                                        <th>Result</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="loginHistoryTable">
+                                    <tr><td colspan="5">Loading...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>/* INJECT_JS */</script>
+</body>
+</html>

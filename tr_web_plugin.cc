@@ -15,18 +15,22 @@
 #include <iomanip>
 #include <fstream>
 
-#include <trunk-recorder/source.h>
-#include <trunk-recorder/systems/system_impl.h>
-#include <json.hpp>
-#include <trunk-recorder/plugin_manager/plugin_api.h>
+// Trunk-Recorder headers
+#include "../../trunk-recorder/source.h"
+#include "../../trunk-recorder/systems/system_impl.h"
+#include "../../lib/json.hpp"
+#include "../../trunk-recorder/plugin_manager/plugin_api.h"
+
+// System/library headers
 #include <boost/dll/alias.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/log/sinks/sync_frontend.hpp>
 #include <boost/log/sinks/text_ostream_backend.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 
+// Plugin headers
 #include "httplib.h"
-#include "web_assets.h"  // Auto-generated during build
+#include "web_assets.h" 
 
 using namespace std;
 using json = nlohmann::json;

@@ -1,18 +1,16 @@
 # tr-web: Web Status Plugin for Trunk-Recorder
 # A lightweight web dashboard with no external dependencies beyond trunk-recorder's existing requirements
 
-# Generate embedded web assets header
+# Generate embedded web assets header using a basic shell script
 set(TR_WEB_ASSETS_HEADER "${CMAKE_CURRENT_BINARY_DIR}/web_assets.h")
 set(TR_WEB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/web")
+set(EMBED_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/embed_assets.sh")
 
 add_custom_command(
     OUTPUT ${TR_WEB_ASSETS_HEADER}
-    COMMAND ${CMAKE_COMMAND} -E env python3 
-            ${CMAKE_CURRENT_SOURCE_DIR}/embed_assets.py 
-            ${TR_WEB_DIR} 
-            ${TR_WEB_ASSETS_HEADER}
+    COMMAND ${EMBED_SCRIPT} ${TR_WEB_DIR} ${TR_WEB_ASSETS_HEADER}
     DEPENDS 
-        ${CMAKE_CURRENT_SOURCE_DIR}/embed_assets.py
+        ${EMBED_SCRIPT}
         ${TR_WEB_DIR}/index.html
         ${TR_WEB_DIR}/style.css
         ${TR_WEB_DIR}/app.js

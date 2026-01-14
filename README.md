@@ -34,7 +34,9 @@ Web-based dashboard for monitoring trunk-recorder status in real-time with live 
 
 2. **Build and install the plugin:**
 
-&emsp; This pluigin source should be cloned into the `/user_plugins` directory of the Trunk Recorder 5.0+ source tree.  It will be built and installed along with Trunk Recorder.
+&emsp; This plugin source should be cloned into the `/user_plugins` directory of the Trunk Recorder 5.0+ source tree.  It will be built and installed along with Trunk Recorder.
+
+**Note**: The build uses a minimal shell script with standard Unix tools (`sh`, `sed`, `cat`) to embed web assets into the `web_assets.h` header.
 
 ```bash
 cd [your trunk-recorder github source directory]

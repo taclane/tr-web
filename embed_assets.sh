@@ -2,6 +2,7 @@
 # embed_assets.sh - Shell script alternative to embed_assets.py
 # Generates C++ header with embedded web assets using only basic shell tools
 # Usage: embed_assets.sh <web_dir> <output_header>
+# Requires: basically just sed
 
 set -e
 
@@ -35,15 +36,16 @@ fi
 TEMP_HTML=$(mktemp)
 trap "rm -f '$TEMP_HTML'" EXIT
 
-# Read HTML and inject CSS and JS
-# Using sed to replace markers with file contents
-sed -e '/\/\* INJECT_CSS \*\// {
+sed '/<style>\/\* INJECT_CSS \*\/<\/style>/ {
+    s|<style>.*</style>|<style>|
     r '"$CSS_FILE"'
-    d
-}' -e '/\/\* INJECT_JS \*\// {
+    a </style>
+}' "$HTML_FILE" | \
+sed '/<script>\/\* INJECT_JS \*\/<\/script>/ {
+    s|<script>.*</script>|<script>|
     r '"$JS_FILE"'
-    d
-}' "$HTML_FILE" > "$TEMP_HTML"
+    a </script>
+}' > "$TEMP_HTML"
 
 # Generate the C++ header file
 cat > "$OUTPUT_FILE" << 'EOF_HEADER'

@@ -91,6 +91,10 @@ class Tr_Web : public Plugin_Api {
     std::deque<json> call_history_;
     static const size_t MAX_CALL_HISTORY = 100;
     
+    // Track previous calls to detect disappearances (encrypted calls)
+    mutable std::mutex previous_calls_mutex_;
+    std::map<long, json> previous_calls_map_;  // call_num -> call_json
+    
     // Console log buffer
     mutable std::mutex console_mutex_;
     std::deque<std::string> console_logs_;
@@ -579,6 +583,9 @@ public:
     int calls_active(std::vector<Call *> calls) override {
         tr_calls_ = calls;
         
+        // Build current calls map for tracking
+        std::map<long, json> current_calls_map;
+        
         // Count calls per system for rate tracking
         std::map<std::string, int> calls_by_system;
         
@@ -586,17 +593,44 @@ public:
         for (auto* call : calls) {
             if (call->get_current_length() > 0 || !call->is_conventional()) {
                 json call_json = get_call_json(call);
+                long call_num = call->get_call_num();
                 
-                // Override sys_name with unique name for deconfliction
+                current_calls_map[call_num] = call_json;
+                
                 System* sys = call->get_system();
                 if (sys) {
                     std::string unique_name = get_unique_sys_name(sys);
-                    call_json["sys_name"] = unique_name;
                     calls_by_system[unique_name]++;
                 }
                 
                 calls_json.push_back(call_json);
             }
+        }
+        
+        // Detect disappeared calls (synthetic call_end for encrypted calls)
+        {
+            std::lock_guard<std::mutex> lock(previous_calls_mutex_);
+            for (const auto& prev_pair : previous_calls_map_) {
+                long prev_call_num = prev_pair.first;
+                const json& prev_call_json = prev_pair.second;
+                
+                // If call was in previous snapshot but not current, it disappeared
+                if (current_calls_map.find(prev_call_num) == current_calls_map.end()) {
+                    bool was_encrypted = prev_call_json.value("encrypted", false);
+                    
+                    if (was_encrypted) {
+                        // Cache the encrypted call that disappeared
+                        cache_call(prev_call_json);
+                        
+                        // Send synthetic call_end event to frontend
+                        json payload = {{"type", "call_end"}, {"call", prev_call_json}};
+                        enqueue_sse_event("call_end", payload.dump());
+                    }
+                }
+            }
+            
+            // Update previous calls map for next iteration
+            previous_calls_map_ = current_calls_map;
         }
         
         // Add call rate data points (including zero for systems with no active calls)

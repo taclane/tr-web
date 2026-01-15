@@ -304,15 +304,20 @@ function connect() {
 
         state.calls = nextCalls;
         
-        // Track call rates per system
+        // Track call rates per system (using numbered names for consistency)
         const timestamp = Date.now();
         const callsBySys = {};
         nextCalls.forEach(call => {
-            const sysName = call.sys_name || call.short_name || 'Unknown';
-            callsBySys[sysName] = (callsBySys[sysName] || 0) + 1;
+            // Generate numbered system name: "N. shortname"
+            const sysNum = call.sys_num;
+            const shortName = call.sys_name || call.short_name || 'Unknown';
+            const numberedName = (sysNum !== undefined && sysNum !== null) 
+                ? `${sysNum + 1}. ${shortName}` 
+                : shortName;
+            callsBySys[numberedName] = (callsBySys[numberedName] || 0) + 1;
         });
         
-        // Initialize and update call rate history for all active systems
+        // Update call rate history for systems with active calls
         Object.keys(callsBySys).forEach(sysName => {
             if (!state.callRateHistory[sysName]) {
                 state.callRateHistory[sysName] = [];
@@ -331,18 +336,18 @@ function connect() {
         
         // For systems with no active calls, add zero data point
         state.systems.forEach(sys => {
-            const sysName = sys.shortName || sys.name;
-            if (!callsBySys[sysName]) {
-                if (!state.callRateHistory[sysName]) {
-                    state.callRateHistory[sysName] = [];
+            const numberedName = `${sys.sys_num + 1}. ${sys.sys_name}`;
+            if (!callsBySys[numberedName]) {
+                if (!state.callRateHistory[numberedName]) {
+                    state.callRateHistory[numberedName] = [];
                 }
-                state.callRateHistory[sysName].push({
+                state.callRateHistory[numberedName].push({
                     time: timestamp,
                     count: 0
                 });
                 
                 const oneHourAgo = timestamp - (60 * 60 * 1000);
-                state.callRateHistory[sysName] = state.callRateHistory[sysName].filter(
+                state.callRateHistory[numberedName] = state.callRateHistory[numberedName].filter(
                     point => point.time > oneHourAgo
                 );
             }

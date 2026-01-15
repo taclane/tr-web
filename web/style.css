@@ -709,6 +709,266 @@ tr.selected {
     font-weight: 700;
 }
 
+/* Omnitrunker Styles */
+.omni-container {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    height: calc(100vh - 150px);
+}
+
+.omni-channels {
+    flex: 0 0 auto;
+    max-height: 40%;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.omni-channels-container {
+    overflow-y: auto;
+    flex: 1;
+    min-height: 400px; /* ~10 rows */
+    background: var(--bg-secondary);
+    border-radius: 6px;
+}
+
+.omni-channel-freq {
+    color: var(--accent-cyan);
+    font-family: 'Courier New', monospace;
+    font-weight: 500;
+}
+
+.omni-channel-tg {
+    color: var(--accent-green);
+    font-weight: 500;
+}
+
+.omni-channel-alpha {
+    color: var(--text-primary);
+}
+
+.omni-channel-source {
+    color: var(--accent-orange);
+    font-family: 'Courier New', monospace;
+}
+
+.omni-channel-alias {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.omni-channel-elapsed {
+    color: var(--accent-yellow);
+    font-family: 'Courier New', monospace;
+    font-size: 0.8rem;
+}
+
+.omni-channel-mode {
+    color: var(--accent-cyan);
+    font-weight: 600;
+    font-size: 0.75rem;
+}
+
+.omni-resize-handle {
+    height: 8px;
+    cursor: ns-resize;
+    background: var(--border);
+    border-radius: 4px;
+    transition: background 0.2s;
+    flex-shrink: 0;
+}
+
+.omni-resize-handle:hover {
+    background: var(--accent);
+}
+
+.omni-resize-handle:active {
+    background: var(--accent-green);
+}
+
+.empty-state {
+    text-align: center;
+    padding: 2rem;
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.omni-messages {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.omni-messages-container {
+    overflow-y: auto;
+    flex: 1;
+    background: var(--bg-secondary);
+    border-radius: 6px;
+}
+
+.omni-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.omni-table thead {
+    position: sticky;
+    top: 0;
+    background: var(--bg-card);
+    z-index: 10;
+}
+
+.omni-table th {
+    padding: 0.5rem 0.5rem;
+    text-align: left;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    border-bottom: 2px solid var(--border);
+    font-weight: 600;
+}
+
+.omni-table td {
+    padding: 0.35rem 0.5rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8rem;
+    line-height: 1.2;
+}
+
+.omni-table tbody tr:hover {
+    background: var(--bg-primary);
+}
+
+.omni-msg-time {
+    color: var(--text-secondary);
+    font-family: 'Courier New', monospace;
+    font-size: 0.75rem;
+    white-space: nowrap;
+}
+
+.omni-msg-system {
+    color: var(--accent-blue);
+    font-weight: 500;
+    font-size: 0.8rem;
+}
+
+.omni-msg-site {
+    color: var(--text-secondary);
+    font-family: 'Courier New', monospace;
+    font-size: 0.75rem;
+}
+
+.omni-msg-unit {
+    color: var(--accent-orange);
+    font-family: 'Courier New', monospace;
+    font-size: 0.75rem;
+}
+
+.omni-msg-alias {
+    color: var(--text-secondary);
+    font-style: italic;
+    font-size: 0.75rem;
+}
+
+.omni-msg-type {
+    display: inline-block;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    line-height: 1;
+}
+
+.omni-msg-type-GRANT {
+    background: var(--accent-green);
+    color: #000;
+}
+
+.omni-msg-type-AFFILIATION {
+    background: var(--accent-purple);
+    color: #fff;
+}
+
+.omni-msg-type-REGISTRATION {
+    background: var(--accent-cyan);
+    color: #000;
+}
+
+.omni-msg-type-DEREGISTRATION {
+    background: var(--accent-orange);
+    color: #000;
+}
+
+.omni-msg-type-ACKNOWLEDGE {
+    background: var(--accent-yellow);
+    color: #000;
+}
+
+.omni-msg-type-DATA_GRANT {
+    background: var(--accent-blue);
+    color: #000;
+}
+
+.omni-msg-type-ANSWER_REQUEST {
+    background: var(--accent-pink);
+    color: #000;
+}
+
+.omni-msg-type-LOCATION {
+    background: var(--text-secondary);
+    color: #000;
+}
+
+.omni-msg-type-STATUS {
+    background: var(--accent-yellow);
+    color: #000;
+}
+
+.omni-msg-type-CONTROL_CHANNEL {
+    background: var(--text-secondary);
+    color: #fff;
+}
+
+.omni-msg-type-PATCH_ADD {
+    background: var(--accent-green);
+    color: #000;
+}
+
+.omni-msg-type-PATCH_DELETE {
+    background: var(--accent);
+    color: #fff;
+}
+
+.omni-msg-type-SYSID {
+    background: var(--accent-purple);
+    color: #fff;
+}
+
+.omni-encrypted-badge {
+    display: inline-block;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.65rem;
+    font-weight: 600;
+    background: var(--accent);
+    color: #fff;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.omni-msg-tg {
+    color: var(--accent-green);
+    font-weight: 500;
+}
+
+.omni-msg-tg-alpha {
+    color: var(--text-primary);
+}
+
+
 .sev-info {
     color: var(--text-secondary);
 }

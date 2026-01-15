@@ -42,6 +42,7 @@
             <button class="main-tab" data-tab="recorders" onclick="showMainTab('recorders')">Recorders / Devices</button>
             <button class="main-tab" data-tab="systems" onclick="showMainTab('systems')">Systems</button>
             <button class="main-tab" data-tab="console" onclick="showMainTab('console')">Console</button>
+            <button class="main-tab" data-tab="omnitrunker" onclick="showMainTab('omnitrunker')">Omnitrunker</button>
             <button class="main-tab" data-tab="admin" onclick="showMainTab('admin')">Admin</button>
         </div>
         
@@ -216,6 +217,102 @@
                     </div>
                 </div>
                 <div class="console-container" id="consoleOutput"></div>
+            </div>
+        </div>
+        
+        <!-- Omnitrunker Panel -->
+        <div class="main-panel" id="panel-omnitrunker">
+            <div class="omni-container">
+                <!-- Voice Channels Table -->
+                <div class="card omni-channels">
+                    <div class="card-header">
+                        <span class="card-title">Active Voice Channels</span>
+                        <div class="card-header-right">
+                            <select id="omniSystemFilter" onchange="filterOmniSystem()">
+                                <option value="">All Systems</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="omni-channels-container">
+                        <table class="omni-table">
+                            <thead>
+                                <tr>
+                                    <th>System</th>
+                                    <th>Channel</th>
+                                    <th>Talkgroup</th>
+                                    <th>Alpha Tag</th>
+                                    <th>Source</th>
+                                    <th>Unit Alias</th>
+                                    <th>Elapsed</th>
+                                    <th>Mode</th>
+                                    <th>Encryption</th>
+                                </tr>
+                            </thead>
+                            <tbody id="voiceChannelsBody">
+                                <tr><td colspan="9" class="empty-state">No active voice channels</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                
+                <!-- Resize Handle -->
+                <div class="omni-resize-handle" id="omniResizeHandle"></div>
+                
+                <!-- Unit Activity Log -->
+                <div class="card omni-messages">
+                    <div class="card-header">
+                        <span class="card-title">Unit Activity</span>
+                        <div class="card-header-right">
+                            <label style="font-size: 0.85rem; color: var(--text-secondary); margin-right: 5px;">Buffer:</label>
+                            <select id="omniBufferSize" onchange="changeOmniBuffer()" style="margin-right: 10px;">
+                                <option value="200">200</option>
+                                <option value="400">400</option>
+                                <option value="600" selected>600</option>
+                                <option value="800">800</option>
+                                <option value="1000">1000</option>
+                            </select>
+                            <select id="omniMsgTypeFilter" onchange="filterOmniMessages()">
+                                <option value="">All Types</option>
+                                <option value="GRANT">GRANT</option>
+                                <option value="AFFILIATION">AFFILIATION</option>
+                                <option value="REGISTRATION">REGISTRATION</option>
+                                <option value="DEREGISTRATION">DEREGISTRATION</option>
+                                <option value="ACKNOWLEDGE">ACKNOWLEDGE</option>
+                                <option value="DATA_GRANT">DATA_GRANT</option>
+                                <option value="ANSWER_REQUEST">ANSWER_REQUEST</option>
+                                <option value="LOCATION">LOCATION</option>
+                                <option value="STATUS">STATUS</option>
+                                <option value="CONTROL_CHANNEL">CONTROL_CHANNEL</option>
+                                <option value="PATCH_ADD">PATCH_ADD</option>
+                                <option value="PATCH_DELETE">PATCH_DELETE</option>
+                                <option value="SYSID">SYSID</option>
+                            </select>
+                            <label class="checkbox">
+                                <input type="checkbox" id="omniAutoScroll" checked />
+                                <span>Auto-scroll</span>
+                            </label>
+                            <button class="console-button" onclick="clearOmniMessages()">Clear</button>
+                        </div>
+                    </div>
+                    <div class="omni-messages-container">
+                        <table class="omni-table">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>System</th>
+                                    <th>Site ID</th>
+                                    <th>Unit ID</th>
+                                    <th>Unit Alias</th>
+                                    <th>Type</th>
+                                    <th>Talkgroup</th>
+                                    <th>TG Alpha</th>
+                                </tr>
+                            </thead>
+                            <tbody id="omniMessagesBody">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
         </div>
         

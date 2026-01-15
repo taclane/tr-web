@@ -31,7 +31,13 @@ const state = {
     callRateHistory: {},  // Per-system call count history
     config: null,
     consoleLogs: [],
-    consoleMaxLines: 5000  // Default, overridden by backend config
+    consoleMaxLines: 5000,  // Default, overridden by backend config
+    trunkMessages: [],  // Omnitrunker: control channel messages
+    unitAffiliations: {},  // Omnitrunker: unit -> talkgroup map
+    omniSystemFilter: '',
+    omniMsgTypeFilter: '',
+    omniAutoScroll: true,
+    omniBufferSize: 600  // Default buffer size for unit activity
 };
 
 const CALL_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
@@ -465,6 +471,33 @@ function connect() {
             }
             updateRecordersTable();
             updateStats();
+        }
+    });
+    
+    eventSource.addEventListener('unit_event', (e) => {
+        const data = JSON.parse(e.data);
+        if (data.event) {
+            // Push to messages log
+            state.trunkMessages.push(data.event);
+            // Trim to buffer size
+            if (state.trunkMessages.length > state.omniBufferSize) {
+                state.trunkMessages.shift();
+            }
+            updateOmniMessages();
+            
+            // Track affiliations
+            if (data.event.msg_type === 'AFFILIATION') {
+                const key = `${data.event.sys_name}_${data.event.unit}`;
+                state.unitAffiliations[key] = {
+                    sys_name: data.event.sys_name,
+                    unit: data.event.unit,
+                    talkgroup: data.event.talkgroup,
+                    timestamp: data.event.timestamp
+                };
+            } else if (data.event.msg_type === 'DEREGISTRATION') {
+                const key = `${data.event.sys_name}_${data.event.unit}`;
+                delete state.unitAffiliations[key];
+            }
         }
     });
 }
@@ -1251,6 +1284,13 @@ function showMainTab(tabName) {
             if (container) {
                 container.scrollTop = container.scrollHeight;
             }
+        }, 0);
+    } else if (tabName === 'omnitrunker') {
+        // Initialize Omnitrunker when tab is opened
+        setTimeout(() => {
+            initOmnitrunker();
+            updateVoiceChannels();
+            updateOmniMessages();
         }, 0);
     } else if (tabName === 'admin') {
         // Load admin data when tab is opened
@@ -2373,6 +2413,10 @@ document.addEventListener('DOMContentLoaded', () => {
             if (data.devices) state.devices = data.devices;
             if (data.rateHistory) state.rateHistory = data.rateHistory;
             if (data.callRateHistory) state.callRateHistory = data.callRateHistory;
+            if (data.trunkMessages) state.trunkMessages = data.trunkMessages;
+            if (data.unitAffiliations) {
+                state.unitAffiliations = data.unitAffiliations;
+            }
             if (data.consoleLogs) {
                 state.consoleLogs = data.consoleLogs;
                 hasScrolledConsole = false;
@@ -2464,6 +2508,217 @@ document.addEventListener('DOMContentLoaded', () => {
         updateCallsTable();
     }, 500);
     
+    // Update voice channels periodically
+    setInterval(() => {
+        updateVoiceChannels();
+    }, 1000);
+    
     // Load admin data when admin tab is shown
     window.showMainTab = showMainTab;
 });
+
+// Omnitrunker Functions
+
+function initOmnitrunker() {
+    const systemFilter = document.getElementById('omniSystemFilter');
+    if (systemFilter && state.systems.length) {
+        const currentValue = systemFilter.value;
+        systemFilter.innerHTML = '<option value="">All Systems</option>';
+        state.systems.forEach(sys => {
+            const opt = document.createElement('option');
+            const sysName = sys.unique_sys_name || sys.short_name || sys.sys_name;
+            opt.value = sysName;
+            opt.textContent = sysName;
+            systemFilter.appendChild(opt);
+        });
+        systemFilter.value = currentValue;
+    }
+    
+    // Set buffer size selector
+    const bufferSel = document.getElementById('omniBufferSize');
+    if (bufferSel) {
+        bufferSel.value = state.omniBufferSize.toString();
+    }
+    
+    // Load filter preferences
+    const autoScrollCb = document.getElementById('omniAutoScroll');
+    if (autoScrollCb) {
+        state.omniAutoScroll = autoScrollCb.checked;
+        autoScrollCb.addEventListener('change', () => {
+            state.omniAutoScroll = autoScrollCb.checked;
+        });
+    }
+    
+    setupOmniResize();
+}
+
+function setupOmniResize() {
+    const handle = document.getElementById('omniResizeHandle');
+    const channelsPanel = document.querySelector('.omni-channels');
+    
+    if (!handle || !channelsPanel) return;
+    
+    const MIN_PERCENT = 20;
+    const MAX_PERCENT = 80;
+    let isResizing = false;
+    
+    handle.addEventListener('mousedown', (e) => {
+        isResizing = true;
+        document.body.style.cursor = 'ns-resize';
+        document.body.style.userSelect = 'none';
+        e.preventDefault();
+    });
+    
+    document.addEventListener('mousemove', (e) => {
+        if (!isResizing) return;
+        
+        const container = document.querySelector('.omni-container');
+        if (!container) return;
+        
+        const rect = container.getBoundingClientRect();
+        const percent = Math.max(MIN_PERCENT, Math.min(MAX_PERCENT, 
+            ((e.clientY - rect.top) / rect.height) * 100));
+        
+        channelsPanel.style.flex = `0 0 ${percent}%`;
+        channelsPanel.style.maxHeight = 'none';
+    });
+    
+    document.addEventListener('mouseup', () => {
+        if (isResizing) {
+            isResizing = false;
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+        }
+    });
+}
+
+function filterOmniSystem() {
+    const sel = document.getElementById('omniSystemFilter');
+    if (sel) {
+        state.omniSystemFilter = sel.value;
+        updateVoiceChannels();
+        updateOmniMessages();
+    }
+}
+
+function filterOmniMessages() {
+    const sel = document.getElementById('omniMsgTypeFilter');
+    if (sel) {
+        state.omniMsgTypeFilter = sel.value;
+        updateOmniMessages();
+    }
+}
+
+function clearOmniMessages() {
+    state.trunkMessages = [];
+    updateOmniMessages();
+}
+
+function changeOmniBuffer() {
+    const sel = document.getElementById('omniBufferSize');
+    if (sel) {
+        state.omniBufferSize = parseInt(sel.value);
+        // Trim to new size if needed
+        if (state.trunkMessages.length > state.omniBufferSize) {
+            state.trunkMessages = state.trunkMessages.slice(-state.omniBufferSize);
+        }
+        updateOmniMessages();
+    }
+}
+
+function updateVoiceChannels() {
+    const tbody = document.getElementById('voiceChannelsBody');
+    if (!tbody) return;
+    
+    // Filter active calls by system if needed - use call_state_type from backend
+    let activeCalls = state.calls.filter(c => c.call_state_type && c.call_state_type !== 'MONITORING');
+    if (state.omniSystemFilter) {
+        // Use unique_sys_name from backend
+        activeCalls = activeCalls.filter(c => c.unique_sys_name === state.omniSystemFilter);
+    }
+    
+    if (activeCalls.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No active voice channels</td></tr>';
+        return;
+    }
+    
+    // Sort by frequency
+    activeCalls.sort((a, b) => (a.freq || 0) - (b.freq || 0));
+    
+    tbody.innerHTML = activeCalls.map(call => {
+        const sysName = call.sys_name || `System ${call.sys_num}`;
+        const freq = call.freq ? (call.freq / 1e6).toFixed(4) : '---';
+        const tg = call.talkgroup || '---';
+        const tgAlpha = call.talkgroup_alpha_tag || '';
+        const source = call.unit || '';
+        const srcAlias = call.unit_alpha_tag || '';
+        const elapsed = call.elapsed ? `${call.elapsed}s` : '';
+        // Consolidate mode and slot: FDMA, TDMA-0, TDMA-1
+        const mode = call.phase2_tdma ? `TDMA-${call.tdma_slot}` : 'FDMA';
+        const encrypted = call.encrypted ? '<span class="omni-encrypted-badge">ENCRYPTED</span>' : '';
+        
+        return `
+            <tr>
+                <td class="omni-msg-system">${escapeHtml(sysName)}</td>
+                <td class="omni-channel-freq">${freq}</td>
+                <td class="omni-channel-tg">${tg}</td>
+                <td class="omni-channel-alpha">${escapeHtml(tgAlpha)}</td>
+                <td class="omni-channel-source">${source}</td>
+                <td class="omni-channel-alias">${escapeHtml(srcAlias)}</td>
+                <td class="omni-channel-elapsed">${elapsed}</td>
+                <td class="omni-channel-mode">${mode}</td>
+                <td class="omni-channel-encrypted">${encrypted}</td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function updateOmniMessages() {
+    const tbody = document.getElementById('omniMessagesBody');
+    if (!tbody) return;
+    
+    // Filter messages
+    let messages = state.trunkMessages;
+    
+    if (state.omniSystemFilter) {
+        messages = messages.filter(m => m.unique_sys_name === state.omniSystemFilter);
+    }
+    
+    if (state.omniMsgTypeFilter) {
+        messages = messages.filter(m => m.msg_type === state.omniMsgTypeFilter);
+    }
+    
+    // Show most recent messages up to buffer size, reversed (newest first)
+    const recent = messages.slice(-state.omniBufferSize).reverse();
+    
+    tbody.innerHTML = recent.map(msg => {
+        const time = new Date(msg.timestamp * 1000).toLocaleTimeString();
+        const msgType = msg.msg_type || 'UNKNOWN';
+        const siteId = msg.site_id || '';
+        const unit = msg.unit || '';
+        const unitAlias = msg.unit_alias || '';
+        const tg = msg.talkgroup || '';
+        const tgAlpha = msg.tg_alpha || '';
+        
+        return `
+            <tr>
+                <td class="omni-msg-time">${time}</td>
+                <td class="omni-msg-system">${escapeHtml(msg.sys_name || '')}</td>
+                <td class="omni-msg-site">${siteId}</td>
+                <td class="omni-msg-unit">${unit}</td>
+                <td class="omni-msg-alias">${escapeHtml(unitAlias)}</td>
+                <td><span class="omni-msg-type omni-msg-type-${msgType}">${msgType}</span></td>
+                <td class="omni-msg-tg">${tg}</td>
+                <td class="omni-msg-tg-alpha">${escapeHtml(tgAlpha)}</td>
+            </tr>
+        `;
+    }).join('');
+    
+    // With reverse chrono (newest first), scroll to top to see new messages
+    if (state.omniAutoScroll) {
+        const container = document.querySelector('.omni-messages-container');
+        if (container) {
+            container.scrollTop = 0;
+        }
+    }
+}

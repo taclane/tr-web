@@ -95,6 +95,15 @@ class Tr_Web : public Plugin_Api {
     mutable std::mutex previous_calls_mutex_;
     std::map<long, json> previous_calls_map_;  // call_num -> call_json
     
+    // Trunking message buffer (for Omnitrunker tab)
+    mutable std::mutex trunk_messages_mutex_;
+    std::deque<json> trunk_messages_;
+    static const size_t MAX_TRUNK_MESSAGES = 500;
+    
+    // Unit affiliation tracking (unit_id -> talkgroup)
+    mutable std::mutex unit_affiliations_mutex_;
+    std::map<long, long> unit_affiliations_;
+    
     // Console log buffer
     mutable std::mutex console_mutex_;
     std::deque<std::string> console_logs_;
@@ -118,6 +127,7 @@ class Tr_Web : public Plugin_Api {
         DIRTY_RECORDERS = 1u << 1,
         DIRTY_CALLS     = 1u << 2,
         DIRTY_RATES     = 1u << 3,
+        DIRTY_TRUNK_MESSAGES = 1u << 4,
         DIRTY_DEVICES   = 1u << 4
     };
 
@@ -141,6 +151,27 @@ class Tr_Web : public Plugin_Api {
         {6, "STOPPED"},
         {7, "AVAILABLE"},
         {8, "IGNORE"}
+    };
+    
+    // Message type mappings for trunk messages
+    std::map<short, std::string> message_type_ = {
+        {0, "GRANT"},
+        {1, "STATUS"},
+        {2, "UPDATE"},
+        {3, "CONTROL_CHANNEL"},
+        {4, "REGISTRATION"},
+        {5, "DEREGISTRATION"},
+        {6, "AFFILIATION"},
+        {7, "SYSID"},
+        {8, "ACKNOWLEDGE"},
+        {9, "LOCATION"},
+        {10, "PATCH_ADD"},
+        {11, "PATCH_DELETE"},
+        {12, "DATA_GRANT"},
+        {13, "UU_ANS_REQ"},
+        {14, "UU_V_GRANT"},
+        {15, "UU_V_UPDATE"},
+        {99, "UNKNOWN"}
     };
 
     // Custom logging backend to capture console output
@@ -250,6 +281,32 @@ public:
             history.push_back(call);
         }
         return history;
+    }
+    
+    void cache_trunk_message(const json& msg_json) {
+        std::lock_guard<std::mutex> lock(trunk_messages_mutex_);
+        trunk_messages_.push_back(msg_json);
+        while (trunk_messages_.size() > MAX_TRUNK_MESSAGES) {
+            trunk_messages_.pop_front();
+        }
+    }
+    
+    json get_trunk_messages() const {
+        std::lock_guard<std::mutex> lock(trunk_messages_mutex_);
+        json messages = json::array();
+        for (const auto& msg : trunk_messages_) {
+            messages.push_back(msg);
+        }
+        return messages;
+    }
+    
+    json get_unit_affiliations() const {
+        std::lock_guard<std::mutex> lock(unit_affiliations_mutex_);
+        json affiliations = json::object();
+        for (const auto& pair : unit_affiliations_) {
+            affiliations[std::to_string(pair.first)] = pair.second;
+        }
+        return affiliations;
     }
     
     // Generate display name for system with number prefix
@@ -655,6 +712,211 @@ public:
         json call_json = get_call_json(call);
         json payload = {{"type", "call_start"}, {"call", call_json}};
         enqueue_sse_event("call_start", payload.dump());
+        
+        // Also log as a GRANT event for Omnitrunker
+        System *sys = call->get_system();
+        long source_id = call->get_current_source_id();
+        long talkgroup_num = call->get_talkgroup();
+        
+        std::string tg_alpha = "";
+        Talkgroup *tg = sys->find_talkgroup(talkgroup_num);
+        if (tg) {
+            tg_alpha = tg->alpha_tag;
+        }
+        
+        std::string unit_alias = sys->find_unit_tag(source_id);
+        
+        json event_json = {
+            {"timestamp", time(NULL)},
+            {"sys_name", sys->get_short_name()},
+            {"unique_sys_name", get_unique_sys_name(sys)},
+            {"site_id", sys->get_sys_site_id()},
+            {"unit", source_id},
+            {"unit_alias", unit_alias},
+            {"msg_type", "GRANT"},
+            {"talkgroup", talkgroup_num},
+            {"tg_alpha", tg_alpha}
+        };
+        
+        cache_trunk_message(event_json);
+        
+        json grant_payload = {{"type", "unit_event"}, {"event", event_json}};
+        enqueue_sse_event("unit_event", grant_payload.dump());
+        
+        dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
+        return 0;
+    }
+    
+    int unit_group_affiliation(System *sys, long source_id, long talkgroup_num) override {
+        {
+            std::lock_guard<std::mutex> lock(unit_affiliations_mutex_);
+            unit_affiliations_[source_id] = talkgroup_num;
+        }
+        
+        // Look up talkgroup alpha tag
+        std::string tg_alpha = "";
+        Talkgroup *tg = sys->find_talkgroup(talkgroup_num);
+        if (tg) {
+            tg_alpha = tg->alpha_tag;
+        }
+        
+        // Look up unit alias
+        std::string unit_alias = sys->find_unit_tag(source_id);
+        
+        // Build event for log
+        json event_json = {
+            {"timestamp", time(NULL)},
+            {"sys_name", sys->get_short_name()},
+            {"unique_sys_name", get_unique_sys_name(sys)},
+            {"site_id", sys->get_sys_site_id()},
+            {"unit", source_id},
+            {"unit_alias", unit_alias},
+            {"msg_type", "AFFILIATION"},
+            {"talkgroup", talkgroup_num},
+            {"tg_alpha", tg_alpha}
+        };
+        
+        cache_trunk_message(event_json);
+        
+        json payload = {{"type", "unit_event"}, {"event", event_json}};
+        enqueue_sse_event("unit_event", payload.dump());
+        
+        dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
+        return 0;
+    }
+    
+    int unit_registration(System *sys, long source_id) override {
+        // Look up unit alias
+        std::string unit_alias = sys->find_unit_tag(source_id);
+        
+        json event_json = {
+            {"timestamp", time(NULL)},
+            {"sys_name", sys->get_short_name()},
+            {"unique_sys_name", get_unique_sys_name(sys)},
+            {"site_id", sys->get_sys_site_id()},
+            {"unit", source_id},
+            {"unit_alias", unit_alias},
+            {"msg_type", "REGISTRATION"},
+            {"talkgroup", nullptr},
+            {"tg_alpha", ""}
+        };
+        
+        cache_trunk_message(event_json);
+        
+        json payload = {{"type", "unit_event"}, {"event", event_json}};
+        enqueue_sse_event("unit_event", payload.dump());
+        
+        dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
+        return 0;
+    }
+    
+    int unit_deregistration(System *sys, long source_id) override {
+        {
+            std::lock_guard<std::mutex> lock(unit_affiliations_mutex_);
+            unit_affiliations_.erase(source_id);
+        }
+        
+        // Look up unit alias
+        std::string unit_alias = sys->find_unit_tag(source_id);
+        
+        json event_json = {
+            {"timestamp", time(NULL)},
+            {"sys_name", sys->get_short_name()},
+            {"unique_sys_name", get_unique_sys_name(sys)},
+            {"site_id", sys->get_sys_site_id()},
+            {"unit", source_id},
+            {"unit_alias", unit_alias},
+            {"msg_type", "DEREGISTRATION"},
+            {"talkgroup", nullptr},
+            {"tg_alpha", ""}
+        };
+        
+        cache_trunk_message(event_json);
+        
+        json payload = {{"type", "unit_event"}, {"event", event_json}};
+        enqueue_sse_event("unit_event", payload.dump());
+        
+        dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
+        return 0;
+    }
+    
+    int unit_acknowledge_response(System *sys, long source_id) override {
+        json event_json = {
+            {"timestamp", time(NULL)},
+            {"sys_name", sys->get_short_name()},
+            {"unique_sys_name", get_unique_sys_name(sys)},
+            {"site_id", sys->get_sys_site_id()},
+            {"unit", source_id},
+            {"unit_alias", sys->find_unit_tag(source_id)},
+            {"msg_type", "ACKNOWLEDGE"},
+            {"talkgroup", nullptr},
+            {"tg_alpha", ""}
+        };
+        
+        cache_trunk_message(event_json);
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
+        dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
+        return 0;
+    }
+    
+    int unit_data_grant(System *sys, long source_id) override {
+        json event_json = {
+            {"timestamp", time(NULL)},
+            {"sys_name", sys->get_short_name()},
+            {"unique_sys_name", get_unique_sys_name(sys)},
+            {"site_id", sys->get_sys_site_id()},
+            {"unit", source_id},
+            {"unit_alias", sys->find_unit_tag(source_id)},
+            {"msg_type", "DATA_GRANT"},
+            {"talkgroup", nullptr},
+            {"tg_alpha", ""}
+        };
+        
+        cache_trunk_message(event_json);
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
+        dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
+        return 0;
+    }
+    
+    int unit_answer_request(System *sys, long source_id, long talkgroup_num) override {
+        Talkgroup *tg = sys->find_talkgroup(talkgroup_num);
+        
+        json event_json = {
+            {"timestamp", time(NULL)},
+            {"sys_name", sys->get_short_name()},
+            {"unique_sys_name", get_unique_sys_name(sys)},
+            {"site_id", sys->get_sys_site_id()},
+            {"unit", source_id},
+            {"unit_alias", sys->find_unit_tag(source_id)},
+            {"msg_type", "ANSWER_REQUEST"},
+            {"talkgroup", talkgroup_num},
+            {"tg_alpha", tg ? tg->alpha_tag : ""}
+        };
+        
+        cache_trunk_message(event_json);
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
+        dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
+        return 0;
+    }
+    
+    int unit_location(System *sys, long source_id, long talkgroup_num) override {
+        Talkgroup *tg = sys->find_talkgroup(talkgroup_num);
+        
+        json event_json = {
+            {"timestamp", time(NULL)},
+            {"sys_name", sys->get_short_name()},
+            {"unique_sys_name", get_unique_sys_name(sys)},
+            {"site_id", sys->get_sys_site_id()},
+            {"unit", source_id},
+            {"unit_alias", sys->find_unit_tag(source_id)},
+            {"msg_type", "LOCATION"},
+            {"talkgroup", talkgroup_num},
+            {"tg_alpha", tg ? tg->alpha_tag : ""}
+        };
+        
+        cache_trunk_message(event_json);
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
+        dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
     
@@ -769,6 +1031,8 @@ private:
             response["rateHistory"] = get_rate_history();
             response["callRateHistory"] = get_call_rate_history();
             response["callHistory"] = get_call_history();
+            response["trunkMessages"] = get_trunk_messages();
+            response["unitAffiliations"] = get_unit_affiliations();
             response["consoleLogs"] = get_console_logs();
             response["timestamp"] = time(NULL);
             response["sse_clients"] = server_.sse_client_count();
@@ -1222,16 +1486,18 @@ private:
     
     json get_call_json(Call *call) {
         boost::property_tree::ptree stat_node = call->get_stats();
-        Talkgroup *tg = call->get_system()->find_talkgroup(stat_node.get<int>("talkgroup"));
+        System *sys = call->get_system();
+        Talkgroup *tg = sys->find_talkgroup(stat_node.get<int>("talkgroup"));
         
         json call_json = {
             {"id", stat_node.get<std::string>("id")},
             {"call_num", stat_node.get<long>("callNum")},
             {"sys_num", stat_node.get<int>("sysNum")},
             {"sys_name", stat_node.get<std::string>("shortName")},
+            {"unique_sys_name", get_unique_sys_name(sys)},
             {"freq", stat_node.get<double>("freq")},
             {"unit", stat_node.get<long>("srcId")},
-            {"unit_alpha_tag", call->get_system()->find_unit_tag(stat_node.get<long>("srcId"))},
+            {"unit_alpha_tag", sys->find_unit_tag(stat_node.get<long>("srcId"))},
             {"talkgroup", stat_node.get<int>("talkgroup")},
             {"talkgroup_alpha_tag", ""},
             {"talkgroup_description", ""},
@@ -1240,6 +1506,7 @@ private:
             {"call_state", stat_node.get<int>("state")},
             {"call_state_type", tr_state_[stat_node.get<int>("state")]},
             {"phase2_tdma", stat_node.get<bool>("phase2")},
+            {"tdma_slot", call->get_tdma_slot()},
             {"analog", stat_node.get<bool>("analog", false)},
             {"conventional", stat_node.get<bool>("conventional")},
             {"encrypted", stat_node.get<bool>("encrypted")},
@@ -1287,6 +1554,8 @@ private:
         return {
             {"sys_num", stat_node.get<int>("id")},
             {"sys_name", stat_node.get<std::string>("name")},
+            {"short_name", sys->get_short_name()},
+            {"unique_sys_name", get_unique_sys_name(sys)},
             {"type", stat_node.get<std::string>("type")},
             {"sysid", int_to_hex(stat_node.get<int>("sysid"), 0)},
             {"wacn", int_to_hex(stat_node.get<int>("wacn"), 0)},

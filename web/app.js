@@ -30,7 +30,8 @@ const state = {
     rateHistory: {},  // Per-system rate history
     callRateHistory: {},  // Per-system call count history
     config: null,
-    consoleLogs: []
+    consoleLogs: [],
+    consoleMaxLines: 5000  // Default, overridden by backend config
 };
 
 const CALL_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
@@ -533,17 +534,45 @@ function updateRecordersTable() {
     
     count.textContent = state.recorders.length;
     
-    tbody.innerHTML = state.recorders.map(r => `
-        <tr>
-            <td>${r.id || r.rec_num}</td>
-            <td>${r.type || '-'}</td>
-            <td class="freq">${formatFreq(r.freq)}</td>
-            <td>${getStateBadge(r.rec_state_type)}</td>
-            <td>${(r.duration || 0).toFixed(1)}s</td>
-            <td>${r.count || 0}</td>
-        </tr>
-    `).join('');
+    // Group recorders by source
+    const bySource = {};
+    state.recorders.forEach(r => {
+        const srcNum = r.src_num || r.srcNum || 0;
+        if (!bySource[srcNum]) bySource[srcNum] = [];
+        bySource[srcNum].push(r);
+    });
     
+    // Build table with source separators
+    let html = '';
+    Object.keys(bySource).sort((a, b) => Number(a) - Number(b)).forEach(srcNum => {
+        const recorders = bySource[srcNum];
+        
+        // Source header row
+        html += `
+            <tr class="source-separator">
+                <td colspan="6" style="background: var(--bg-tertiary); font-weight: bold; padding: 8px; border-top: 2px solid var(--border);">
+                    Source ${srcNum} (${recorders.length} recorders)
+                </td>
+            </tr>
+        `;
+        
+        // Recorder rows
+        recorders.forEach(r => {
+            const recNum = r.rec_num || r.recNum || 0;
+            html += `
+                <tr>
+                    <td style="padding-left: 20px;">${srcNum}-${recNum}</td>
+                    <td>${r.type || '-'}</td>
+                    <td class="freq">${formatFreq(r.freq)}</td>
+                    <td>${getStateBadge(r.rec_state_type)}</td>
+                    <td>${(r.duration || 0).toFixed(1)}s</td>
+                    <td>${r.count || 0}</td>
+                </tr>
+            `;
+        });
+    });
+    
+    tbody.innerHTML = html;
     updateLastUpdate();
 }
 
@@ -1246,8 +1275,8 @@ function initWrapToggle() {
 function addConsoleLine(line) {
     state.consoleLogs.push(line);
     
-    // Trim to max lines (handled server-side, but safety check)
-    const maxLines = 5000;
+    // Trim to max lines (respects backend config)
+    const maxLines = state.consoleMaxLines || 5000;
     if (state.consoleLogs.length > maxLines) {
         state.consoleLogs = state.consoleLogs.slice(-maxLines);
     }
@@ -1264,8 +1293,8 @@ function addConsoleLine(line) {
             container.scrollTop = container.scrollHeight;
         }
         
-        // Trim DOM elements if too many
-        while (container.children.length > 5000) {
+        // Trim DOM elements if too many (respects backend config)
+        while (container.children.length > maxLines) {
             container.removeChild(container.firstChild);
         }
     }
@@ -1274,7 +1303,7 @@ function addConsoleLine(line) {
 function addConsoleLines(lines) {
     if (!Array.isArray(lines) || !lines.length) return;
 
-    const maxLines = 5000;
+    const maxLines = state.consoleMaxLines || 5000;
 
     // Update state (keep only last N)
     state.consoleLogs.push(...lines);
@@ -1626,36 +1655,51 @@ function updateChart() {
         legendContainer.innerHTML = '';
     }
     
+    // Initialize hidden systems set if not exists
+    if (!state.hiddenRateSystems) state.hiddenRateSystems = new Set();
+    
     const palette = getChartPalette();
 
     systems.forEach((sysName, idx) => {
         const data = state.rateHistory[sysName].filter(p => p.time >= startTime);
-        if (data.length < 2) return;
-
         const color = palette[idx % palette.length];
+        const isHidden = state.hiddenRateSystems.has(sysName);
         
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        
-        data.forEach((point, i) => {
-            const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
-            const y = padding.top + chartHeight - (point.rate / yMax * chartHeight);
+        // Draw line if not hidden and has enough data
+        if (!isHidden && data.length >= 2) {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
             
-            if (i === 0) {
-                ctx.moveTo(x, y);
-            } else {
-                ctx.lineTo(x, y);
-            }
-        });
+            data.forEach((point, i) => {
+                const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
+                const y = padding.top + chartHeight - (point.rate / yMax * chartHeight);
+                
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            });
+            
+            ctx.stroke();
+        }
         
-        ctx.stroke();
-        
-        // Add to legend
+        // Add to legend (always show, even if hidden)
         if (legendContainer) {
             const item = document.createElement('div');
-            item.className = 'legend-item';
+            item.className = 'legend-item' + (isHidden ? ' legend-hidden' : '');
+            item.style.cursor = 'pointer';
+            item.style.opacity = isHidden ? '0.4' : '1';
             item.innerHTML = `<div class="legend-color" style="background: ${color}"></div>${sysName}`;
+            item.onclick = () => {
+                if (state.hiddenRateSystems.has(sysName)) {
+                    state.hiddenRateSystems.delete(sysName);
+                } else {
+                    state.hiddenRateSystems.add(sysName);
+                }
+                updateChart();
+            };
             legendContainer.appendChild(item);
         }
     });
@@ -1693,29 +1737,23 @@ function updateCallRateChart() {
     }
     const startTime = now - timeRange;
     
-    // Calculate max Y value from data - auto-range to [MAX+1] with even intervals
-    let yMax = 10;  // Default minimum
-    const allData = Object.values(state.callRateHistory).flat().filter(p => p.time >= startTime);
+    // Initialize hidden systems set if not exists
+    if (!state.hiddenCallRateSystems) state.hiddenCallRateSystems = new Set();
+    if (state.hiddenCallRateTotal === undefined) state.hiddenCallRateTotal = false;
+    
+    // Calculate max Y value from data (only from visible systems)
+    const yMin = 0;
+    const yStep = 2;  // Always use intervals of 2
+    let yMax = 10;  // Minimum range
+    
+    const visibleSystems = Object.keys(state.callRateHistory).filter(s => !state.hiddenCallRateSystems.has(s));
+    const allData = visibleSystems.flatMap(s => state.callRateHistory[s] || []).filter(p => p.time >= startTime);
     if (allData.length > 0) {
         const maxCount = Math.max(...allData.map(p => p.count));
-        yMax = Math.max(10, maxCount + 1);  // At least 10, or max+1 for headroom
+        // Round up to next even number (multiple of 2) with headroom
+        const targetMax = maxCount + 1;
+        yMax = Math.max(10, Math.ceil(targetMax / yStep) * yStep);
     }
-    
-    // Calculate even step intervals (prefer 2, 5, 10, 20, etc.)
-    const yMin = 0;
-    const targetSteps = 4;
-    const rawStep = yMax / targetSteps;
-    let yStep;
-    if (rawStep <= 2) yStep = 2;
-    else if (rawStep <= 5) yStep = 5;
-    else if (rawStep <= 10) yStep = 10;
-    else if (rawStep <= 20) yStep = 20;
-    else if (rawStep <= 25) yStep = 25;
-    else if (rawStep <= 50) yStep = 50;
-    else yStep = Math.ceil(rawStep / 10) * 10;
-    
-    // Adjust yMax to be a multiple of yStep
-    yMax = Math.ceil(yMax / yStep) * yStep;
     
     // Draw grid
     ctx.strokeStyle = cssVar('--border', '#2a2a4e');
@@ -1790,53 +1828,65 @@ function updateCallRateChart() {
     // Draw individual system lines as step charts (calls are discrete)
     systems.forEach((sysName, idx) => {
         const data = state.callRateHistory[sysName].filter(p => p.time >= startTime);
-        if (data.length < 1) return;
-
         const color = palette[idx % palette.length];
+        const isHidden = state.hiddenCallRateSystems.has(sysName);
         
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        
-        // Step-based rendering: calls remain constant until they change
-        data.forEach((point, i) => {
-            const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
-            const y = padding.top + chartHeight - (point.count / yMax * chartHeight);
+        // Draw line if not hidden and has data
+        if (!isHidden && data.length >= 1) {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
             
-            if (i === 0) {
-                // Start at first point
-                ctx.moveTo(x, y);
-            } else {
-                // Draw horizontal line from previous point, then vertical step to new value
-                const prevPoint = data[i - 1];
-                const prevX = padding.left + ((prevPoint.time - startTime) / timeRange * chartWidth);
-                const prevY = padding.top + chartHeight - (prevPoint.count / yMax * chartHeight);
+            // Step-based rendering: calls remain constant until they change
+            data.forEach((point, i) => {
+                const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
+                const y = padding.top + chartHeight - (point.count / yMax * chartHeight);
                 
-                // Horizontal plateau at previous value
-                ctx.lineTo(x, prevY);
-                // Vertical step to new value
-                ctx.lineTo(x, y);
-            }
+                if (i === 0) {
+                    // Start at first point
+                    ctx.moveTo(x, y);
+                } else {
+                    // Draw horizontal line from previous point, then vertical step to new value
+                    const prevPoint = data[i - 1];
+                    const prevX = padding.left + ((prevPoint.time - startTime) / timeRange * chartWidth);
+                    const prevY = padding.top + chartHeight - (prevPoint.count / yMax * chartHeight);
+                    
+                    // Horizontal plateau at previous value
+                    ctx.lineTo(x, prevY);
+                    // Vertical step to new value
+                    ctx.lineTo(x, y);
+                }
+                
+                // Extend plateau to next point or end of chart
+                if (i === data.length - 1) {
+                    ctx.lineTo(width - padding.right, y);
+                }
+            });
             
-            // Extend plateau to next point or end of chart
-            if (i === data.length - 1) {
-                ctx.lineTo(width - padding.right, y);
-            }
-        });
+            ctx.stroke();
+        }
         
-        ctx.stroke();
-        
-        // Add to legend
+        // Add to legend (always show, even if hidden)
         if (legendContainer) {
             const item = document.createElement('div');
-            item.className = 'legend-item';
+            item.className = 'legend-item' + (isHidden ? ' legend-hidden' : '');
+            item.style.cursor = 'pointer';
+            item.style.opacity = isHidden ? '0.4' : '1';
             item.innerHTML = `<div class="legend-color" style="background: ${color}"></div>${sysName}`;
+            item.onclick = () => {
+                if (state.hiddenCallRateSystems.has(sysName)) {
+                    state.hiddenCallRateSystems.delete(sysName);
+                } else {
+                    state.hiddenCallRateSystems.add(sysName);
+                }
+                updateCallRateChart();
+            };
             legendContainer.appendChild(item);
         }
     });
     
     // Draw total line as step chart (subtle, semi-transparent)
-    if (totalData.length >= 1) {
+    if (!state.hiddenCallRateTotal && totalData.length >= 1) {
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
         ctx.lineWidth = 1.5;
         ctx.setLineDash([4, 4]);
@@ -1866,14 +1916,20 @@ function updateCallRateChart() {
         
         ctx.stroke();
         ctx.setLineDash([]);
+    }
         
-        // Add total to legend
-        if (legendContainer) {
-            const item = document.createElement('div');
-            item.className = 'legend-item';
-            item.innerHTML = `<div class="legend-color" style="background: rgba(255,255,255,0.35); border: 1px dashed rgba(255,255,255,0.5)"></div>Total`;
-            legendContainer.appendChild(item);
-        }
+    // Add total to legend (always show, with toggle)
+    if (legendContainer) {
+        const item = document.createElement('div');
+        item.className = 'legend-item' + (state.hiddenCallRateTotal ? ' legend-hidden' : '');
+        item.style.cursor = 'pointer';
+        item.style.opacity = state.hiddenCallRateTotal ? '0.4' : '1';
+        item.innerHTML = `<div class="legend-color" style="background: rgba(255,255,255,0.35); border: 1px dashed rgba(255,255,255,0.5)"></div>Total`;
+        item.onclick = () => {
+            state.hiddenCallRateTotal = !state.hiddenCallRateTotal;
+            updateCallRateChart();
+        };
+        legendContainer.appendChild(item);
     }
 }
 
@@ -2319,6 +2375,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 state.config = data.config;
                 if (state.config && state.config.theme) {
                     applyTheme(state.config.theme);
+                }
+                // Apply console limit from backend config
+                if (state.config && state.config.console_max_lines) {
+                    state.consoleMaxLines = state.config.console_max_lines;
                 }
             }
             

@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <deque>
 #include <iostream>
@@ -247,6 +248,13 @@ public:
         return history;
     }
     
+    // Generate display name for system with number prefix
+    std::string get_unique_sys_name(System *sys) {
+        int sys_num = sys->get_sys_num();
+        std::string short_name = sys->get_short_name();
+        return std::to_string(sys_num + 1) + ". " + short_name;
+    }
+    
     void add_rate_point(const std::string& sys_name, double rate) {
         std::lock_guard<std::mutex> lock(data_mutex_);
         
@@ -351,7 +359,6 @@ public:
         log_prefix_ = "[tr-web]\t";
 
         // Best-effort read of trunk-recorder config.json (static device metadata)
-        // trunk-recorder loads config from "./config.json" by default.
         try {
             std::ifstream in("./config.json");
             if (in.good()) {
@@ -579,20 +586,22 @@ public:
         for (auto* call : calls) {
             if (call->get_current_length() > 0 || !call->is_conventional()) {
                 json call_json = get_call_json(call);
-                calls_json.push_back(call_json);
                 
-                // Track by system name
-                std::string sys_name = call_json.value("sys_name", "");
-                if (sys_name.empty()) {
-                    sys_name = call_json.value("short_name", "Unknown");
+                // Override sys_name with unique name for deconfliction
+                System* sys = call->get_system();
+                if (sys) {
+                    std::string unique_name = get_unique_sys_name(sys);
+                    call_json["sys_name"] = unique_name;
+                    calls_by_system[unique_name]++;
                 }
-                calls_by_system[sys_name]++;
+                
+                calls_json.push_back(call_json);
             }
         }
         
         // Add call rate data points (including zero for systems with no active calls)
         for (auto* sys : tr_systems_) {
-            std::string sys_name = sys->get_short_name();
+            std::string sys_name = get_unique_sys_name(sys);
             int count = calls_by_system.count(sys_name) ? calls_by_system[sys_name] : 0;
             add_call_rate_point(sys_name, count);
         }
@@ -669,13 +678,13 @@ public:
                 
                 rates_json.push_back({
                     {"sys_num", stat_node.get<int>("id")},
-                    {"sys_name", sys->get_short_name()},
+                    {"sys_name", get_unique_sys_name(sys)},
                     {"decoderate", decode_rate},
                     {"control_channel", control_channel}
                 });
                 
                 // Store in rate history
-                add_rate_point(sys->get_short_name(), decode_rate);
+                add_rate_point(get_unique_sys_name(sys), decode_rate);
             }
         }
         
@@ -720,7 +729,8 @@ private:
                 response["rates"] = cached_rates_;
             }
             response["config"] = {
-                {"theme", theme_}
+                {"theme", theme_},
+                {"console_max_lines", console_max_lines_}
             };
             response["rateHistory"] = get_rate_history();
             response["callRateHistory"] = get_call_rate_history();
@@ -898,7 +908,8 @@ private:
                 std::ifstream config_file("./config.json");
                 if (!config_file.good()) {
                     res.status = 404;
-                    res.set_content("{\"error\": \"Config file not found\"}", "application/json");
+                    json error = {{"error", "Config file not found: ./config.json"}};
+                    res.set_content(error.dump(), "application/json");
                     return;
                 }
                 
@@ -1214,6 +1225,15 @@ private:
         return call_json;
     }
     
+    std::string int_to_hex(int num, int places) {
+        if (num == 0 && places == 0) return "0";
+        std::stringstream stream;
+        stream << std::setfill('0') << std::uppercase;
+        if (places > 0) stream << std::setw(places);
+        stream << std::hex << num;
+        return stream.str();
+    }
+    
     json get_system_json(System *sys) {
         boost::property_tree::ptree stat_node = sys->get_stats();
 
@@ -1246,15 +1266,6 @@ private:
             {"unit_tags_mode", sys->get_unit_tags_mode()},
             {"unit_tags_ota_file", sys->get_unit_tags_ota_file()}
         };
-    }
-    
-    std::string int_to_hex(int num, int places) {
-        if (num == 0 && places == 0) return "0";
-        std::stringstream stream;
-        stream << std::setfill('0') << std::uppercase;
-        if (places > 0) stream << std::setw(places);
-        stream << std::hex << num;
-        return stream.str();
     }
     
     // Factory method

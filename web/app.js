@@ -1746,15 +1746,43 @@ function updateCallRateChart() {
     if (!state.hiddenCallRateSystems) state.hiddenCallRateSystems = new Set();
     if (state.hiddenCallRateTotal === undefined) state.hiddenCallRateTotal = false;
     
-    // Calculate max Y value from data (only from visible systems)
+    // Calculate total line first (needed for yMax calculation)
+    const systems = Object.keys(state.callRateHistory).filter(
+        name => name && name !== 'undefined' && name !== 'Unknown' && name.trim() !== ''
+    );
+    const totalData = [];
+    const allTimes = new Set();
+    systems.forEach(sysName => {
+        state.callRateHistory[sysName].forEach(p => {
+            if (p.time >= startTime) allTimes.add(p.time);
+        });
+    });
+    
+    Array.from(allTimes).sort((a, b) => a - b).forEach(time => {
+        let sum = 0;
+        systems.forEach(sysName => {
+            const point = state.callRateHistory[sysName].find(p => p.time === time);
+            if (point) sum += point.count;
+        });
+        totalData.push({ time, count: sum });
+    });
+    
+    // Calculate max Y value from data (include visible systems and total if shown)
     const yMin = 0;
     const yStep = 2;  // Always use intervals of 2
     let yMax = 10;  // Minimum range
     
     const visibleSystems = Object.keys(state.callRateHistory).filter(s => !state.hiddenCallRateSystems.has(s));
     const allData = visibleSystems.flatMap(s => state.callRateHistory[s] || []).filter(p => p.time >= startTime);
-    if (allData.length > 0) {
-        const maxCount = Math.max(...allData.map(p => p.count));
+    
+    // Also include total data if total line is visible
+    const dataForScaling = allData.length > 0 ? allData.map(p => p.count) : [];
+    if (!state.hiddenCallRateTotal && totalData.length > 0) {
+        dataForScaling.push(...totalData.map(p => p.count));
+    }
+    
+    if (dataForScaling.length > 0) {
+        const maxCount = Math.max(...dataForScaling);
         // Round up to next even number (multiple of 2) with headroom
         const targetMax = maxCount + 1;
         yMax = Math.max(10, Math.ceil(targetMax / yStep) * yStep);
@@ -1802,33 +1830,12 @@ function updateCallRateChart() {
     
     // Draw data lines for each system + total
     // Filter out invalid system names (undefined, Unknown, empty)
-    const systems = Object.keys(state.callRateHistory).filter(
-        name => name && name !== 'undefined' && name !== 'Unknown' && name.trim() !== ''
-    );
     const legendContainer = document.getElementById('callChartLegend');
     if (legendContainer) {
         legendContainer.innerHTML = '';
     }
     
     const palette = getChartPalette();
-    
-    // Calculate total line
-    const totalData = [];
-    const allTimes = new Set();
-    systems.forEach(sysName => {
-        state.callRateHistory[sysName].forEach(p => {
-            if (p.time >= startTime) allTimes.add(p.time);
-        });
-    });
-    
-    Array.from(allTimes).sort((a, b) => a - b).forEach(time => {
-        let sum = 0;
-        systems.forEach(sysName => {
-            const point = state.callRateHistory[sysName].find(p => p.time === time);
-            if (point) sum += point.count;
-        });
-        totalData.push({ time, count: sum });
-    });
 
     // Draw individual system lines as step charts (calls are discrete)
     systems.forEach((sysName, idx) => {

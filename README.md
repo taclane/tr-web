@@ -70,18 +70,21 @@ Add the plugin to your trunk-recorder `config.json` to get started:
 
 ### Plugin Options
 
-| Key              | Required | Default Value | Type       | Description                                                                       |
-| ---------------- | :------: | ------------- | ---------- | --------------------------------------------------------------------------------- |
-| port             |          | 8080          | integer    | HTTP/HTTPS port                                                                   |
-| bind             |          | `"0.0.0.0"`   | string     | Bind address (0.0.0.0 = all interfaces)                                           |
-| username         |          | `""`          | string     | Info-level auth username (empty = no auth)                                        |
-| password         |          | `""`          | string     | Info-level auth password                                                          |
-| admin_username   |          | `""`          | string     | Admin-level auth username                                                         |
-| admin_password   |          | `""`          | string     | Admin-level auth password                                                         |
-| ssl_cert         |          | `""`          | string     | Path to SSL certificate PEM                                                       |
-| ssl_key          |          | `""`          | string     | Path to SSL private key PEM                                                       |
-| console_lines    |          | 5000          | integer    | Console log buffer size                                                           |
-| theme            |          | `"nostromo"`  | string     | Default UI theme (`nostromo`, `classic`, `hotdog`)                                |
+| Key                             | Required | Default Value | Type       | Description                                                                       |
+| ------------------------------- | :------: | ------------- | ---------- | --------------------------------------------------------------------------------- |
+| port                            |          | 8080          | integer    | HTTP/HTTPS port                                                                   |
+| bind                            |          | `"0.0.0.0"`   | string     | Bind address (0.0.0.0 = all interfaces)                                           |
+| username                        |          | `""`          | string     | Info-level auth username (empty = no auth)                                        |
+| password                        |          | `""`          | string     | Info-level auth password                                                          |
+| admin_username                  |          | `""`          | string     | Admin-level auth username                                                         |
+| admin_password                  |          | `""`          | string     | Admin-level auth password                                                         |
+| ssl_cert                        |          | `""`          | string     | Path to SSL certificate PEM                                                       |
+| ssl_key                         |          | `""`          | string     | Path to SSL private key PEM                                                       |
+| console_lines                   |          | 5000          | integer    | Console log buffer size                                                           |
+| theme                           |          | `"nostromo"`  | string     | Default UI theme (`nostromo`, `classic`, `hotdog`)                                |
+| affiliation_timeout_hours       |          | 12            | integer    | Hours of inactivity before unit/TG marked idle                                    |
+| affiliation_persist_file        |          | `""`          | string     | Path to save/load affiliation state (empty = disabled)                            |
+| affiliation_persist_interval_sec|          | 300           | integer    | Seconds between automatic saves of affiliation state                              |
 
 ### Authentication
 
@@ -119,6 +122,7 @@ Access the dashboard at `http://your-server:8080` (or `https://` if configured).
 - **Recorders**: Detailed recorder status table
 - **Systems**: Per-system info, control channels, talkgroup/unit tag data
 - **Console**: Live console output with ANSI colors and filtering
+- **Affiliations**: Unit/talkgroup association tracking with heatmap data and JSON export
 - **Admin**: System status, login history, config editor, restart controls
 
 ## API Endpoints
@@ -136,6 +140,7 @@ Access the dashboard at `http://your-server:8080` (or `https://` if configured).
 | ------------------------------------- | ------ | --------------------------- |
 | `/api/status`                         | GET    | Full system snapshot        |
 | `/api/whoami`                         | GET    | Current user info and access|
+| `/api/affiliations`                   | GET    | Unit/talkgroup affiliation state with heatmap data |
 | `/api/system/talkgroups?sys_num=N`    | GET    | Talkgroup list for system   |
 | `/api/system/unit_tags?sys_num=N`     | GET    | Manual unit tags for system |
 | `/api/system/unit_tags_ota?sys_num=N` | GET    | OTA unit aliases for system |

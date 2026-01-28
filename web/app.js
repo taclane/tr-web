@@ -37,7 +37,7 @@ const state = {
     omniSystemFilter: '',
     omniMsgTypeFilter: '',
     omniAutoScroll: true,
-    omniBufferSize: 600  // Default buffer size for unit activity
+    omniBufferSize: 200  // Default buffer size for unit activity
 };
 
 const CALL_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
@@ -1292,6 +1292,11 @@ function showMainTab(tabName) {
             updateVoiceChannels();
             updateOmniMessages();
         }, 0);
+    } else if (tabName === 'affiliations') {
+        // Load affiliations when tab is opened
+        setTimeout(() => {
+            loadAffiliations();
+        }, 0);
     } else if (tabName === 'admin') {
         // Load admin data when tab is opened
         setTimeout(() => {
@@ -2084,11 +2089,13 @@ function loadConfig() {
     const editor = document.getElementById('configEditor');
     const highlight = document.getElementById('configHighlight');
     const status = document.getElementById('configStatus');
+    const pathDisplay = document.getElementById('configFilePath');
     if (!editor) return;
     
     editor.value = 'Loading config...';
     if (highlight) highlight.innerHTML = '';
     if (status) status.textContent = '';
+    if (pathDisplay) pathDisplay.textContent = '';
     clearValidation();
     hasUnsavedChanges = false;
     updateLineNumbers();
@@ -2114,6 +2121,7 @@ function loadConfig() {
             configPath = data.path || './config.json';
             editor.value = originalConfig;
         }
+        if (pathDisplay) pathDisplay.textContent = configPath;
         updateLineNumbers();
         updateHighlight();
         validateJSON();
@@ -2722,3 +2730,519 @@ function updateOmniMessages() {
         }
     }
 }
+
+// ========================================
+// Affiliations Tab
+// ========================================
+
+const affiliationState = {
+    units: [],
+    talkgroups: [],
+    currentView: 'talkgroups',
+    sortColumn: 'id',
+    sortDirection: 'asc',
+    searchTerm: '',
+    filterBogons: true
+};
+
+function toggleApiInfo() {
+        // Setup copy button with clipboard API and feedback
+        const copyBtn = document.getElementById('copyGraphStreamUrl');
+        if (copyBtn) {
+            copyBtn.onclick = function() {
+                const url = document.getElementById('graphStreamUrl').textContent;
+                if (navigator.clipboard) {
+                    navigator.clipboard.writeText(url).then(() => {
+                        copyBtn.textContent = 'Copied!';
+                        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1200);
+                    });
+                } else {
+                    // Fallback for older browsers
+                    const tempInput = document.createElement('input');
+                    tempInput.value = url;
+                    document.body.appendChild(tempInput);
+                    tempInput.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(tempInput);
+                    copyBtn.textContent = 'Copied!';
+                    setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1200);
+                }
+            };
+        }
+    const infoBox = document.getElementById('apiInfoBox');
+    if (infoBox) {
+        const isHidden = infoBox.style.display === 'none';
+        infoBox.style.display = isHidden ? 'block' : 'none';
+        
+        // Populate URL when showing
+        if (isHidden) {
+            const urlElement = document.getElementById('graphStreamUrl');
+            if (urlElement) {
+                const port = window.location.port ? `:${window.location.port}` : '';
+                const basePath = BASE_PATH || '';
+                const path = basePath.endsWith('/') ? `${basePath}graph-stream` : `${basePath}/graph-stream`;
+                const url = `${window.location.protocol}//${window.location.hostname}${port}${path}`;
+                urlElement.textContent = url;
+            }
+        }
+    }
+}
+
+function showAffiliationView(view) {
+    affiliationState.currentView = view;
+    
+    // Update tabs
+    document.querySelectorAll('.affiliation-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.view === view);
+    });
+    
+    // Update views
+    document.querySelectorAll('.affiliation-view').forEach(v => {
+        v.classList.toggle('active', v.id === `view-${view}`);
+    });
+    
+    renderAffiliationTable();
+}
+
+async function loadAffiliations() {
+    console.log('[Affiliations] loadAffiliations called');
+    
+    // Update loading message to show we're actually trying
+    // Show loading overlay or spinner if desired, but do not clear table
+    
+    try {
+        console.log('[Affiliations] Fetching data from /api/affiliations');
+        const response = await fetch(`${BASE_PATH}api/affiliations`, {
+            credentials: 'same-origin',
+            headers: {
+                'Accept': 'application/json'
+            }
+        });
+        console.log('[Affiliations] Response status:', response.status, response.statusText);
+        
+        if (!response.ok) {
+            console.error('[Affiliations] Failed to fetch:', response.status, response.statusText);
+            const errorText = await response.text();
+            console.error('[Affiliations] Error body:', errorText);
+            // Do not clear table while fetching
+            return;
+        }
+        
+        const data = await response.json();
+        console.log('[Affiliations] Received data:', { units: data.units?.length || 0, talkgroups: data.talkgroups?.length || 0 });
+        affiliationState.units = data.units || [];
+        affiliationState.talkgroups = data.talkgroups || [];
+        
+        renderAffiliationTable();
+    } catch (e) {
+        console.error('[Affiliations] Exception caught:', e);
+        console.error('[Affiliations] Stack:', e.stack);
+        // Do not clear table on error
+    }
+}
+
+function formatTimestamp(timestamp) {
+    if (!timestamp) return 'Never';
+    
+    const now = Math.floor(Date.now() / 1000);
+    const diff = now - timestamp;
+    
+    if (diff < 60) return 'Just now';
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    return `${Math.floor(diff / 86400)}d ago`;
+}
+
+function renderStatusBadge(item, isUnit) {
+    const now = Math.floor(Date.now() / 1000);
+    const idleThreshold = 12 * 3600;
+    const isIdle = (now - item.last_active) > idleThreshold;
+    
+    if (isUnit && !item.registered) {
+        return '<span class="status-badge deregistered">⚪ Deregistered</span>';
+    } else if (isIdle) {
+        return '<span class="status-badge idle">⚫ Idle</span>';
+    } else {
+        return '<span class="status-badge active">🟢 Active</span>';
+    }
+}
+
+function renderEncryptionBadge(item) {
+    if (item.ever_encrypted) {
+        return '<span class="status-badge encrypted">🔴 Encrypted</span>';
+    }
+    return '<span style="color: var(--text-secondary);">—</span>';
+}
+
+function renderStatusBadges(item, isUnit) {
+    const badges = [];
+    
+    if (item.ever_encrypted) {
+        badges.push('<span class="status-badge encrypted">🔴 Encrypted</span>');
+    }
+    
+    if (isUnit && !item.registered) {
+        badges.push('<span class="status-badge deregistered">⚪ Deregistered</span>');
+    } else if (item.is_idle) {
+        badges.push('<span class="status-badge idle">⚫ Idle</span>');
+    } else {
+        badges.push('<span class="status-badge active">● Active</span>');
+    }
+    
+    return badges.join(' ');
+}
+
+function renderAssociatedItems(counts, isUnit) {
+    const entries = Object.entries(counts);
+    if (entries.length === 0) return '<span style="color: var(--text-secondary);">None</span>';
+    
+    // Sort by transmission count descending
+    entries.sort((a, b) => b[1] - a[1]);
+    
+    const itemClass = isUnit ? 'tg-chip' : 'unit-chip';
+    const clickHandler = isUnit ? 'jumpToTalkgroup' : 'jumpToUnit';
+    
+    return `<div class="${isUnit ? 'tg-list' : 'unit-list'}">` +
+        entries.map(([id, count]) => 
+            `<span class="${itemClass}" onclick="${clickHandler}('${id}')">
+                ${id} <span class="transmission-badge">${count}</span>
+            </span>`
+        ).join('') +
+        '</div>';
+}
+
+function sortAffiliationTable(view, column) {
+    if (affiliationState.sortColumn === column) {
+        affiliationState.sortDirection = affiliationState.sortDirection === 'asc' ? 'desc' : 'asc';
+    } else {
+        affiliationState.sortColumn = column;
+        affiliationState.sortDirection = 'desc';
+    }
+    renderAffiliationTable();
+}
+
+function filterAndSortData(items) {
+    let filtered = items;
+    // Apply bogon filter (unit/tg 0, -1)
+    const filterBogons = document.getElementById('filterBogonsCheckbox')?.checked ?? true;
+    if (filterBogons) {
+        filtered = filtered.filter(item => item.id !== 0 && item.id !== -1);
+        // Deep filter associations as well
+        filtered = filtered.map(item => {
+            // Clone to avoid mutating original
+            const newItem = { ...item };
+            if (newItem.talkgroup_transmission_counts) {
+                newItem.talkgroup_transmission_counts = Object.fromEntries(
+                    Object.entries(newItem.talkgroup_transmission_counts)
+                        .filter(([tgid]) => tgid !== '0' && tgid !== '-1')
+                );
+            }
+            if (newItem.unit_transmission_counts) {
+                newItem.unit_transmission_counts = Object.fromEntries(
+                    Object.entries(newItem.unit_transmission_counts)
+                        .filter(([uid]) => uid !== '0' && uid !== '-1')
+                );
+            }
+            return newItem;
+        });
+    }
+    
+    // Apply search filter
+    if (affiliationState.searchTerm) {
+        const term = affiliationState.searchTerm.toLowerCase();
+        filtered = filtered.map(item => {
+            let newItem = { ...item };
+            let match = String(item.id).includes(term) ||
+                (item.alias && item.alias.toLowerCase().includes(term)) ||
+                String(item.wacn).includes(term) ||
+                String(item.sysid).includes(term);
+
+            // If top-level matches, show all associations
+            if (match) {
+                // Do not filter associations
+                return newItem;
+            }
+
+            // Otherwise, filter associations
+            let hasAssociations = false;
+            if (newItem.talkgroup_transmission_counts) {
+                newItem.talkgroup_transmission_counts = Object.fromEntries(
+                    Object.entries(newItem.talkgroup_transmission_counts)
+                        .filter(([tgid]) => tgid.toLowerCase().includes(term))
+                );
+                if (Object.keys(newItem.talkgroup_transmission_counts).length > 0) hasAssociations = true;
+            }
+            if (newItem.unit_transmission_counts) {
+                newItem.unit_transmission_counts = Object.fromEntries(
+                    Object.entries(newItem.unit_transmission_counts)
+                        .filter(([uid]) => uid.toLowerCase().includes(term))
+                );
+                if (Object.keys(newItem.unit_transmission_counts).length > 0) hasAssociations = true;
+            }
+            return hasAssociations ? newItem : null;
+        }).filter(Boolean);
+    }
+    
+    // Apply sorting
+    filtered.sort((a, b) => {
+        const col = affiliationState.sortColumn;
+        let aVal = a[col];
+        let bVal = b[col];
+        
+        if (col === 'alias') {
+            aVal = (aVal || '').toLowerCase();
+            bVal = (bVal || '').toLowerCase();
+        }
+        
+        if (aVal < bVal) return affiliationState.sortDirection === 'asc' ? -1 : 1;
+        if (aVal > bVal) return affiliationState.sortDirection === 'asc' ? 1 : -1;
+        return 0;
+    });
+    
+    return filtered;
+}
+
+function renderAffiliationTable() {
+    const view = affiliationState.currentView;
+    const isUnits = view === 'units';
+    const data = isUnits ? affiliationState.units : affiliationState.talkgroups;
+    
+    const filtered = filterAndSortData(data);
+    
+    const tbody = document.getElementById(isUnits ? 'unitTableBody' : 'talkgroupTableBody');
+    // Always fully rebuild the table to avoid orphaned/stale rows
+    tbody.innerHTML = filtered.map((item, idx) => {
+        const associatedCounts = isUnits ? item.talkgroup_transmission_counts : item.unit_transmission_counts;
+        const itemKey = `${item.wacn}:${item.sysid}:${item.id}`;
+        const rowId = `aff-row-${itemKey.replace(/:/g, '-')}`;
+        const detailsId = `aff-details-${itemKey.replace(/:/g, '-')}`;
+        const hasAssociations = associatedCounts && Object.keys(associatedCounts).length > 0;
+        let html = '';
+        // Always allow toggling, but auto-collapse if no associations
+        html += '<tr id="' + rowId + '" class="affiliation-main-row" style="cursor: pointer; font-size: 15px;" onclick="toggleAffiliationDetails(\'' + detailsId + '\')">';
+        html += '<td><strong style="font-size: 1.25em;">' + escapeHtml(item.id) + '</strong></td>';
+        html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(item.wacn) + '</code></td>';
+        html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(item.sysid) + '</code></td>';
+        html += '<td>' + (item.alias ? '<span style="font-size: 1.15em; font-weight: 600;">' + escapeHtml(item.alias) + '</span>' : '<span style="color: var(--text-secondary);">—</span>') + '</td>';
+        html += '<td>' + renderStatusBadge(item, isUnits) + '</td>';
+        html += '<td>' + renderEncryptionBadge(item) + '</td>';
+        html += '<td>' + formatTimestamp(item.last_active) + '</td>';
+        html += '<td><strong>' + escapeHtml(item.transmission_count) + '</strong></td>';
+        html += '</tr>';
+        // Details row: auto-collapse if no associations
+        html += '<tr id="' + detailsId + '" class="affiliation-details-row" style="display:' + (hasAssociations ? 'table-row' : 'none') + ';">';
+        html += '<td colspan="8" style="padding: 0; background: var(--bg-tertiary);">';
+        html += '<div style="padding: 12px 16px; border-top: 1px solid var(--border);">';
+        html += '<div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; text-transform: uppercase; font-weight: 600;">';
+        html += 'Associated ' + (isUnits ? 'Talkgroups' : 'Units') + ' (' + Object.keys(associatedCounts).length + ')';
+        html += '</div>';
+        html += '<div style="display: flex; flex-wrap: wrap; gap: 6px;">';
+        html += renderAssociatedItemsCompact(associatedCounts, isUnits, item);
+        html += '</div>';
+        html += '</div>';
+        html += '</td>';
+        html += '</tr>';
+        return html;
+    }).join('');
+    requestAnimationFrame(() => {
+        if (scrollContainer) scrollContainer.scrollTop = savedScrollTop;
+    });
+    return;
+}
+
+function toggleAffiliationDetails(detailsId) {
+    const row = document.getElementById(detailsId);
+    if (row) {
+        const isVisible = row.style.display !== 'none';
+        row.style.display = isVisible ? 'none' : 'table-row';
+    }
+}
+
+function renderAssociatedItemsCompact(counts, isUnits, parentItem) {
+    if (!counts || Object.keys(counts).length === 0) {
+        return '<span style="color: var(--text-secondary); font-size: 12px;">None</span>';
+    }
+    
+    // Sort by transmission count descending
+    const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    
+    return sorted.map(([id, count]) => {
+        // Get the associated item's state to determine status and alias
+        const associatedItem = isUnits ? 
+            affiliationState.talkgroups.find(tg => tg.id == id && tg.wacn === parentItem.wacn && tg.sysid === parentItem.sysid) :
+            affiliationState.units.find(u => u.id == id && u.wacn === parentItem.wacn && u.sysid === parentItem.sysid);
+        
+        const statusBadge = associatedItem ? getStatusBadge(associatedItem, !isUnits) : '';
+        const clickHandler = isUnits ? 
+            `jumpToTalkgroup(${id}, ${parentItem.wacn}, ${parentItem.sysid})` : 
+            `jumpToUnit(${id}, ${parentItem.wacn}, ${parentItem.sysid})`;
+        
+        // Display alias if available, otherwise just the ID
+        const displayText = associatedItem && associatedItem.alias ? 
+            associatedItem.alias : 
+            String(id);
+        
+        return `
+            <div style="display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; 
+                        background: var(--bg-secondary); border: 1px solid var(--border); 
+                        border-radius: 4px; font-size: 12px; cursor: pointer; transition: all 0.2s;"
+                 onclick="event.stopPropagation(); ${clickHandler};" 
+                 onmouseover="this.style.background='var(--bg-hover)'" 
+                 onmouseout="this.style.background='var(--bg-secondary)'"
+                 title="${associatedItem && associatedItem.alias ? `${id}: ${associatedItem.alias}` : id}">
+                ${statusBadge}
+                <strong style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;">${escapeHtml(displayText)}</strong>
+                <span style="color: var(--text-secondary); margin-left: 2px;">(${count})</span>
+            </div>
+        `;
+    }).join('');
+}
+
+function getStatusBadge(item, isUnit) {
+    const now = Math.floor(Date.now() / 1000);
+    const idleThreshold = 12 * 3600;
+    const isIdle = (now - item.last_active) > idleThreshold;
+    
+    if (isUnit && !item.registered) {
+        return '<span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #666;" title="Deregistered"></span>';
+    }
+    
+    if (isIdle) {
+        return '<span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #888;" title="Idle"></span>';
+    }
+    
+    if (item.ever_encrypted) {
+        return '<span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #a83232;" title="Active (Encrypted)"></span>';
+    }
+    
+    return '<span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #32a852;" title="Active"></span>';
+}
+
+function make_unit_key(wacn, sysid, unit_id) {
+    return `${wacn}:${sysid}:${unit_id}`;
+}
+
+function make_tg_key(wacn, sysid, tg_id) {
+    return `${wacn}:${sysid}:${tg_id}`;
+}
+
+function jumpToTalkgroup(tgId, wacn, sysid) {
+    affiliationState.currentView = 'talkgroups';
+    affiliationState.searchTerm = '';
+    const searchInput = document.getElementById('affiliationSearch');
+    const clearBtn = document.getElementById('clearAffiliationSearch');
+    if (searchInput) searchInput.value = '';
+    if (clearBtn) clearBtn.style.display = 'none';
+    showAffiliationView('talkgroups');
+    
+    // Scroll to the specific row after a short delay for rendering
+    setTimeout(() => {
+        const rowId = `aff-row-${wacn}-${sysid}-${tgId}`;
+        const row = document.getElementById(rowId);
+        if (row) {
+            row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            // Pulse animation: 3 quick flashes
+            row.style.transition = 'background 0.3s ease';
+            let pulseCount = 0;
+            const pulseInterval = setInterval(() => {
+                row.style.background = pulseCount % 2 === 0 ? 'rgba(59, 130, 246, 0.3)' : '';
+                pulseCount++;
+                if (pulseCount >= 6) {
+                    clearInterval(pulseInterval);
+                    row.style.background = '';
+                    row.style.transition = '';
+                }
+            }, 300);
+        }
+    }, 100);
+}
+
+function jumpToUnit(unitId, wacn, sysid) {
+    affiliationState.currentView = 'units';
+    affiliationState.searchTerm = '';
+    const searchInput = document.getElementById('affiliationSearch');
+    const clearBtn = document.getElementById('clearAffiliationSearch');
+    if (searchInput) searchInput.value = '';
+    if (clearBtn) clearBtn.style.display = 'none';
+    showAffiliationView('units');
+    
+    // Scroll to the specific row after a short delay for rendering
+    setTimeout(() => {
+        const rowId = `aff-row-${wacn}-${sysid}-${unitId}`;
+        const row = document.getElementById(rowId);
+        if (row) {
+            row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            // Pulse animation: 3 quick flashes
+            row.style.transition = 'background 0.3s ease';
+            let pulseCount = 0;
+            const pulseInterval = setInterval(() => {
+                row.style.background = pulseCount % 2 === 0 ? 'rgba(59, 130, 246, 0.3)' : '';
+                pulseCount++;
+                if (pulseCount >= 6) {
+                    clearInterval(pulseInterval);
+                    row.style.background = '';
+                    row.style.transition = '';
+                }
+            }, 300);
+        }
+    }, 100);
+}
+
+function clearAffiliationSearch() {
+    affiliationState.searchTerm = '';
+    const searchInput = document.getElementById('affiliationSearch');
+    const clearBtn = document.getElementById('clearAffiliationSearch');
+    if (searchInput) searchInput.value = '';
+    if (clearBtn) clearBtn.style.display = 'none';
+    // Force full re-render and reset
+    renderAffiliationTable();
+}
+
+function exportAffiliationsJSON() {
+    const data = {
+        exported_at: Math.floor(Date.now() / 1000),
+        units: affiliationState.units,
+        talkgroups: affiliationState.talkgroups
+    };
+    
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `affiliations_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+// Initialize search handler
+document.addEventListener('DOMContentLoaded', () => {
+    const searchInput = document.getElementById('affiliationSearch');
+    const clearBtn = document.getElementById('clearAffiliationSearch');
+    
+    if (searchInput) {
+        searchInput.addEventListener('input', (e) => {
+            affiliationState.searchTerm = e.target.value;
+            if (clearBtn) {
+                clearBtn.style.display = e.target.value ? 'block' : 'none';
+            }
+            renderAffiliationTable();
+        });
+    }
+    
+    // Smart periodic updates: refresh data every 30s but preserve user's sort/scroll position
+    setInterval(() => {
+        if (affiliationState.currentView) {
+            // Save current scroll position
+            const container = document.querySelector('.tab-content');
+            const scrollPos = container ? container.scrollTop : 0;
+            
+            // Refresh data without changing sort
+            loadAffiliations().then(() => {
+                // Restore scroll position
+                if (container) container.scrollTop = scrollPos;
+            });
+        }
+    }, 30000); // Update every 30 seconds
+});

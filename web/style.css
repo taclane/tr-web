@@ -1351,3 +1351,157 @@ tr.selected {
 .json-bracket { color: var(--json-bracket); }
 .json-colon { color: var(--json-colon); }
 .json-comma { color: var(--json-comma); }
+
+/* Affiliations Tab Styles */
+.affiliation-tabs {
+    display: flex;
+    gap: 5px;
+    background: var(--bg-secondary);
+    padding: 4px;
+    border-radius: 6px;
+}
+
+.affiliation-tab {
+    padding: 8px 20px;
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 14px;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.affiliation-tab:hover {
+    background: var(--bg-card);
+    color: var(--text-primary);
+}
+
+.affiliation-tab.active {
+    background: var(--accent);
+    color: #fff;
+}
+
+.affiliation-view {
+    display: none;
+}
+
+.affiliation-view.active {
+    display: block;
+}
+
+.affiliation-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.affiliation-table th {
+    background: var(--bg-secondary);
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-primary);
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+    user-select: none;
+}
+
+.affiliation-table th:hover {
+    background: var(--bg-card);
+}
+
+.affiliation-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-primary);
+}
+
+/* Larger font for ID and Alias in affiliation header rows */
+.affiliation-main-row td:first-child strong {
+    font-size: 1.25em;
+}
+.affiliation-main-row td:nth-child(4) span {
+    font-size: 1.15em;
+    font-weight: 600;
+}
+
+.affiliation-table tbody tr {
+    transition: background 0.15s;
+}
+
+.affiliation-table tbody tr:hover {
+    background: var(--bg-secondary);
+}
+
+.sort-indicator {
+    display: inline-block;
+    width: 12px;
+    color: var(--text-secondary);
+}
+
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.status-badge.encrypted {
+    background: rgba(168, 50, 50, 0.2);
+    color: #ff6b6b;
+}
+
+.status-badge.idle {
+    background: rgba(128, 128, 128, 0.2);
+    color: #999;
+}
+
+.status-badge.deregistered {
+    background: rgba(128, 128, 128, 0.2);
+    color: #999;
+}
+
+.status-badge.active {
+    background: rgba(0, 153, 204, 0.2);
+    color: var(--accent);
+}
+
+.unit-list, .tg-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    max-width: 400px;
+}
+
+.unit-chip, .tg-chip {
+    display: inline-block;
+    padding: 2px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.unit-chip:hover, .tg-chip:hover {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+}
+
+.transmission-badge {
+    display: inline-block;
+    padding: 2px 6px;
+    background: rgba(0, 153, 204, 0.15);
+    border-radius: 3px;
+    font-size: 11px;
+    color: var(--accent);
+    font-weight: 600;
+}
+

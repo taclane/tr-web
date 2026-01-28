@@ -10,6 +10,7 @@
 #include <iostream>
 #include <string>
 #include <map>
+#include <unordered_set>
 #include <mutex>
 #include <atomic>
 #include <regex>
@@ -119,7 +120,58 @@ class Tr_Web : public Plugin_Api {
     std::deque<std::pair<std::string, std::string>> event_queue_;
     size_t event_queue_dropped_ = 0;
 
-    // Dirty flags for SSE broadcasts (avoid doing work in trunk-recorder threads)
+    // Graph streaming events for Gephi compatibility
+    mutable std::mutex graph_event_queue_mutex_;
+    std::deque<std::string> graph_event_queue_;
+    size_t graph_event_queue_dropped_ = 0;
+
+    // State tracking for units and talkgroups (for Gephi coloring and Affiliations UI)
+    struct UnitState {
+        long id = 0;
+        int wacn = 0;
+        int sysid = 0;
+        std::string alias;
+        bool ever_encrypted = false;      // Has ever transmitted encrypted
+        time_t last_active = 0;
+        bool registered = false;
+        int transmission_count = 0;
+        std::map<long, int> talkgroup_transmission_counts;  // tg_id -> count (heatmap data)
+    };
+    
+    struct TalkgroupState {
+        long id = 0;
+        int wacn = 0;
+        int sysid = 0;
+        std::string alias;
+        bool ever_encrypted = false;      // Has ever had encrypted traffic
+        time_t last_active = 0;
+        int transmission_count = 0;
+        std::map<long, int> unit_transmission_counts;  // unit_id -> count (heatmap data)
+    };
+    
+    // Composite key for multi-system support: "wacn:sysid:id"
+    std::string make_unit_key(int wacn, int sysid, long unit_id) const {
+        return std::to_string(wacn) + ":" + std::to_string(sysid) + ":" + std::to_string(unit_id);
+    }
+    
+    std::string make_tg_key(int wacn, int sysid, long tg_id) const {
+        return std::to_string(wacn) + ":" + std::to_string(sysid) + ":" + std::to_string(tg_id);
+    }
+    
+    mutable std::mutex affiliation_state_mutex_;
+    std::map<std::string, UnitState> unit_states_;      // keyed by "wacn:sysid:unit_id"
+    std::map<std::string, TalkgroupState> talkgroup_states_;  // keyed by "wacn:sysid:tg_id"
+    
+    // Configuration for affiliation tracking
+    int affiliation_timeout_hours_ = 12;
+    std::string affiliation_persist_file_;
+    int affiliation_persist_interval_sec_ = 300;
+    time_t last_affiliation_save_ = 0;
+
+    // Flag to trigger initial Gephi dump on next poll cycle
+    std::atomic<bool> gephi_initial_dump_pending_{false};
+    
+    // Dirty flags for SSE broadcasts
     std::atomic<uint32_t> dirty_flags_{0};
 
     enum DirtyBits : uint32_t {
@@ -140,6 +192,135 @@ class Tr_Web : public Plugin_Api {
         }
         event_queue_.emplace_back(event, std::move(data));
     }
+
+    void enqueue_graph_event(std::string data) {
+        std::lock_guard<std::mutex> lock(graph_event_queue_mutex_);
+        static constexpr size_t MAX_GRAPH_EVENTS = 1000;
+        if (graph_event_queue_.size() >= MAX_GRAPH_EVENTS) {
+            ++graph_event_queue_dropped_;
+            return;
+        }
+        graph_event_queue_.emplace_back(std::move(data));
+    }
+    
+    // Trigger initial Gephi dump (called from httplib when raw stream client connects)
+    void request_gephi_initial_dump() {
+        gephi_initial_dump_pending_.store(true, std::memory_order_release);
+    }
+    
+    // Send current affiliation state to newly connected Gephi clients
+    void send_gephi_initial_state() {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        
+        int node_count = 0;
+        int edge_count = 0;
+        
+        time_t now = time(NULL);
+        const time_t idle_threshold = 12 * 3600; // 12 hours
+        
+        // Send all units as nodes
+        for (const auto& [key, unit] : unit_states_) {
+            if (unit.id == 0 || unit.id == -1) continue;
+            
+            std::string node_id = std::to_string(unit.id);
+            std::string label = unit.alias.empty() ? ("Unit " + std::to_string(unit.id)) : unit.alias;
+            
+            // Determine color based on status
+            std::string color;
+            if (!unit.registered) {
+                color = "#666666";
+            } else if ((now - unit.last_active) > idle_threshold) {
+                color = "#888888";
+            } else if (unit.ever_encrypted) {
+                color = GEPHI_COLOR_RED;
+            } else {
+                color = GEPHI_COLOR_BLUE;
+            }
+            
+            json node_data = {
+                {"id", unit.id},
+                {"label", label},
+                {"color", color},
+                {"size", 15}
+            };
+            
+            if (unit.ever_encrypted) {
+                node_data["encryption"] = true;
+            }
+            if (!unit.registered) {
+                node_data["deregistered"] = true;
+            }
+            
+            json add_node = {{"an", {{node_id, node_data}}}};
+            server_.broadcast_raw_to_path("/graph-stream", add_node.dump() + "\r\n");
+            node_count++;
+        }
+        
+        // Send all talkgroups as nodes
+        for (const auto& [key, tg] : talkgroup_states_) {
+            if (tg.id == 0 || tg.id == -1) continue;
+            
+            std::string node_id = "TG-" + std::to_string(tg.id);
+            std::string label = tg.alias.empty() ? ("TG " + std::to_string(tg.id)) : tg.alias;
+            
+            std::string color = tg.ever_encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN;
+            
+            json node_data = {
+                {"id", node_id},
+                {"label", label},
+                {"color", color},
+                {"size", 25}
+            };
+            
+            if (tg.ever_encrypted) {
+                node_data["encryption"] = true;
+            }
+            
+            json add_node = {{"an", {{node_id, node_data}}}};
+            server_.broadcast_raw_to_path("/graph-stream", add_node.dump() + "\r\n");
+            node_count++;
+        }
+        
+        // Collect all unique (unit_id, tg_id) pairs from both directions
+        std::set<std::pair<long, long>> edge_pairs;
+        for (const auto& [unit_key, unit] : unit_states_) {
+            if (unit.id == 0 || unit.id == -1) continue;
+            for (const auto& [tg_id, count] : unit.talkgroup_transmission_counts) {
+                if (tg_id == 0 || tg_id == -1) continue;
+                edge_pairs.emplace(unit.id, tg_id);
+            }
+        }
+        for (const auto& [tg_key, tg] : talkgroup_states_) {
+            if (tg.id == 0 || tg.id == -1) continue;
+            for (const auto& [unit_id, count] : tg.unit_transmission_counts) {
+                if (unit_id == 0 || unit_id == -1) continue;
+                edge_pairs.emplace(unit_id, tg.id);
+            }
+        }
+
+        // Emit edges for all unique pairs
+        for (const auto& [unit_id, tg_id] : edge_pairs) {
+            std::string unit_node = std::to_string(unit_id);
+            std::string tg_node = "TG-" + std::to_string(tg_id);
+            std::string edge_id = tg_node + "-" + unit_node;
+            json edge_data = {
+                {"directed", false},
+                {"source", unit_node},
+                {"target", tg_node}
+            };
+            json add_edge = {{"ae", {{edge_id, edge_data}}}};
+            server_.broadcast_raw_to_path("/graph-stream", add_edge.dump() + "\r\n");
+            edge_count++;
+        }
+        
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Sent " << node_count << " nodes and " << edge_count << " edges to new Gephi connection";
+    }
+
+    // Gephi streaming constants
+    static constexpr const char* GEPHI_COLOR_BLUE = "#0099CC";
+    static constexpr const char* GEPHI_COLOR_RED = "#a83232";
+    static constexpr const char* GEPHI_COLOR_GREEN = "#32a852";
+    static constexpr const char* GEPHI_COLOR_GREY = "#808080";
     
     // State maps (same as mqtt_status)
     std::map<short, std::string> tr_state_ = {
@@ -309,6 +490,314 @@ public:
         return affiliations;
     }
     
+    // Update unit/talkgroup state tracking (for Gephi colors and Affiliations UI)
+    void update_affiliation_state(System* sys, long unit_id, long tg_id, bool encrypted) {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        time_t now = time(NULL);
+        
+        int wacn = sys->get_wacn();
+        int sysid = sys->get_sys_id();
+        std::string unit_key = make_unit_key(wacn, sysid, unit_id);
+        std::string tg_key = make_tg_key(wacn, sysid, tg_id);
+        
+        // Update unit state
+        auto& unit = unit_states_[unit_key];
+        unit.id = unit_id;
+        unit.wacn = wacn;
+        unit.sysid = sysid;
+        if (unit.alias.empty()) {  // Only set alias if not already stored
+            unit.alias = sys->find_unit_tag(unit_id);
+        }
+        unit.last_active = now;
+        unit.registered = true;  // Active transmission means registered
+        unit.transmission_count++;
+        unit.talkgroup_transmission_counts[tg_id]++;  // Track per-TG frequency
+        if (encrypted) {
+            unit.ever_encrypted = true;
+        }
+        
+        // Update talkgroup state
+        auto& tg = talkgroup_states_[tg_key];
+        tg.id = tg_id;
+        tg.wacn = wacn;
+        tg.sysid = sysid;
+        if (tg.alias.empty()) {  // Only set alias if not already stored
+            Talkgroup *talkgroup = sys->find_talkgroup(tg_id);
+            tg.alias = talkgroup ? talkgroup->alpha_tag : "";
+        }
+        tg.last_active = now;
+        tg.transmission_count++;
+        tg.unit_transmission_counts[unit_id]++;  // Track per-unit frequency
+        if (encrypted) {
+            tg.ever_encrypted = true;
+        }
+    }
+    
+    void set_unit_registration(System* sys, long unit_id, bool registered) {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        time_t now = time(NULL);
+        
+        int wacn = sys->get_wacn();
+        int sysid = sys->get_sys_id();
+        std::string unit_key = make_unit_key(wacn, sysid, unit_id);
+        
+        auto& unit = unit_states_[unit_key];
+        unit.id = unit_id;
+        unit.wacn = wacn;
+        unit.sysid = sysid;
+        if (unit.alias.empty()) {
+            unit.alias = sys->find_unit_tag(unit_id);
+        }
+        unit.last_active = now;
+        unit.registered = registered;
+    }
+    
+    // Get effective color for a unit based on state (for grey-to-color transitions)
+    std::string get_unit_effective_color(System* sys, long unit_id) const {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        
+        int wacn = sys->get_wacn();
+        int sysid = sys->get_sys_id();
+        std::string unit_key = make_unit_key(wacn, sysid, unit_id);
+        
+        auto it = unit_states_.find(unit_key);
+        if (it == unit_states_.end()) {
+            return GEPHI_COLOR_BLUE;  // Default
+        }
+        
+        const auto& unit = it->second;
+        time_t now = time(NULL);
+        time_t idle_threshold = now - (affiliation_timeout_hours_ * 3600);
+        
+        // Grey if deregistered OR idle
+        if (!unit.registered || unit.last_active < idle_threshold) {
+            return GEPHI_COLOR_GREY;
+        }
+        
+        return unit.ever_encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
+    }
+    
+    // Get affiliation data for API
+    json get_affiliation_data() const {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        time_t now = time(NULL);
+        time_t idle_threshold = now - (affiliation_timeout_hours_ * 3600);
+        
+        json result = {
+            {"units", json::array()},
+            {"talkgroups", json::array()},
+            {"config", {
+                {"timeout_hours", affiliation_timeout_hours_}
+            }}
+        };
+        
+        for (const auto& pair : unit_states_) {
+            const auto& unit = pair.second;
+            bool is_idle = unit.last_active < idle_threshold;
+            
+            json tg_counts = json::object();
+            for (const auto& tg_pair : unit.talkgroup_transmission_counts) {
+                tg_counts[std::to_string(tg_pair.first)] = tg_pair.second;
+            }
+            
+            result["units"].push_back({
+                {"id", unit.id},
+                {"wacn", unit.wacn},
+                {"sysid", unit.sysid},
+                {"alias", unit.alias},
+                {"ever_encrypted", unit.ever_encrypted},
+                {"last_active", unit.last_active},
+                {"registered", unit.registered},
+                {"is_idle", is_idle},
+                {"transmission_count", unit.transmission_count},
+                {"talkgroup_transmission_counts", tg_counts}
+            });
+        }
+        
+        for (const auto& pair : talkgroup_states_) {
+            const auto& tg = pair.second;
+            bool is_idle = tg.last_active < idle_threshold;
+            
+            json unit_counts = json::object();
+            for (const auto& unit_pair : tg.unit_transmission_counts) {
+                unit_counts[std::to_string(unit_pair.first)] = unit_pair.second;
+            }
+            
+            result["talkgroups"].push_back({
+                {"id", tg.id},
+                {"wacn", tg.wacn},
+                {"sysid", tg.sysid},
+                {"alias", tg.alias},
+                {"ever_encrypted", tg.ever_encrypted},
+                {"last_active", tg.last_active},
+                {"is_idle", is_idle},
+                {"transmission_count", tg.transmission_count},
+                {"unit_transmission_counts", unit_counts}
+            });
+        }
+        
+        return result;
+    }
+    
+    // Save affiliation state to JSON file
+    void save_affiliation_state() {
+        if (affiliation_persist_file_.empty()) return;
+        
+        try {
+            json persist_data = {
+                {"version", 1},
+                {"saved_at", time(NULL)},
+                {"units", json::array()},
+                {"talkgroups", json::array()}
+            };
+            
+            {
+                std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+                
+                for (const auto& pair : unit_states_) {
+                    const auto& unit = pair.second;
+                    json tg_counts = json::object();
+                    for (const auto& tg_pair : unit.talkgroup_transmission_counts) {
+                        tg_counts[std::to_string(tg_pair.first)] = tg_pair.second;
+                    }
+                    persist_data["units"].push_back({
+                        {"id", unit.id},
+                        {"wacn", unit.wacn},
+                        {"sysid", unit.sysid},
+                        {"alias", unit.alias},
+                        {"encr_seen", unit.ever_encrypted},
+                        {"last_active", unit.last_active},
+                        {"registered", unit.registered},
+                        {"tx_count", unit.transmission_count},
+                        {"tg_activity", tg_counts}
+                    });
+                }
+                
+                for (const auto& pair : talkgroup_states_) {
+                    const auto& tg = pair.second;
+                    json unit_counts = json::object();
+                    for (const auto& unit_pair : tg.unit_transmission_counts) {
+                        unit_counts[std::to_string(unit_pair.first)] = unit_pair.second;
+                    }
+                    persist_data["talkgroups"].push_back({
+                        {"id", tg.id},
+                        {"wacn", tg.wacn},
+                        {"sysid", tg.sysid},
+                        {"alias", tg.alias},
+                        {"encr_seen", tg.ever_encrypted},
+                        {"last_active", tg.last_active},
+                        {"tx_count", tg.transmission_count},
+                        {"unit_activity", unit_counts}
+                    });
+                }
+            }
+            
+            // Write to file atomically (write to temp, then rename)
+            std::string temp_file = affiliation_persist_file_ + ".tmp";
+            std::ofstream out(temp_file);
+            if (!out.good()) {
+                BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Failed to open " << temp_file << " for writing";
+                return;
+            }
+            out << persist_data.dump(2);  // Pretty print with 2-space indent
+            out.close();
+            
+            // Atomic rename
+            if (std::rename(temp_file.c_str(), affiliation_persist_file_.c_str()) != 0) {
+                BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Failed to rename temp file to " << affiliation_persist_file_;
+            } else {
+                BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Saved affiliation state to " << affiliation_persist_file_;
+            }
+            
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << log_prefix_ << "Failed to save affiliation state: " << e.what();
+        }
+    }
+    
+    // Load affiliation state from JSON file
+    void load_affiliation_state() {
+        if (affiliation_persist_file_.empty()) return;
+        
+        try {
+            std::ifstream in(affiliation_persist_file_);
+            if (!in.good()) {
+                BOOST_LOG_TRIVIAL(info) << log_prefix_ << "No existing affiliation state file found (this is normal on first run)";
+                return;
+            }
+            
+            json persist_data;
+            in >> persist_data;
+            
+            // Check version
+            int version = persist_data.value("version", 0);
+            if (version != 1) {
+                BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Unsupported affiliation state version: " << version;
+                return;
+            }
+            
+            std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+            unit_states_.clear();
+            talkgroup_states_.clear();
+            
+            // Load units
+            if (persist_data.contains("units")) {
+                for (const auto& unit_json : persist_data["units"]) {
+                    UnitState unit;
+                    unit.id = unit_json.value("id", 0L);
+                    unit.wacn = unit_json.value("wacn", 0);
+                    unit.sysid = unit_json.value("sysid", 0);
+                    unit.alias = unit_json.value("alias", "");
+                    unit.ever_encrypted = unit_json.value("encr_seen", false);
+                    unit.last_active = unit_json.value("last_active", 0L);
+                    unit.registered = unit_json.value("registered", false);
+                    unit.transmission_count = unit_json.value("tx_count", 0);
+                    
+                    if (unit_json.contains("tg_activity")) {
+                        for (auto& item : unit_json["tg_activity"].items()) {
+                            long tg_id = std::stol(item.key());
+                            int count = item.value();
+                            unit.talkgroup_transmission_counts[tg_id] = count;
+                        }
+                    }
+                    
+                    std::string key = make_unit_key(unit.wacn, unit.sysid, unit.id);
+                    unit_states_[key] = unit;
+                }
+            }
+            
+            // Load talkgroups
+            if (persist_data.contains("talkgroups")) {
+                for (const auto& tg_json : persist_data["talkgroups"]) {
+                    TalkgroupState tg;
+                    tg.id = tg_json.value("id", 0L);
+                    tg.wacn = tg_json.value("wacn", 0);
+                    tg.sysid = tg_json.value("sysid", 0);
+                    tg.alias = tg_json.value("alias", "");
+                    tg.ever_encrypted = tg_json.value("encr_seen", false);
+                    tg.last_active = tg_json.value("last_active", 0L);
+                    tg.transmission_count = tg_json.value("tx_count", 0);
+                    
+                    if (tg_json.contains("unit_activity")) {
+                        for (auto& item : tg_json["unit_activity"].items()) {
+                            long unit_id = std::stol(item.key());
+                            int count = item.value();
+                            tg.unit_transmission_counts[unit_id] = count;
+                        }
+                    }
+                    
+                    std::string key = make_tg_key(tg.wacn, tg.sysid, tg.id);
+                    talkgroup_states_[key] = tg;
+                }
+            }
+            
+            BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Loaded " << unit_states_.size() << " units and " 
+                                    << talkgroup_states_.size() << " talkgroups from " << affiliation_persist_file_;
+            
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << log_prefix_ << "Failed to load affiliation state: " << e.what();
+        }
+    }
+    
     // Generate display name for system with number prefix
     std::string get_unique_sys_name(System *sys) {
         int sys_num = sys->get_sys_num();
@@ -398,6 +887,11 @@ public:
         console_max_lines_ = config_data.value("console_lines", 5000);
         theme_ = config_data.value("theme", "nostromo");
         
+        // Affiliation tracking configuration
+        affiliation_timeout_hours_ = config_data.value("affiliation_timeout_hours", 12);
+        affiliation_persist_file_ = config_data.value("affiliation_persist_file", "");
+        affiliation_persist_interval_sec_ = config_data.value("affiliation_persist_interval_sec", 300);
+        
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Port:          " << port_;
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Bind:          " << bind_address_;
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Auth:          " << (username_.empty() ? "[disabled]" : "[enabled]");
@@ -405,6 +899,8 @@ public:
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "HTTPS:         " << (ssl_cert_.empty() ? "[disabled]" : "[enabled]");
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Console Lines: " << console_max_lines_;
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Theme:         " << theme_;
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Timeout: " << affiliation_timeout_hours_ << "h";
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Persist: " << (affiliation_persist_file_.empty() ? "[disabled]" : affiliation_persist_file_);
         
         return 0;
     }
@@ -419,9 +915,9 @@ public:
     int start() override {
         log_prefix_ = "[tr-web]\t";
 
-        // Best-effort read of trunk-recorder config.json (static device metadata)
+        // Best-effort read of trunk-recorder config (static device metadata)
         try {
-            std::ifstream in("./config.json");
+            std::ifstream in(tr_config_->config_file);
             if (in.good()) {
                 in >> tr_config_json_;
             }
@@ -453,6 +949,9 @@ public:
         
         // Setup console log capture
         setup_log_capture();
+
+        // Load persisted affiliation state
+        load_affiliation_state();
 
         // Prime initial caches for first page load
         resend_recorders();
@@ -555,6 +1054,39 @@ public:
                     }
                 }
 
+                // Flush graph streaming events for Gephi compatibility (separate /graph-stream endpoint)
+                std::deque<std::string> graph_events;
+                {
+                    std::lock_guard<std::mutex> lock(graph_event_queue_mutex_);
+                    static constexpr size_t MAX_GRAPH_FLUSH = 50;
+                    while (!graph_event_queue_.empty() && graph_events.size() < MAX_GRAPH_FLUSH) {
+                        graph_events.push_back(std::move(graph_event_queue_.front()));
+                        graph_event_queue_.pop_front();
+                    }
+                    graph_event_queue_dropped_ = 0;
+                }
+                
+                // Send initial state to new Gephi connections
+                if (gephi_initial_dump_pending_.exchange(false, std::memory_order_acquire)) {
+                    send_gephi_initial_state();
+                }
+
+                // Flush graph events to /graph-stream clients
+                if (!graph_events.empty()) {
+                }
+                for (const auto& graph_event : graph_events) {
+                    server_.broadcast_raw_to_path("/graph-stream", graph_event);
+                }
+                
+                // Periodic save of affiliation state
+                if (!affiliation_persist_file_.empty()) {
+                    time_t current_time = time(NULL);
+                    if (current_time - last_affiliation_save_ >= affiliation_persist_interval_sec_) {
+                        save_affiliation_state();
+                        last_affiliation_save_ = current_time;
+                    }
+                }
+
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         });
@@ -597,6 +1129,9 @@ public:
         if (broadcast_thread_.joinable()) {
             broadcast_thread_.join();
         }
+        
+        // Save affiliation state on shutdown
+        save_affiliation_state();
         
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Web server stopped";
         return 0;
@@ -743,16 +1278,18 @@ public:
         json grant_payload = {{"type", "unit_event"}, {"event", event_json}};
         enqueue_sse_event("unit_event", grant_payload.dump());
         
+        // Update affiliation state for proper Gephi coloring
+        bool encrypted = call->get_encrypted();
+        update_affiliation_state(sys, source_id, talkgroup_num, encrypted);
+        
+        // Send graph streaming data for Gephi
+        send_gephi_unit_event(sys, source_id, talkgroup_num, encrypted);
+        
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
     
     int unit_group_affiliation(System *sys, long source_id, long talkgroup_num) override {
-        {
-            std::lock_guard<std::mutex> lock(unit_affiliations_mutex_);
-            unit_affiliations_[source_id] = talkgroup_num;
-        }
-        
         // Look up talkgroup alpha tag
         std::string tg_alpha = "";
         Talkgroup *tg = sys->find_talkgroup(talkgroup_num);
@@ -781,6 +1318,12 @@ public:
         json payload = {{"type", "unit_event"}, {"event", event_json}};
         enqueue_sse_event("unit_event", payload.dump());
         
+        // Update affiliation state (affiliations are typically not encrypted)
+        update_affiliation_state(sys, source_id, talkgroup_num, false);
+        
+        // Send graph streaming data for Gephi
+        send_gephi_unit_event(sys, source_id, talkgroup_num, false);
+        
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
@@ -806,16 +1349,28 @@ public:
         json payload = {{"type", "unit_event"}, {"event", event_json}};
         enqueue_sse_event("unit_event", payload.dump());
         
+        // Update state: unit is now registered
+        set_unit_registration(sys, source_id, true);
+        
+        // Create unlinked Gephi node for registered unit (use state color)
+        if (source_id != -1 && source_id != 0) {
+            std::string node_id = std::to_string(source_id);
+            std::string color = get_unit_effective_color(sys, source_id);
+            json node_data = {
+                {"id", source_id},
+                {"label", unit_alias.empty() ? node_id : unit_alias},
+                {"color", color},
+                {"size", 15}
+            };
+            json add_node = {{"an", {{node_id, node_data}}}};
+            enqueue_graph_event(add_node.dump() + "\r\n");
+        }
+        
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
     
     int unit_deregistration(System *sys, long source_id) override {
-        {
-            std::lock_guard<std::mutex> lock(unit_affiliations_mutex_);
-            unit_affiliations_.erase(source_id);
-        }
-        
         // Look up unit alias
         std::string unit_alias = sys->find_unit_tag(source_id);
         
@@ -835,6 +1390,22 @@ public:
         
         json payload = {{"type", "unit_event"}, {"event", event_json}};
         enqueue_sse_event("unit_event", payload.dump());
+        
+        // Update state: unit is now deregistered
+        set_unit_registration(sys, source_id, false);
+        
+        // Change Gephi node color to grey for deregistered unit
+        if (source_id != -1 && source_id != 0) {
+            std::string node_id = std::to_string(source_id);
+            json node_data = {
+                {"id", source_id},
+                {"label", unit_alias.empty() ? node_id : unit_alias},
+                {"color", GEPHI_COLOR_GREY},
+                {"size", 15}
+            };
+            json change_node = {{"cn", {{node_id, node_data}}}};
+            enqueue_graph_event(change_node.dump() + "\r\n");
+        }
         
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
@@ -916,6 +1487,9 @@ public:
         
         cache_trunk_message(event_json);
         enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
+
+        send_gephi_unit_event(sys, source_id, talkgroup_num, false);
+
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
@@ -1013,6 +1587,21 @@ private:
         // SSE endpoint for live updates
         server_.SSE("/events");
         
+        // Dedicated endpoint for Gephi graph streaming (raw JSON, not SSE)
+        server_.RawStream("/graph-stream");
+        
+        // Notify when Gephi clients connect so we can send current state
+        server_.set_raw_stream_connect_notify([this]() {
+            this->request_gephi_initial_dump();
+        });
+        
+        // Test endpoint to manually generate graph events
+        server_.Get("/api/test_graph", [this](const httplib::Request& req, httplib::Response& res) {
+            json test_node = {{"an", {{"test1", {{"id", "test1"}, {"label", "Test Node"}, {"color", "#0099CC"}, {"size", 20}}}}}};
+            enqueue_graph_event(test_node.dump() + "\n");
+            res.set_content("{\"status\":\"graph event queued\"}", "application/json");
+        });
+        
         // REST API endpoint for initial state
         server_.Get("/api/status", [this](const httplib::Request& req, httplib::Response& res) {
             json response;
@@ -1032,7 +1621,8 @@ private:
             response["callRateHistory"] = get_call_rate_history();
             response["callHistory"] = get_call_history();
             response["trunkMessages"] = get_trunk_messages();
-            response["unitAffiliations"] = get_unit_affiliations();
+            // COMMENTED OUT: unitAffiliations not currently displayed in UI
+            // response["unitAffiliations"] = get_unit_affiliations();
             response["consoleLogs"] = get_console_logs();
             response["timestamp"] = time(NULL);
             response["sse_clients"] = server_.sse_client_count();
@@ -1062,6 +1652,14 @@ private:
         // Console logs endpoint
         server_.Get("/api/console", [this](const httplib::Request& req, httplib::Response& res) {
             json response = {{"lines", get_console_logs()}};
+            res.set_content(response.dump(), "application/json");
+        });
+        
+        // Affiliations data endpoint
+        server_.Get("/api/affiliations", [this](const httplib::Request& req, httplib::Response& res) {
+            // BOOST_LOG_TRIVIAL(info) << "[tr-web] API /api/affiliations called. unit_states_ size: " << unit_states_.size() << ", talkgroup_states_ size: " << talkgroup_states_.size();
+            json response = get_affiliation_data();
+            // BOOST_LOG_TRIVIAL(info) << "[tr-web] API response units count: " << response["units"].size() << ", talkgroups count: " << response["talkgroups"].size();
             res.set_content(response.dump(), "application/json");
         });
         
@@ -1203,10 +1801,11 @@ private:
         // Admin: Get trunk-recorder config
         server_.Get("/api/admin/config", [this](const httplib::Request& req, httplib::Response& res) {
             try {
-                std::ifstream config_file("./config.json");
+                std::string config_path = tr_config_->config_file;
+                std::ifstream config_file(config_path);
                 if (!config_file.good()) {
                     res.status = 404;
-                    json error = {{"error", "Config file not found: ./config.json"}};
+                    json error = {{"error", "Config file not found: " + config_path}};
                     res.set_content(error.dump(), "application/json");
                     return;
                 }
@@ -1215,7 +1814,7 @@ private:
                                           std::istreambuf_iterator<char>());
                 json response = {
                     {"content", config_content},
-                    {"path", "./config.json"}
+                    {"path", config_path}
                 };
                 res.set_content(response.dump(), "application/json");
             } catch (const std::exception& e) {
@@ -1228,9 +1827,6 @@ private:
         // Admin: Save config (atomic with backup)
         server_.Post("/api/admin/save-config", [this](const httplib::Request& req, httplib::Response& res) {
             try {
-                // Log request size for debugging
-                BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Save config request size: " << req.body.size() << " bytes";
-                
                 json request_data;
                 try {
                     request_data = json::parse(req.body);
@@ -1244,7 +1840,7 @@ private:
                 }
                 
                 std::string new_content = request_data.value("content", "");
-                std::string config_path = request_data.value("path", "./config.json");
+                std::string config_path = request_data.value("path", tr_config_->config_file);
                 
                 if (new_content.empty()) {
                     res.status = 400;
@@ -1569,6 +2165,266 @@ private:
             {"unit_tags_mode", sys->get_unit_tags_mode()},
             {"unit_tags_ota_file", sys->get_unit_tags_ota_file()}
         };
+    }
+    
+    // Gephi streaming
+    std::string create_gephi_add_unit_node(long unit_id, const std::string& unit_alpha, bool encrypted) {
+        std::string node_id = std::to_string(unit_id);
+        
+        json node_data = {
+            {"id", unit_id},
+            {"label", unit_alpha.empty() ? node_id : unit_alpha},
+            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE},
+            {"size", 15}
+        };
+        
+        if (encrypted) {
+            node_data["encryption"] = true;
+        }
+        
+        json add_node = {{"an", {{node_id, node_data}}}};
+        return add_node.dump() + "\r\n";
+    }
+    
+    std::string create_gephi_change_unit_node(long unit_id, const std::string& unit_alpha, bool encrypted) {
+        std::string node_id = std::to_string(unit_id);
+        
+        json node_data = {
+            {"id", unit_id},
+            {"label", unit_alpha.empty() ? node_id : unit_alpha},
+            {"size", 15}
+        };
+        
+        // Preserve encryption color on change events
+        if (encrypted) {
+            node_data["color"] = GEPHI_COLOR_RED;
+            node_data["encryption"] = true;
+        }
+        
+        json change_node = {{"cn", {{node_id, node_data}}}};
+        return change_node.dump() + "\r\n";
+    }
+    
+    std::string create_gephi_add_talkgroup_node(long tg_id, const std::string& tg_alpha, bool encrypted) {
+        std::string node_id = "TG-" + std::to_string(tg_id);
+        std::string label = tg_alpha.empty() ? std::to_string(tg_id) : tg_alpha;
+        
+        json node_data = {
+            {"id", node_id},
+            {"label", label},
+            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
+            {"size", 25}
+        };
+        
+        if (encrypted) {
+            node_data["encryption"] = true;
+        }
+        
+        json add_node = {{"an", {{node_id, node_data}}}};
+        return add_node.dump() + "\r\n";
+    }
+    
+    std::string create_gephi_change_talkgroup_node(long tg_id, const std::string& tg_alpha, bool encrypted) {
+        std::string node_id = "TG-" + std::to_string(tg_id);
+        std::string label = tg_alpha.empty() ? std::to_string(tg_id) : tg_alpha;
+        
+        json node_data = {
+            {"id", node_id},
+            {"label", label},
+            {"size", 25}
+        };
+        
+        // Only include color/encryption if encrypted (prevents resetting red to green on unencrypted events)
+        if (encrypted) {
+            node_data["color"] = GEPHI_COLOR_RED;
+            node_data["encryption"] = true;
+        }
+        
+        json change_node = {{"cn", {{node_id, node_data}}}};
+        return change_node.dump() + "\r\n";
+    }
+    
+    std::string create_gephi_add_edge(long unit_id, long tg_id, bool encrypted) {
+        std::string unit_node = std::to_string(unit_id);
+        std::string tg_node = "TG-" + std::to_string(tg_id);
+        std::string edge_id = tg_node + "-" + unit_node;
+        
+        json edge_data = {
+            {"source", unit_node},
+            {"target", tg_node},
+            {"directed", false}
+        };
+        
+        if (encrypted) {
+            edge_data["color"] = GEPHI_COLOR_RED;
+            edge_data["encryption"] = true;
+        }
+        
+        json add_edge = {{"ae", {{edge_id, edge_data}}}};
+        return add_edge.dump() + "\r\n";
+    }
+    
+    std::string create_gephi_change_edge(long unit_id, long tg_id, bool encrypted) {
+        std::string unit_node = std::to_string(unit_id);
+        std::string tg_node = "TG-" + std::to_string(tg_id);
+        std::string edge_id = tg_node + "-" + unit_node;
+        
+        json edge_data = {
+            {"source", unit_node},
+            {"target", tg_node},
+            {"directed", false}
+        };
+        
+        // Only include color/encryption if encrypted
+        if (encrypted) {
+            edge_data["color"] = GEPHI_COLOR_RED;
+            edge_data["encryption"] = true;
+        }
+        
+        json change_edge = {{"ce", {{edge_id, edge_data}}}};
+        return change_edge.dump() + "\r\n";
+    }
+    
+    // Generate complete Gephi graph state dump for initial connection
+    std::string generate_gephi_state_dump() {
+        std::stringstream dump;
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Generating Gephi initial state dump: " 
+                                 << unit_states_.size() << " units, " 
+                                 << talkgroup_states_.size() << " talkgroups";
+        
+        // Add all tracked units as nodes
+        for (const auto& [key, unit] : unit_states_) {
+            // Skip bogon IDs
+            if (unit.id == 0 || unit.id == -1) continue;
+            
+            std::string unit_alpha = "";
+            std::string color = GEPHI_COLOR_BLUE;
+            
+            // Try to find system to get alias and color
+            for (auto* sys : tr_systems_) {
+                if (sys->get_wacn() == unit.wacn && sys->get_sys_id() == unit.sysid) {
+                    unit_alpha = sys->find_unit_tag(unit.id);
+                    color = get_unit_effective_color(sys, unit.id);
+                    break;
+                }
+            }
+            
+            json node_data = {
+                {"id", unit.id},
+                {"label", unit_alpha.empty() ? std::to_string(unit.id) : unit_alpha},
+                {"color", color},
+                {"size", 15}
+            };
+            
+            if (unit.ever_encrypted) {
+                node_data["encryption"] = true;
+            }
+            
+            std::string node_id = std::to_string(unit.id);
+            json add_node = {{"an", {{node_id, node_data}}}};
+            dump << add_node.dump() << "\r\n";
+        }
+        
+        // Add all tracked talkgroups as nodes
+        for (const auto& [key, tg] : talkgroup_states_) {
+            // Skip bogon IDs
+            if (tg.id == 0 || tg.id == -1) continue;
+            
+            std::string tg_alpha = "";
+            for (auto* sys : tr_systems_) {
+                if (sys->get_wacn() == tg.wacn && sys->get_sys_id() == tg.sysid) {
+                    Talkgroup *tg_obj = sys->find_talkgroup(tg.id);
+                    if (tg_obj) {
+                        tg_alpha = tg_obj->alpha_tag;
+                    }
+                    break;
+                }
+            }
+            
+            std::string node_id = "TG-" + std::to_string(tg.id);
+            json node_data = {
+                {"id", node_id},
+                {"label", tg_alpha.empty() ? std::to_string(tg.id) : tg_alpha},
+                {"color", tg.ever_encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
+                {"size", 20}
+            };
+            
+            if (tg.ever_encrypted) {
+                node_data["encryption"] = true;
+            }
+            
+            json add_node = {{"an", {{node_id, node_data}}}};
+            dump << add_node.dump() << "\r\n";
+        }
+        
+        // Add all tracked edges (unit-talkgroup affiliations)
+        for (const auto& [key, unit] : unit_states_) {
+            if (unit.id == 0 || unit.id == -1) continue;
+            
+            for (const auto& [tg_id, count] : unit.talkgroup_transmission_counts) {
+                if (tg_id == 0 || tg_id == -1) continue;
+                
+                std::string unit_node = std::to_string(unit.id);
+                std::string tg_node = "TG-" + std::to_string(tg_id);
+                std::string edge_id = tg_node + "-" + unit_node;
+                
+                // Determine if this affiliation has seen encryption
+                bool edge_encrypted = unit.ever_encrypted;
+                
+                json edge_data = {
+                    {"source", unit_node},
+                    {"target", tg_node},
+                    {"directed", false}
+                };
+                
+                if (edge_encrypted) {
+                    edge_data["color"] = GEPHI_COLOR_RED;
+                    edge_data["encryption"] = true;
+                }
+                
+                json add_edge = {{"ae", {{edge_id, edge_data}}}};
+                dump << add_edge.dump() << "\r\n";
+            }
+        }
+        
+        return dump.str();
+    }
+    
+    void send_gephi_unit_event(System* sys, long unit_id, long tg_id, bool encrypted = false) {
+        // Filter out anomalous IDs that are not valid for graph theory
+        // -1 indicates unknown/invalid radio ID
+        // 0 indicates uninitialized or missing unit/talkgroup ID
+        if (unit_id == -1 || unit_id == 0 || tg_id == 0) {
+            return;
+        }
+        
+        std::string unit_alpha = sys->find_unit_tag(unit_id);
+        
+        std::string tg_alpha = "";
+        Talkgroup *tg = sys->find_talkgroup(tg_id);
+        if (tg) {
+            tg_alpha = tg->alpha_tag;
+        }
+        
+        // Always send both "add" and "change" events (no state tracking)
+        // - "add" events set initial color (Gephi ignores duplicates)
+        // - "change" events only set color if encrypted (prevents blue reset)
+        std::stringstream events;
+        
+        // Send add events (establish nodes/edges with correct initial colors)
+        events << create_gephi_add_unit_node(unit_id, unit_alpha, encrypted);
+        events << create_gephi_add_talkgroup_node(tg_id, tg_alpha, encrypted);
+        events << create_gephi_add_edge(unit_id, tg_id, encrypted);
+        
+        // Send change events (update labels, only set color if encrypted)
+        events << create_gephi_change_unit_node(unit_id, unit_alpha, encrypted);
+        events << create_gephi_change_talkgroup_node(tg_id, tg_alpha, encrypted);
+        events << create_gephi_change_edge(unit_id, tg_id, encrypted);
+        
+        // Queue all events together
+        enqueue_graph_event(events.str());
     }
     
     // Factory method

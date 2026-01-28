@@ -43,6 +43,7 @@
             <button class="main-tab" data-tab="systems" onclick="showMainTab('systems')">Systems</button>
             <button class="main-tab" data-tab="console" onclick="showMainTab('console')">Console</button>
             <button class="main-tab" data-tab="omnitrunker" onclick="showMainTab('omnitrunker')">Omnitrunker</button>
+            <button class="main-tab" data-tab="affiliations" onclick="showMainTab('affiliations')">Affiliations</button>
             <button class="main-tab" data-tab="admin" onclick="showMainTab('admin')">Admin</button>
         </div>
         
@@ -316,6 +317,136 @@
             </div>
         </div>
         
+        <!-- Affiliations Panel -->
+        <div class="main-panel" id="panel-affiliations">
+            <div style="display: flex; gap: 10px; margin-bottom: 15px; align-items: center;">
+                <!-- Sub-tabs for view selection -->
+                <div class="affiliation-tabs">
+                    <button class="affiliation-tab active" data-view="talkgroups" onclick="showAffiliationView('talkgroups')">By Talkgroup</button>
+                    <button class="affiliation-tab" data-view="units" onclick="showAffiliationView('units')">By Unit</button>
+                </div>
+                
+                <!-- Search bar with clear button -->
+                <div style="flex: 1; position: relative;">
+                    <input type="text" id="affiliationSearch" placeholder="Search by ID or alias..." 
+                           style="width: 100%; padding: 8px 36px 8px 12px; background: var(--bg-secondary); border: 1px solid var(--border); 
+                                  border-radius: 4px; color: var(--text-primary); font-size: 14px;">
+                    <button id="clearAffiliationSearch" onclick="clearAffiliationSearch()" 
+                            style="position: absolute; right: 8px; top: 50%; transform: translateY(-50%); 
+                                   background: transparent; border: none; color: var(--text-secondary); 
+                                   cursor: pointer; padding: 4px 8px; font-size: 16px; display: none;"
+                            title="Clear search">✕</button>
+                </div>
+                
+                <!-- Filter Bogons Checkbox -->
+                <label style="display: flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer;">
+                    <input type="checkbox" id="filterBogonsCheckbox" checked onchange="renderAffiliationTable()" 
+                           style="cursor: pointer; width: 16px; height: 16px;">
+                    <span style="font-size: 14px; color: var(--text-primary);">Filter Bogons</span>
+                </label>
+                
+                <!-- API Info Button -->
+                <button onclick="toggleApiInfo()" 
+                        style="padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); 
+                               border: 1px solid var(--border); border-radius: 4px; cursor: pointer; 
+                               font-size: 14px; white-space: nowrap;">
+                    ℹ️ API Info
+                </button>
+                
+                <!-- Export button -->
+                <button onclick="exportAffiliationsJSON()" 
+                        style="padding: 8px 16px; background: var(--accent); color: #fff; border: none; 
+                               border-radius: 4px; cursor: pointer; font-size: 14px; white-space: nowrap;">
+                    Export JSON
+                </button>
+            </div>
+            
+            <!-- GraphStream API Info Box -->
+            <div id="apiInfoBox" style="display: none; background: var(--bg-secondary); border: 1px solid var(--border); 
+                                         border-radius: 4px; padding: 16px; margin-bottom: 15px;">
+                <h3 style="margin: 0 0 12px 0; font-size: 16px; color: var(--text-primary);">GraphStream API Setup</h3>
+                <ol style="margin: 0; padding-left: 20px; color: var(--text-primary); line-height: 1.8;">
+                    <li>Download and install <a href="https://gephi.org/" target="_blank" style="color: var(--accent);">Gephi</a></li>
+                    <li>Install the <strong>Graph Streaming</strong> plugin:
+                        <ul style="margin: 4px 0; padding-left: 20px;">
+                            <li>Tools → Plugins → Available Plugins</li>
+                            <li>Search for "Graph Streaming" and install</li>
+                        </ul>
+                    </li>
+                    <li>Connect to the stream:
+                        <ul style="margin: 4px 0; padding-left: 20px;">
+                            <li>Window → Streaming → Master Server</li>
+                            <li>Right-click "Master" → "Connect to Stream"</li>
+                                <li>URL: <code id="graphStreamUrl" style="background: var(--bg-tertiary); padding: 2px 6px; border-radius: 3px; 
+                                          color: var(--accent); user-select: all; cursor: text;"></code>
+                                <button id="copyGraphStreamUrl" style="margin-left: 8px; padding: 2px 8px; background: var(--bg-tertiary); border: 1px solid var(--border); 
+                                           border-radius: 3px; cursor: pointer; font-size: 12px;">Copy</button>
+                                                        <li style="margin-top: 8px; color: var(--text-secondary); font-size: 13px;">
+                                                            <b>Note:</b> If you have configured a username and password in the plugin, you must enter them in Gephi's authentication fields.
+                                                        </li>
+                            </li>
+                        </ul>
+                    </li>
+                    <li>Run your system and watch the graph populate with units, talkgroups, and affiliations in real-time</li>
+                </ol>
+                <p style="margin: 12px 0 0 0; padding: 8px; background: var(--bg-tertiary); border-left: 3px solid var(--accent); 
+                          font-size: 13px; color: var(--text-secondary);">
+                    💡 <strong>Tip:</strong> The graph stream now sends a complete initial dump of all tracked units and talkgroups 
+                    when you connect, so you don't need to maintain a permanent connection to see the full network.
+                </p>
+            </div>
+            
+            <!-- Talkgroup View -->
+            <div class="affiliation-view active" id="view-talkgroups">
+                <div class="card">
+                    <div style="overflow-x: auto;">
+                        <table class="affiliation-table">
+                            <thead>
+                                <tr>
+                                    <th onclick="sortAffiliationTable('talkgroups', 'id')" style="cursor: pointer; width: 150px;">TG ID <span class="sort-indicator"></span></th>
+                                    <th onclick="sortAffiliationTable('talkgroups', 'wacn')" style="cursor: pointer; width: 90px;">WACN <span class="sort-indicator"></span></th>
+                                    <th onclick="sortAffiliationTable('talkgroups', 'sysid')" style="cursor: pointer; width: 90px;">SYSID <span class="sort-indicator"></span></th>
+                                    <th onclick="sortAffiliationTable('talkgroups', 'alias')" style="cursor: pointer;">Alias <span class="sort-indicator"></span></th>
+                                    <th style="width: 120px;">Status</th>
+                                    <th style="width: 120px;">Encryption</th>
+                                    <th onclick="sortAffiliationTable('talkgroups', 'last_active')" style="cursor: pointer; width: 130px;">Last Active <span class="sort-indicator"></span></th>
+                                    <th onclick="sortAffiliationTable('talkgroups', 'transmission_count')" style="cursor: pointer; width: 110px;">TX Count <span class="sort-indicator"></span></th>
+                                </tr>
+                            </thead>
+                            <tbody id="talkgroupTableBody">
+                                <tr><td colspan="8" style="text-align: center; padding: 40px;">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Unit View -->
+            <div class="affiliation-view" id="view-units">
+                <div class="card">
+                    <div style="overflow-x: auto;">
+                        <table class="affiliation-table">
+                            <thead>
+                                <tr>
+                                    <th onclick="sortAffiliationTable('units', 'id')" style="cursor: pointer; width: 150px;">Unit ID <span class="sort-indicator"></span></th>
+                                    <th onclick="sortAffiliationTable('units', 'wacn')" style="cursor: pointer; width: 90px;">WACN <span class="sort-indicator"></span></th>
+                                    <th onclick="sortAffiliationTable('units', 'sysid')" style="cursor: pointer; width: 90px;">SYSID <span class="sort-indicator"></span></th>
+                                    <th onclick="sortAffiliationTable('units', 'alias')" style="cursor: pointer;">Alias <span class="sort-indicator"></span></th>
+                                    <th style="width: 120px;">Status</th>
+                                    <th style="width: 120px;">Encryption</th>
+                                    <th onclick="sortAffiliationTable('units', 'last_active')" style="cursor: pointer; width: 130px;">Last Active <span class="sort-indicator"></span></th>
+                                    <th onclick="sortAffiliationTable('units', 'transmission_count')" style="cursor: pointer; width: 110px;">TX Count <span class="sort-indicator"></span></th>
+                                </tr>
+                            </thead>
+                            <tbody id="unitTableBody">
+                                <tr><td colspan="8" style="text-align: center; padding: 40px;">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
         <!-- Admin Panel -->
         <div class="main-panel" id="panel-admin">
             <div style="display: flex; gap: 0; height: calc(100vh - 180px);">
@@ -359,6 +490,9 @@
                                 </div>
                             </div>
                             <div style="padding: 10px; display: flex; flex-direction: column; height: calc(100vh - 300px);">
+                                <div style="margin-bottom: 8px; padding: 8px 12px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 4px; font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 0.85rem;">
+                                    <span style="color: var(--text-secondary);">File:</span> <span id="configFilePath" style="color: var(--text-primary);"></span>
+                                </div>
                                 <div class="json-editor-container" style="display: flex; min-height: 400px; max-height: calc(100vh - 400px); flex: 1; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; background: var(--bg-dark);">
                                     <div id="lineNumbers" style="background: #1a1a1a; color: #666; padding: 12px 8px; text-align: right; font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 13px; line-height: 1.5; user-select: none; border-right: 1px solid var(--border); overflow: hidden; white-space: pre; min-width: 60px;"></div>
                                     <div class="json-editor-wrapper" style="flex: 1; position: relative; overflow: auto;">

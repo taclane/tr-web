@@ -227,9 +227,10 @@ struct SSEClient {
     std::mutex write_mutex;
     std::string client_ip;
     std::string username;
+    std::string path;  // Track which path this client is connected to
     
-    explicit SSEClient(std::shared_ptr<SocketWrapper> sock, const std::string& ip = "", const std::string& user = "") 
-        : socket(sock), connected(true), client_ip(ip), username(user) {}
+    explicit SSEClient(std::shared_ptr<SocketWrapper> sock, const std::string& ip = "", const std::string& user = "", const std::string& p = "") 
+        : socket(sock), connected(true), client_ip(ip), username(user), path(p) {}
     
     bool send_event(const std::string& event, const std::string& data) {
         if (!connected || !socket->is_valid()) return false;
@@ -372,17 +373,73 @@ public:
         sse_paths_.push_back(path);
     }
     
-    // Send SSE event to all connected clients
+    // Register a raw stream endpoint (like SSE but without "data:" prefix)
+    void RawStream(const std::string& path) {
+        sse_paths_.push_back(path);  // Still needs to be in sse_paths_ to be handled
+        raw_stream_paths_.push_back(path);  // Track separately for format detection
+    }
+    
+    // Set fast notification for raw stream connections (just sets a flag, no heavy work!)
+    void set_raw_stream_connect_notify(std::function<void()> notify) {
+        raw_stream_connect_notify_ = notify;
+    }
+    
+    // Send SSE event to all connected clients (except raw stream clients)
     void broadcast_sse(const std::string& event, const std::string& data) {
         std::lock_guard<std::mutex> lock(sse_mutex_);
         for (auto it = sse_clients_.begin(); it != sse_clients_.end();) {
-            if (!(*it)->connected || !(*it)->send_event(event, data)) {
-                (*it)->close();
-                it = sse_clients_.erase(it);
-            } else {
-                ++it;
+            // Skip raw stream clients - they only receive raw data
+            bool is_raw_stream_client = false;
+            for (const auto& raw_path : raw_stream_paths_) {
+                if ((*it)->path == raw_path) {
+                    is_raw_stream_client = true;
+                    break;
+                }
             }
+            
+            if (!is_raw_stream_client) {
+                if (!(*it)->connected || !(*it)->send_event(event, data)) {
+                    (*it)->close();
+                    it = sse_clients_.erase(it);
+                    continue;
+                }
+            }
+            ++it;
         }
+    }
+    
+    // Send raw data to clients on a specific path (for raw streaming like Gephi)
+    void broadcast_raw_to_path(const std::string& path, const std::string& data) {
+        std::lock_guard<std::mutex> lock(sse_mutex_);
+        int sent_count = 0;
+        int total_clients = 0;
+        for (auto it = sse_clients_.begin(); it != sse_clients_.end();) {
+            // Only send to clients on the specified path
+            if ((*it)->path == path) {
+                total_clients++;
+                if (!(*it)->connected) {
+                    (*it)->close();
+                    it = sse_clients_.erase(it);
+                    continue;
+                }
+                
+                // Send raw data without SSE formatting
+                std::lock_guard<std::mutex> write_lock((*it)->write_mutex);
+                ssize_t written = (*it)->socket->write(data.c_str(), data.size());
+                if (written < 0 || static_cast<size_t>(written) != data.size()) {
+                    BOOST_LOG_TRIVIAL(warning) << "[Web Plugin]\tFailed to send raw data to client on " << path << ": written=" << written << " expected=" << data.size();
+                    (*it)->close();
+                    it = sse_clients_.erase(it);
+                    continue;
+                } else {
+                    sent_count++;
+                }
+            }
+            ++it;
+        }
+        // if (total_clients > 0) {
+        //     BOOST_LOG_TRIVIAL(info) << "[Web Plugin]\tSent " << data.size() << " bytes to " << sent_count << "/" << total_clients << " clients on " << path;
+        // }
     }
     
     size_t sse_client_count() {
@@ -795,14 +852,36 @@ private:
             }
         }
 
-        // Send SSE headers
-        std::string response = 
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/event-stream\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: keep-alive\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "\r\n";
+        // Check if this is a raw stream (like Gephi)
+        bool is_raw_stream = false;
+        for (const auto& path : raw_stream_paths_) {
+            if (req.path == path) {
+                is_raw_stream = true;
+                break;
+            }
+        }
+
+        // Send appropriate headers
+        std::string response;
+        if (is_raw_stream) {
+            // Raw stream - just HTTP 200 with chunked encoding
+            response = 
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: keep-alive\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "\r\n";
+        } else {
+            // SSE - needs text/event-stream
+            response = 
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: keep-alive\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "\r\n";
+        }
         
         if (socket->write(response.c_str(), response.length()) <= 0) {
             socket->close();
@@ -810,17 +889,22 @@ private:
         }
         
         // Add to SSE clients
-        auto client = std::make_shared<SSEClient>(socket, client_ip, username);
+        auto client = std::make_shared<SSEClient>(socket, client_ip, username, req.path);
         {
             std::lock_guard<std::mutex> lock(sse_mutex_);
             sse_clients_.push_back(client);
         }
         
         // Log connection
-        BOOST_LOG_TRIVIAL(info) << "[Web Plugin]\tSSE session started - user: " << username << " from " << client_ip;
+        BOOST_LOG_TRIVIAL(info) << "[Web Plugin]\t" << (is_raw_stream ? "Raw stream" : "SSE") << " session started - user: " << username << " from " << client_ip << " path: " << req.path;
         
-        // Send initial keepalive
-        client->send_event("", "connected");
+        // Send initial keepalive (only for SSE, not raw streams)
+        if (!is_raw_stream) {
+            client->send_event("", "connected");
+        } else if (raw_stream_connect_notify_) {
+            // Notify plugin that a raw stream client connected (just sets a flag)
+            raw_stream_connect_notify_();
+        }
         
         // Keep connection alive until client disconnects
         char dummy[1];
@@ -972,9 +1056,12 @@ private:
     
     std::map<std::string, std::map<std::string, Handler>> routes_;
     std::vector<std::string> sse_paths_;
+    std::vector<std::string> raw_stream_paths_;  // Track raw stream paths separately
     
     std::mutex sse_mutex_;
     std::vector<std::shared_ptr<SSEClient>> sse_clients_;
+    
+    std::function<void()> raw_stream_connect_notify_;  // Fast notification for raw stream connects
     
     bool auth_enabled_ = false;
     std::string auth_credentials_;

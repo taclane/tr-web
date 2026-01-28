@@ -214,18 +214,16 @@ class Tr_Web : public Plugin_Api {
         
         int node_count = 0;
         int edge_count = 0;
-        
+
         time_t now = time(NULL);
         const time_t idle_threshold = 12 * 3600; // 12 hours
-        
-        // Send all units as nodes
+
+        // Gather all nodes
+        json all_nodes;
         for (const auto& [key, unit] : unit_states_) {
             if (unit.id == 0 || unit.id == -1) continue;
-            
             std::string node_id = std::to_string(unit.id);
             std::string label = unit.alias.empty() ? ("Unit " + std::to_string(unit.id)) : unit.alias;
-            
-            // Determine color based on status
             std::string color;
             if (!unit.registered) {
                 color = "#666666";
@@ -236,52 +234,44 @@ class Tr_Web : public Plugin_Api {
             } else {
                 color = GEPHI_COLOR_BLUE;
             }
-            
             json node_data = {
                 {"id", unit.id},
                 {"label", label},
                 {"color", color},
                 {"size", 15}
             };
-            
             if (unit.encr_seen) {
                 node_data["encryption"] = true;
             }
             if (!unit.registered) {
                 node_data["deregistered"] = true;
             }
-            
-            json add_node = {{"an", {{node_id, node_data}}}};
-            server_.broadcast_raw_to_path("/graph-stream", add_node.dump() + "\r\n");
+            all_nodes[node_id] = node_data;
             node_count++;
         }
-        
-        // Send all talkgroups as nodes
         for (const auto& [key, tg] : talkgroup_states_) {
             if (tg.id == 0 || tg.id == -1) continue;
-            
             std::string node_id = "TG-" + std::to_string(tg.id);
             std::string label = tg.alias.empty() ? ("TG " + std::to_string(tg.id)) : tg.alias;
-            
             std::string color = tg.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN;
-            
             json node_data = {
                 {"id", node_id},
                 {"label", label},
                 {"color", color},
                 {"size", 25}
             };
-            
             if (tg.encr_seen) {
                 node_data["encryption"] = true;
             }
-            
-            json add_node = {{"an", {{node_id, node_data}}}};
-            server_.broadcast_raw_to_path("/graph-stream", add_node.dump() + "\r\n");
+            all_nodes[node_id] = node_data;
             node_count++;
         }
-        
-        // Collect all unique (unit_id, tg_id) pairs from both directions
+        if (!all_nodes.empty()) {
+            json an_msg = {{"an", all_nodes}};
+            server_.broadcast_raw_to_path("/graph-stream", an_msg.dump() + "\r\n");
+        }
+
+        // Gather all edges
         std::set<std::pair<long, long>> edge_pairs;
         for (const auto& [unit_key, unit] : unit_states_) {
             if (unit.id == 0 || unit.id == -1) continue;
@@ -297,8 +287,7 @@ class Tr_Web : public Plugin_Api {
                 edge_pairs.emplace(unit_id, tg.id);
             }
         }
-
-        // Emit edges for all unique pairs
+        json all_edges;
         for (const auto& [unit_id, tg_id] : edge_pairs) {
             std::string unit_node = std::to_string(unit_id);
             std::string tg_node = "TG-" + std::to_string(tg_id);
@@ -308,11 +297,14 @@ class Tr_Web : public Plugin_Api {
                 {"source", unit_node},
                 {"target", tg_node}
             };
-            json add_edge = {{"ae", {{edge_id, edge_data}}}};
-            server_.broadcast_raw_to_path("/graph-stream", add_edge.dump() + "\r\n");
+            all_edges[edge_id] = edge_data;
             edge_count++;
         }
-        
+        if (!all_edges.empty()) {
+            json ae_msg = {{"ae", all_edges}};
+            server_.broadcast_raw_to_path("/graph-stream", ae_msg.dump() + "\r\n");
+        }
+
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Sent " << node_count << " nodes and " << edge_count << " edges to new Gephi connection";
     }
 

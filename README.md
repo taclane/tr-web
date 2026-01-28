@@ -82,9 +82,9 @@ Add the plugin to your trunk-recorder `config.json` to get started:
 | ssl_key                         |          | `""`          | string     | Path to SSL private key PEM                                                       |
 | console_lines                   |          | 5000          | integer    | Console log buffer size                                                           |
 | theme                           |          | `"nostromo"`  | string     | Default UI theme (`nostromo`, `classic`, `hotdog`)                                |
-| affiliation_timeout_hours       |          | 12            | integer    | Hours of inactivity before unit/TG marked idle                                    |
-| affiliation_persist_file        |          | `""`          | string     | Path to save/load affiliation state (empty = disabled)                            |
-| affiliation_persist_interval_sec|          | 300           | integer    | Seconds between automatic saves of affiliation state                              |
+| affiliation_timeout             |          | 12            | integer    | Hours of inactivity before unit/TG marked idle                                    |
+| affiliation_cache               |          | `"affiliations.json"`   | string     | Path to save/load affiliation state ("" = disabled)                            |
+| affiliation_autosave            |          | 300           | integer    | Seconds between automatic saves of affiliation state                              |
 
 ### Authentication
 

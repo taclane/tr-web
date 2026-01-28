@@ -131,11 +131,11 @@ class Tr_Web : public Plugin_Api {
         int wacn = 0;
         int sysid = 0;
         std::string alias;
-        bool ever_encrypted = false;      // Has ever transmitted encrypted
+        bool encr_seen = false;      // Has ever transmitted encrypted
         time_t last_active = 0;
         bool registered = false;
-        int transmission_count = 0;
-        std::map<long, int> talkgroup_transmission_counts;  // tg_id -> count (heatmap data)
+        int tx_count = 0;
+        std::map<long, int> tg_activity;  // tg_id -> count (heatmap data)
     };
     
     struct TalkgroupState {
@@ -143,10 +143,10 @@ class Tr_Web : public Plugin_Api {
         int wacn = 0;
         int sysid = 0;
         std::string alias;
-        bool ever_encrypted = false;      // Has ever had encrypted traffic
+        bool encr_seen = false;      // Has ever had encrypted traffic
         time_t last_active = 0;
-        int transmission_count = 0;
-        std::map<long, int> unit_transmission_counts;  // unit_id -> count (heatmap data)
+        int tx_count = 0;
+        std::map<long, int> unit_activity;  // unit_id -> count (heatmap data)
     };
     
     // Composite key for multi-system support: "wacn:sysid:id"
@@ -163,9 +163,9 @@ class Tr_Web : public Plugin_Api {
     std::map<std::string, TalkgroupState> talkgroup_states_;  // keyed by "wacn:sysid:tg_id"
     
     // Configuration for affiliation tracking
-    int affiliation_timeout_hours_ = 12;
-    std::string affiliation_persist_file_;
-    int affiliation_persist_interval_sec_ = 300;
+    int affiliation_timeout_ = 12;
+    std::string affiliation_cache_;
+    int affiliation_autosave_ = 300;
     time_t last_affiliation_save_ = 0;
 
     // Flag to trigger initial Gephi dump on next poll cycle
@@ -231,7 +231,7 @@ class Tr_Web : public Plugin_Api {
                 color = "#666666";
             } else if ((now - unit.last_active) > idle_threshold) {
                 color = "#888888";
-            } else if (unit.ever_encrypted) {
+            } else if (unit.encr_seen) {
                 color = GEPHI_COLOR_RED;
             } else {
                 color = GEPHI_COLOR_BLUE;
@@ -244,7 +244,7 @@ class Tr_Web : public Plugin_Api {
                 {"size", 15}
             };
             
-            if (unit.ever_encrypted) {
+            if (unit.encr_seen) {
                 node_data["encryption"] = true;
             }
             if (!unit.registered) {
@@ -263,7 +263,7 @@ class Tr_Web : public Plugin_Api {
             std::string node_id = "TG-" + std::to_string(tg.id);
             std::string label = tg.alias.empty() ? ("TG " + std::to_string(tg.id)) : tg.alias;
             
-            std::string color = tg.ever_encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN;
+            std::string color = tg.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN;
             
             json node_data = {
                 {"id", node_id},
@@ -272,7 +272,7 @@ class Tr_Web : public Plugin_Api {
                 {"size", 25}
             };
             
-            if (tg.ever_encrypted) {
+            if (tg.encr_seen) {
                 node_data["encryption"] = true;
             }
             
@@ -285,14 +285,14 @@ class Tr_Web : public Plugin_Api {
         std::set<std::pair<long, long>> edge_pairs;
         for (const auto& [unit_key, unit] : unit_states_) {
             if (unit.id == 0 || unit.id == -1) continue;
-            for (const auto& [tg_id, count] : unit.talkgroup_transmission_counts) {
+            for (const auto& [tg_id, count] : unit.tg_activity) {
                 if (tg_id == 0 || tg_id == -1) continue;
                 edge_pairs.emplace(unit.id, tg_id);
             }
         }
         for (const auto& [tg_key, tg] : talkgroup_states_) {
             if (tg.id == 0 || tg.id == -1) continue;
-            for (const auto& [unit_id, count] : tg.unit_transmission_counts) {
+            for (const auto& [unit_id, count] : tg.unit_activity) {
                 if (unit_id == 0 || unit_id == -1) continue;
                 edge_pairs.emplace(unit_id, tg.id);
             }
@@ -510,10 +510,10 @@ public:
         }
         unit.last_active = now;
         unit.registered = true;  // Active transmission means registered
-        unit.transmission_count++;
-        unit.talkgroup_transmission_counts[tg_id]++;  // Track per-TG frequency
+        unit.tx_count++;
+        unit.tg_activity[tg_id]++;  // Track per-TG frequency
         if (encrypted) {
-            unit.ever_encrypted = true;
+            unit.encr_seen = true;
         }
         
         // Update talkgroup state
@@ -526,10 +526,10 @@ public:
             tg.alias = talkgroup ? talkgroup->alpha_tag : "";
         }
         tg.last_active = now;
-        tg.transmission_count++;
-        tg.unit_transmission_counts[unit_id]++;  // Track per-unit frequency
+        tg.tx_count++;
+        tg.unit_activity[unit_id]++;  // Track per-unit frequency
         if (encrypted) {
-            tg.ever_encrypted = true;
+            tg.encr_seen = true;
         }
     }
     
@@ -567,27 +567,27 @@ public:
         
         const auto& unit = it->second;
         time_t now = time(NULL);
-        time_t idle_threshold = now - (affiliation_timeout_hours_ * 3600);
+        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
         
         // Grey if deregistered OR idle
         if (!unit.registered || unit.last_active < idle_threshold) {
             return GEPHI_COLOR_GREY;
         }
         
-        return unit.ever_encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
+        return unit.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
     }
     
     // Get affiliation data for API
     json get_affiliation_data() const {
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
         time_t now = time(NULL);
-        time_t idle_threshold = now - (affiliation_timeout_hours_ * 3600);
+        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
         
         json result = {
             {"units", json::array()},
             {"talkgroups", json::array()},
             {"config", {
-                {"timeout_hours", affiliation_timeout_hours_}
+                {"timeout_hours", affiliation_timeout_}
             }}
         };
         
@@ -596,7 +596,7 @@ public:
             bool is_idle = unit.last_active < idle_threshold;
             
             json tg_counts = json::object();
-            for (const auto& tg_pair : unit.talkgroup_transmission_counts) {
+            for (const auto& tg_pair : unit.tg_activity) {
                 tg_counts[std::to_string(tg_pair.first)] = tg_pair.second;
             }
             
@@ -605,12 +605,12 @@ public:
                 {"wacn", unit.wacn},
                 {"sysid", unit.sysid},
                 {"alias", unit.alias},
-                {"ever_encrypted", unit.ever_encrypted},
+                {"encr_seen", unit.encr_seen},
                 {"last_active", unit.last_active},
                 {"registered", unit.registered},
                 {"is_idle", is_idle},
-                {"transmission_count", unit.transmission_count},
-                {"talkgroup_transmission_counts", tg_counts}
+                {"tx_count", unit.tx_count},
+                {"tg_activity", tg_counts}
             });
         }
         
@@ -619,7 +619,7 @@ public:
             bool is_idle = tg.last_active < idle_threshold;
             
             json unit_counts = json::object();
-            for (const auto& unit_pair : tg.unit_transmission_counts) {
+            for (const auto& unit_pair : tg.unit_activity) {
                 unit_counts[std::to_string(unit_pair.first)] = unit_pair.second;
             }
             
@@ -628,11 +628,11 @@ public:
                 {"wacn", tg.wacn},
                 {"sysid", tg.sysid},
                 {"alias", tg.alias},
-                {"ever_encrypted", tg.ever_encrypted},
+                {"encr_seen", tg.encr_seen},
                 {"last_active", tg.last_active},
                 {"is_idle", is_idle},
-                {"transmission_count", tg.transmission_count},
-                {"unit_transmission_counts", unit_counts}
+                {"tx_count", tg.tx_count},
+                {"unit_activity", unit_counts}
             });
         }
         
@@ -641,7 +641,7 @@ public:
     
     // Save affiliation state to JSON file
     void save_affiliation_state() {
-        if (affiliation_persist_file_.empty()) return;
+        if (affiliation_cache_.empty()) return;
         
         try {
             json persist_data = {
@@ -657,7 +657,7 @@ public:
                 for (const auto& pair : unit_states_) {
                     const auto& unit = pair.second;
                     json tg_counts = json::object();
-                    for (const auto& tg_pair : unit.talkgroup_transmission_counts) {
+                    for (const auto& tg_pair : unit.tg_activity) {
                         tg_counts[std::to_string(tg_pair.first)] = tg_pair.second;
                     }
                     persist_data["units"].push_back({
@@ -665,10 +665,10 @@ public:
                         {"wacn", unit.wacn},
                         {"sysid", unit.sysid},
                         {"alias", unit.alias},
-                        {"encr_seen", unit.ever_encrypted},
+                        {"encr_seen", unit.encr_seen},
                         {"last_active", unit.last_active},
                         {"registered", unit.registered},
-                        {"tx_count", unit.transmission_count},
+                        {"tx_count", unit.tx_count},
                         {"tg_activity", tg_counts}
                     });
                 }
@@ -676,7 +676,7 @@ public:
                 for (const auto& pair : talkgroup_states_) {
                     const auto& tg = pair.second;
                     json unit_counts = json::object();
-                    for (const auto& unit_pair : tg.unit_transmission_counts) {
+                    for (const auto& unit_pair : tg.unit_activity) {
                         unit_counts[std::to_string(unit_pair.first)] = unit_pair.second;
                     }
                     persist_data["talkgroups"].push_back({
@@ -684,16 +684,16 @@ public:
                         {"wacn", tg.wacn},
                         {"sysid", tg.sysid},
                         {"alias", tg.alias},
-                        {"encr_seen", tg.ever_encrypted},
+                        {"encr_seen", tg.encr_seen},
                         {"last_active", tg.last_active},
-                        {"tx_count", tg.transmission_count},
+                        {"tx_count", tg.tx_count},
                         {"unit_activity", unit_counts}
                     });
                 }
             }
             
             // Write to file atomically (write to temp, then rename)
-            std::string temp_file = affiliation_persist_file_ + ".tmp";
+            std::string temp_file = affiliation_cache_ + ".tmp";
             std::ofstream out(temp_file);
             if (!out.good()) {
                 BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Failed to open " << temp_file << " for writing";
@@ -703,10 +703,10 @@ public:
             out.close();
             
             // Atomic rename
-            if (std::rename(temp_file.c_str(), affiliation_persist_file_.c_str()) != 0) {
-                BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Failed to rename temp file to " << affiliation_persist_file_;
+            if (std::rename(temp_file.c_str(), affiliation_cache_.c_str()) != 0) {
+                BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Failed to rename temp file to " << affiliation_cache_;
             } else {
-                BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Saved affiliation state to " << affiliation_persist_file_;
+                BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Saved affiliation state to " << affiliation_cache_;
             }
             
         } catch (const std::exception& e) {
@@ -716,10 +716,10 @@ public:
     
     // Load affiliation state from JSON file
     void load_affiliation_state() {
-        if (affiliation_persist_file_.empty()) return;
+        if (affiliation_cache_.empty()) return;
         
         try {
-            std::ifstream in(affiliation_persist_file_);
+            std::ifstream in(affiliation_cache_);
             if (!in.good()) {
                 BOOST_LOG_TRIVIAL(info) << log_prefix_ << "No existing affiliation state file found (this is normal on first run)";
                 return;
@@ -747,16 +747,16 @@ public:
                     unit.wacn = unit_json.value("wacn", 0);
                     unit.sysid = unit_json.value("sysid", 0);
                     unit.alias = unit_json.value("alias", "");
-                    unit.ever_encrypted = unit_json.value("encr_seen", false);
+                    unit.encr_seen = unit_json.value("encr_seen", false);
                     unit.last_active = unit_json.value("last_active", 0L);
                     unit.registered = unit_json.value("registered", false);
-                    unit.transmission_count = unit_json.value("tx_count", 0);
+                    unit.tx_count = unit_json.value("tx_count", 0);
                     
                     if (unit_json.contains("tg_activity")) {
                         for (auto& item : unit_json["tg_activity"].items()) {
                             long tg_id = std::stol(item.key());
                             int count = item.value();
-                            unit.talkgroup_transmission_counts[tg_id] = count;
+                            unit.tg_activity[tg_id] = count;
                         }
                     }
                     
@@ -773,15 +773,15 @@ public:
                     tg.wacn = tg_json.value("wacn", 0);
                     tg.sysid = tg_json.value("sysid", 0);
                     tg.alias = tg_json.value("alias", "");
-                    tg.ever_encrypted = tg_json.value("encr_seen", false);
+                    tg.encr_seen = tg_json.value("encr_seen", false);
                     tg.last_active = tg_json.value("last_active", 0L);
-                    tg.transmission_count = tg_json.value("tx_count", 0);
+                    tg.tx_count = tg_json.value("tx_count", 0);
                     
                     if (tg_json.contains("unit_activity")) {
                         for (auto& item : tg_json["unit_activity"].items()) {
                             long unit_id = std::stol(item.key());
                             int count = item.value();
-                            tg.unit_transmission_counts[unit_id] = count;
+                            tg.unit_activity[unit_id] = count;
                         }
                     }
                     
@@ -791,7 +791,7 @@ public:
             }
             
             BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Loaded " << unit_states_.size() << " units and " 
-                                    << talkgroup_states_.size() << " talkgroups from " << affiliation_persist_file_;
+                                    << talkgroup_states_.size() << " talkgroups from " << affiliation_cache_;
             
         } catch (const std::exception& e) {
             BOOST_LOG_TRIVIAL(error) << log_prefix_ << "Failed to load affiliation state: " << e.what();
@@ -888,19 +888,20 @@ public:
         theme_ = config_data.value("theme", "nostromo");
         
         // Affiliation tracking configuration
-        affiliation_timeout_hours_ = config_data.value("affiliation_timeout_hours", 12);
-        affiliation_persist_file_ = config_data.value("affiliation_persist_file", "");
-        affiliation_persist_interval_sec_ = config_data.value("affiliation_persist_interval_sec", 300);
+        affiliation_timeout_ = config_data.value("affiliation_timeout", 12);
+        affiliation_cache_ = config_data.value("affiliation_cache", "affiliations.json");
+        affiliation_autosave_ = config_data.value("affiliation_autosave", 300);
         
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Port:          " << port_;
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Bind:          " << bind_address_;
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Auth:          " << (username_.empty() ? "[disabled]" : "[enabled]");
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Admin Auth:    " << (admin_username_.empty() ? "[disabled]" : "[enabled]");
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "HTTPS:         " << (ssl_cert_.empty() ? "[disabled]" : "[enabled]");
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Console Lines: " << console_max_lines_;
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Theme:         " << theme_;
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Timeout: " << affiliation_timeout_hours_ << "h";
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Persist: " << (affiliation_persist_file_.empty() ? "[disabled]" : affiliation_persist_file_);
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Port:           " << port_;
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Bind:           " << bind_address_;
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Auth:           " << (username_.empty() ? "[disabled]" : "[enabled]");
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Admin Auth:     " << (admin_username_.empty() ? "[disabled]" : "[enabled]");
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "HTTPS:          " << (ssl_cert_.empty() ? "[disabled]" : "[enabled]");
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Console Lines:  " << console_max_lines_;
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Theme:          " << theme_;
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Cache:    " << (affiliation_cache_.empty() ? "[disabled]" : affiliation_cache_);
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Timeout:  " << affiliation_timeout_ << "h";
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Autosave: " << affiliation_autosave_ << "s";
         
         return 0;
     }
@@ -1079,9 +1080,9 @@ public:
                 }
                 
                 // Periodic save of affiliation state
-                if (!affiliation_persist_file_.empty()) {
+                if (!affiliation_cache_.empty()) {
                     time_t current_time = time(NULL);
-                    if (current_time - last_affiliation_save_ >= affiliation_persist_interval_sec_) {
+                    if (current_time - last_affiliation_save_ >= affiliation_autosave_) {
                         save_affiliation_state();
                         last_affiliation_save_ = current_time;
                     }
@@ -2318,7 +2319,7 @@ private:
                 {"size", 15}
             };
             
-            if (unit.ever_encrypted) {
+            if (unit.encr_seen) {
                 node_data["encryption"] = true;
             }
             
@@ -2347,11 +2348,11 @@ private:
             json node_data = {
                 {"id", node_id},
                 {"label", tg_alpha.empty() ? std::to_string(tg.id) : tg_alpha},
-                {"color", tg.ever_encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
+                {"color", tg.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
                 {"size", 20}
             };
             
-            if (tg.ever_encrypted) {
+            if (tg.encr_seen) {
                 node_data["encryption"] = true;
             }
             
@@ -2363,7 +2364,7 @@ private:
         for (const auto& [key, unit] : unit_states_) {
             if (unit.id == 0 || unit.id == -1) continue;
             
-            for (const auto& [tg_id, count] : unit.talkgroup_transmission_counts) {
+            for (const auto& [tg_id, count] : unit.tg_activity) {
                 if (tg_id == 0 || tg_id == -1) continue;
                 
                 std::string unit_node = std::to_string(unit.id);
@@ -2371,7 +2372,7 @@ private:
                 std::string edge_id = tg_node + "-" + unit_node;
                 
                 // Determine if this affiliation has seen encryption
-                bool edge_encrypted = unit.ever_encrypted;
+                bool edge_encrypted = unit.encr_seen;
                 
                 json edge_data = {
                     {"source", unit_node},

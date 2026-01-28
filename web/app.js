@@ -2868,7 +2868,7 @@ function renderStatusBadge(item, isUnit) {
 }
 
 function renderEncryptionBadge(item) {
-    if (item.ever_encrypted) {
+    if (item.encr_seen) {
         return '<span class="status-badge encrypted">🔴 Encrypted</span>';
     }
     return '<span style="color: var(--text-secondary);">—</span>';
@@ -2877,7 +2877,7 @@ function renderEncryptionBadge(item) {
 function renderStatusBadges(item, isUnit) {
     const badges = [];
     
-    if (item.ever_encrypted) {
+    if (item.encr_seen) {
         badges.push('<span class="status-badge encrypted">🔴 Encrypted</span>');
     }
     
@@ -2931,15 +2931,15 @@ function filterAndSortData(items) {
         filtered = filtered.map(item => {
             // Clone to avoid mutating original
             const newItem = { ...item };
-            if (newItem.talkgroup_transmission_counts) {
-                newItem.talkgroup_transmission_counts = Object.fromEntries(
-                    Object.entries(newItem.talkgroup_transmission_counts)
+            if (newItem.tg_activity) {
+                newItem.tg_activity = Object.fromEntries(
+                    Object.entries(newItem.tg_activity)
                         .filter(([tgid]) => tgid !== '0' && tgid !== '-1')
                 );
             }
-            if (newItem.unit_transmission_counts) {
-                newItem.unit_transmission_counts = Object.fromEntries(
-                    Object.entries(newItem.unit_transmission_counts)
+            if (newItem.unit_activity) {
+                newItem.unit_activity = Object.fromEntries(
+                    Object.entries(newItem.unit_activity)
                         .filter(([uid]) => uid !== '0' && uid !== '-1')
                 );
             }
@@ -2965,19 +2965,19 @@ function filterAndSortData(items) {
 
             // Otherwise, filter associations
             let hasAssociations = false;
-            if (newItem.talkgroup_transmission_counts) {
-                newItem.talkgroup_transmission_counts = Object.fromEntries(
-                    Object.entries(newItem.talkgroup_transmission_counts)
+            if (newItem.tg_activity) {
+                newItem.tg_activity = Object.fromEntries(
+                    Object.entries(newItem.tg_activity)
                         .filter(([tgid]) => tgid.toLowerCase().includes(term))
                 );
-                if (Object.keys(newItem.talkgroup_transmission_counts).length > 0) hasAssociations = true;
+                if (Object.keys(newItem.tg_activity).length > 0) hasAssociations = true;
             }
-            if (newItem.unit_transmission_counts) {
-                newItem.unit_transmission_counts = Object.fromEntries(
-                    Object.entries(newItem.unit_transmission_counts)
+            if (newItem.unit_activity) {
+                newItem.unit_activity = Object.fromEntries(
+                    Object.entries(newItem.unit_activity)
                         .filter(([uid]) => uid.toLowerCase().includes(term))
                 );
-                if (Object.keys(newItem.unit_transmission_counts).length > 0) hasAssociations = true;
+                if (Object.keys(newItem.unit_activity).length > 0) hasAssociations = true;
             }
             return hasAssociations ? newItem : null;
         }).filter(Boolean);
@@ -3012,7 +3012,7 @@ function renderAffiliationTable() {
     const tbody = document.getElementById(isUnits ? 'unitTableBody' : 'talkgroupTableBody');
     // Always fully rebuild the table to avoid orphaned/stale rows
     tbody.innerHTML = filtered.map((item, idx) => {
-        const associatedCounts = isUnits ? item.talkgroup_transmission_counts : item.unit_transmission_counts;
+        const associatedCounts = isUnits ? item.tg_activity : item.unit_activity;
         const itemKey = `${item.wacn}:${item.sysid}:${item.id}`;
         const rowId = `aff-row-${itemKey.replace(/:/g, '-')}`;
         const detailsId = `aff-details-${itemKey.replace(/:/g, '-')}`;
@@ -3027,7 +3027,7 @@ function renderAffiliationTable() {
         html += '<td>' + renderStatusBadge(item, isUnits) + '</td>';
         html += '<td>' + renderEncryptionBadge(item) + '</td>';
         html += '<td>' + formatTimestamp(item.last_active) + '</td>';
-        html += '<td><strong>' + escapeHtml(item.transmission_count) + '</strong></td>';
+        html += '<td><strong>' + escapeHtml(item.tx_count) + '</strong></td>';
         html += '</tr>';
         // Details row: auto-collapse if no associations
         html += '<tr id="' + detailsId + '" class="affiliation-details-row" style="display:' + (hasAssociations ? 'table-row' : 'none') + ';">';
@@ -3111,7 +3111,7 @@ function getStatusBadge(item, isUnit) {
         return '<span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #888;" title="Idle"></span>';
     }
     
-    if (item.ever_encrypted) {
+    if (item.encr_seen) {
         return '<span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #a83232;" title="Active (Encrypted)"></span>';
     }
     
@@ -3138,22 +3138,27 @@ function jumpToTalkgroup(tgId, wacn, sysid) {
     // Scroll to the specific row after a short delay for rendering
     setTimeout(() => {
         const rowId = `aff-row-${wacn}-${sysid}-${tgId}`;
+        const detailsId = `aff-details-${wacn}-${sysid}-${tgId}`;
         const row = document.getElementById(rowId);
+        const detailsRow = document.getElementById(detailsId);
         if (row) {
             row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            // Pulse animation: 3 quick flashes
-            row.style.transition = 'background 0.3s ease';
-            let pulseCount = 0;
-            const pulseInterval = setInterval(() => {
-                row.style.background = pulseCount % 2 === 0 ? 'rgba(59, 130, 246, 0.3)' : '';
-                pulseCount++;
-                if (pulseCount >= 6) {
-                    clearInterval(pulseInterval);
-                    row.style.background = '';
-                    row.style.transition = '';
-                }
-            }, 300);
         }
+        [row, detailsRow].forEach(targetRow => {
+            if (targetRow) {
+                targetRow.style.transition = 'background 0.3s ease';
+                let pulseCount = 0;
+                const pulseInterval = setInterval(() => {
+                    targetRow.style.background = pulseCount % 2 === 0 ? 'rgba(59, 130, 246, 0.3)' : '';
+                    pulseCount++;
+                    if (pulseCount >= 4) {
+                        clearInterval(pulseInterval);
+                        targetRow.style.background = '';
+                        targetRow.style.transition = '';
+                    }
+                }, 300);
+            }
+        });
     }, 100);
 }
 
@@ -3169,22 +3174,27 @@ function jumpToUnit(unitId, wacn, sysid) {
     // Scroll to the specific row after a short delay for rendering
     setTimeout(() => {
         const rowId = `aff-row-${wacn}-${sysid}-${unitId}`;
+        const detailsId = `aff-details-${wacn}-${sysid}-${unitId}`;
         const row = document.getElementById(rowId);
+        const detailsRow = document.getElementById(detailsId);
         if (row) {
             row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            // Pulse animation: 3 quick flashes
-            row.style.transition = 'background 0.3s ease';
-            let pulseCount = 0;
-            const pulseInterval = setInterval(() => {
-                row.style.background = pulseCount % 2 === 0 ? 'rgba(59, 130, 246, 0.3)' : '';
-                pulseCount++;
-                if (pulseCount >= 6) {
-                    clearInterval(pulseInterval);
-                    row.style.background = '';
-                    row.style.transition = '';
-                }
-            }, 300);
         }
+        [row, detailsRow].forEach(targetRow => {
+            if (targetRow) {
+                targetRow.style.transition = 'background 0.3s ease';
+                let pulseCount = 0;
+                const pulseInterval = setInterval(() => {
+                    targetRow.style.background = pulseCount % 2 === 0 ? 'rgba(59, 130, 246, 0.3)' : '';
+                    pulseCount++;
+                    if (pulseCount >= 4) {
+                        clearInterval(pulseInterval);
+                        targetRow.style.background = '';
+                        targetRow.style.transition = '';
+                    }
+                }, 300);
+            }
+        });
     }, 100);
 }
 

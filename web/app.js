@@ -3019,7 +3019,10 @@ function renderAffiliationTable() {
         const hasAssociations = associatedCounts && Object.keys(associatedCounts).length > 0;
         let html = '';
         // Always allow toggling, but auto-collapse if no associations
-        html += '<tr id="' + rowId + '" class="affiliation-main-row" style="cursor: pointer; font-size: 15px;" onclick="toggleAffiliationDetails(\'' + detailsId + '\')">';
+        html += `<tr id="${rowId}" class="affiliation-main-row" style="cursor: pointer; font-size: 15px;"
+            onclick="toggleAffiliationDetails('${detailsId}')"
+            onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
+            onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">`;
         html += '<td><strong style="font-size: 1.25em;">' + escapeHtml(item.id) + '</strong></td>';
         html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(item.wacn) + '</code></td>';
         html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(item.sysid) + '</code></td>';
@@ -3030,7 +3033,9 @@ function renderAffiliationTable() {
         html += '<td><strong>' + escapeHtml(item.tx_count) + '</strong></td>';
         html += '</tr>';
         // Details row: auto-collapse if no associations
-        html += '<tr id="' + detailsId + '" class="affiliation-details-row" style="display:' + (hasAssociations ? 'table-row' : 'none') + ';">';
+        html += `<tr id="${detailsId}" class="affiliation-details-row" style="display:${hasAssociations ? 'table-row' : 'none'};"
+            onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
+            onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">`;
         html += '<td colspan="8" style="padding: 0; background: var(--bg-tertiary);">';
         html += '<div style="padding: 12px 16px; border-top: 1px solid var(--border);">';
         html += '<div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; text-transform: uppercase; font-weight: 600;">';
@@ -3044,11 +3049,23 @@ function renderAffiliationTable() {
         html += '</tr>';
         return html;
     }).join('');
-    requestAnimationFrame(() => {
-        if (scrollContainer) scrollContainer.scrollTop = savedScrollTop;
-    });
     return;
 }
+// Highlight both header and detail row on mouseover
+function highlightAffiliationRows(rowId, detailsId, highlight) {
+    const mainRow = document.getElementById(rowId);
+    const detailsRow = document.getElementById(detailsId);
+    [mainRow, detailsRow].forEach(row => {
+        if (row) {
+            if (highlight) {
+                row.classList.add('affiliation-hover');
+            } else {
+                row.classList.remove('affiliation-hover');
+            }
+        }
+    });
+}
+window.highlightAffiliationRows = highlightAffiliationRows;
 
 function toggleAffiliationDetails(detailsId) {
     const row = document.getElementById(detailsId);

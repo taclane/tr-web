@@ -1,3 +1,8 @@
+/* Highlight for affiliation table rows on mouseover */
+.affiliation-hover {
+    background: rgba(59, 130, 246, 0.13) !important;
+    transition: background 0.2s;
+}
 /* Theme variables
    Default theme: Nostromo
 */

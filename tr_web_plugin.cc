@@ -99,7 +99,7 @@ class Tr_Web : public Plugin_Api {
     // Trunking message buffer (for Omnitrunker tab)
     mutable std::mutex trunk_messages_mutex_;
     std::deque<json> trunk_messages_;
-    static const size_t MAX_TRUNK_MESSAGES = 500;
+    static const size_t MAX_TRUNK_MESSAGES = 300;
     
     // Unit affiliation tracking (unit_id -> talkgroup)
     mutable std::mutex unit_affiliations_mutex_;
@@ -1554,6 +1554,7 @@ public:
             if (sys_type.find("conventional") == std::string::npos) {
                 boost::property_tree::ptree stat_node = sys->get_stats_current(timeDiff);
                 double decode_rate = stat_node.get<double>("decoderate");
+                decode_rate = std::round(decode_rate * 100) / 100;  // Round to 2 decimal places
 
                 double control_channel = 0.0;
                 if (sys->control_channel_count() > 0) {

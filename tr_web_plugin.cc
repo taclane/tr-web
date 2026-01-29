@@ -216,10 +216,13 @@ class Tr_Web : public Plugin_Api {
         int edge_count = 0;
 
         time_t now = time(NULL);
-        const time_t idle_threshold = 12 * 3600; // 12 hours
+        const time_t idle_threshold = affiliation_timeout_ * 3600;
 
-        // Gather all nodes
         json all_nodes;
+        json all_edges;
+        json edge_map;
+
+        // Gather all unit nodes
         for (const auto& [key, unit] : unit_states_) {
             if (unit.id == 0 || unit.id == -1) continue;
             std::string node_id = std::to_string(unit.id);
@@ -248,7 +251,19 @@ class Tr_Web : public Plugin_Api {
             }
             all_nodes[node_id] = node_data;
             node_count++;
+
+            // Add unit->tg pairings to edge_map
+            for (const auto& [tg_id, count] : unit.tg_activity) {
+                if (tg_id == 0 || tg_id == -1) continue;
+                std::string edge_key = "TG-" + std::to_string(tg_id) + "-" + std::to_string(unit.id);
+                edge_map[edge_key] = {
+                    {"unit", unit.id},
+                    {"tg", tg_id}
+                };
+            }
         }
+
+        // Gather all talkgroup nodes
         for (const auto& [key, tg] : talkgroup_states_) {
             if (tg.id == 0 || tg.id == -1) continue;
             std::string node_id = "TG-" + std::to_string(tg.id);
@@ -265,41 +280,47 @@ class Tr_Web : public Plugin_Api {
             }
             all_nodes[node_id] = node_data;
             node_count++;
+
+            // Add tg->unit pairings to edge_map (reverse), and set encrypted if tg.encr_seen
+            for (const auto& [unit_id, count] : tg.unit_activity) {
+                if (unit_id == 0 || unit_id == -1) continue;
+                std::string edge_key = "TG-" + std::to_string(tg.id) + "-" + std::to_string(unit_id);
+                edge_map[edge_key] = {
+                    {"unit", unit_id},
+                    {"tg", tg.id}
+                };
+                if (tg.encr_seen) {
+                    edge_map[edge_key]["encrypted"] = true;
+                }
+            }
         }
+        // Send all nodes to Gephi
         if (!all_nodes.empty()) {
             json an_msg = {{"an", all_nodes}};
             server_.broadcast_raw_to_path("/graph-stream", an_msg.dump() + "\r\n");
         }
 
         // Gather all edges
-        std::set<std::pair<long, long>> edge_pairs;
-        for (const auto& [unit_key, unit] : unit_states_) {
-            if (unit.id == 0 || unit.id == -1) continue;
-            for (const auto& [tg_id, count] : unit.tg_activity) {
-                if (tg_id == 0 || tg_id == -1) continue;
-                edge_pairs.emplace(unit.id, tg_id);
-            }
-        }
-        for (const auto& [tg_key, tg] : talkgroup_states_) {
-            if (tg.id == 0 || tg.id == -1) continue;
-            for (const auto& [unit_id, count] : tg.unit_activity) {
-                if (unit_id == 0 || unit_id == -1) continue;
-                edge_pairs.emplace(unit_id, tg.id);
-            }
-        }
-        json all_edges;
-        for (const auto& [unit_id, tg_id] : edge_pairs) {
+        for (auto it = edge_map.begin(); it != edge_map.end(); ++it) {
+            std::string edge_id = it.key();
+            long unit_id = it.value()["unit"];
+            long tg_id = it.value()["tg"];
             std::string unit_node = std::to_string(unit_id);
             std::string tg_node = "TG-" + std::to_string(tg_id);
-            std::string edge_id = tg_node + "-" + unit_node;
+            bool edge_encrypted = it.value().value("encrypted", false);
             json edge_data = {
                 {"directed", false},
                 {"source", unit_node},
                 {"target", tg_node}
             };
+            if (edge_encrypted) {
+                edge_data["color"] = GEPHI_COLOR_RED;
+                edge_data["encryption"] = true;
+            }
             all_edges[edge_id] = edge_data;
             edge_count++;
         }
+        // Send all edges to Gephi
         if (!all_edges.empty()) {
             json ae_msg = {{"ae", all_edges}};
             server_.broadcast_raw_to_path("/graph-stream", ae_msg.dump() + "\r\n");
@@ -2277,114 +2298,7 @@ private:
         json change_edge = {{"ce", {{edge_id, edge_data}}}};
         return change_edge.dump() + "\r\n";
     }
-    
-    // Generate complete Gephi graph state dump for initial connection
-    std::string generate_gephi_state_dump() {
-        std::stringstream dump;
-        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
-        
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Generating Gephi initial state dump: " 
-                                 << unit_states_.size() << " units, " 
-                                 << talkgroup_states_.size() << " talkgroups";
-        
-        // Add all tracked units as nodes
-        for (const auto& [key, unit] : unit_states_) {
-            // Skip bogon IDs
-            if (unit.id == 0 || unit.id == -1) continue;
             
-            std::string unit_alpha = "";
-            std::string color = GEPHI_COLOR_BLUE;
-            
-            // Try to find system to get alias and color
-            for (auto* sys : tr_systems_) {
-                if (sys->get_wacn() == unit.wacn && sys->get_sys_id() == unit.sysid) {
-                    unit_alpha = sys->find_unit_tag(unit.id);
-                    color = get_unit_effective_color(sys, unit.id);
-                    break;
-                }
-            }
-            
-            json node_data = {
-                {"id", unit.id},
-                {"label", unit_alpha.empty() ? std::to_string(unit.id) : unit_alpha},
-                {"color", color},
-                {"size", 15}
-            };
-            
-            if (unit.encr_seen) {
-                node_data["encryption"] = true;
-            }
-            
-            std::string node_id = std::to_string(unit.id);
-            json add_node = {{"an", {{node_id, node_data}}}};
-            dump << add_node.dump() << "\r\n";
-        }
-        
-        // Add all tracked talkgroups as nodes
-        for (const auto& [key, tg] : talkgroup_states_) {
-            // Skip bogon IDs
-            if (tg.id == 0 || tg.id == -1) continue;
-            
-            std::string tg_alpha = "";
-            for (auto* sys : tr_systems_) {
-                if (sys->get_wacn() == tg.wacn && sys->get_sys_id() == tg.sysid) {
-                    Talkgroup *tg_obj = sys->find_talkgroup(tg.id);
-                    if (tg_obj) {
-                        tg_alpha = tg_obj->alpha_tag;
-                    }
-                    break;
-                }
-            }
-            
-            std::string node_id = "TG-" + std::to_string(tg.id);
-            json node_data = {
-                {"id", node_id},
-                {"label", tg_alpha.empty() ? std::to_string(tg.id) : tg_alpha},
-                {"color", tg.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
-                {"size", 20}
-            };
-            
-            if (tg.encr_seen) {
-                node_data["encryption"] = true;
-            }
-            
-            json add_node = {{"an", {{node_id, node_data}}}};
-            dump << add_node.dump() << "\r\n";
-        }
-        
-        // Add all tracked edges (unit-talkgroup affiliations)
-        for (const auto& [key, unit] : unit_states_) {
-            if (unit.id == 0 || unit.id == -1) continue;
-            
-            for (const auto& [tg_id, count] : unit.tg_activity) {
-                if (tg_id == 0 || tg_id == -1) continue;
-                
-                std::string unit_node = std::to_string(unit.id);
-                std::string tg_node = "TG-" + std::to_string(tg_id);
-                std::string edge_id = tg_node + "-" + unit_node;
-                
-                // Determine if this affiliation has seen encryption
-                bool edge_encrypted = unit.encr_seen;
-                
-                json edge_data = {
-                    {"source", unit_node},
-                    {"target", tg_node},
-                    {"directed", false}
-                };
-                
-                if (edge_encrypted) {
-                    edge_data["color"] = GEPHI_COLOR_RED;
-                    edge_data["encryption"] = true;
-                }
-                
-                json add_edge = {{"ae", {{edge_id, edge_data}}}};
-                dump << add_edge.dump() << "\r\n";
-            }
-        }
-        
-        return dump.str();
-    }
-    
     void send_gephi_unit_event(System* sys, long unit_id, long tg_id, bool encrypted = false) {
         // Filter out anomalous IDs that are not valid for graph theory
         // -1 indicates unknown/invalid radio ID

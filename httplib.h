@@ -888,11 +888,14 @@ private:
             return;
         }
         
-        // Add to SSE clients
+        // Add to SSE clients (and raw stream clients if applicable)
         auto client = std::make_shared<SSEClient>(socket, client_ip, username, req.path);
         {
             std::lock_guard<std::mutex> lock(sse_mutex_);
             sse_clients_.push_back(client);
+            if (is_raw_stream) {
+                raw_stream_clients_.push_back(client);
+            }
         }
         
         // Log connection
@@ -923,13 +926,19 @@ private:
             }
         }
         
-        // Remove from SSE clients
+        // Remove from SSE clients and raw stream clients (if applicable)
         {
             std::lock_guard<std::mutex> lock(sse_mutex_);
             sse_clients_.erase(
                 std::remove_if(sse_clients_.begin(), sse_clients_.end(),
                     [&client](const std::shared_ptr<SSEClient>& c) { return c.get() == client.get(); }),
                 sse_clients_.end());
+            if (is_raw_stream) {
+                raw_stream_clients_.erase(
+                    std::remove_if(raw_stream_clients_.begin(), raw_stream_clients_.end(),
+                        [&client](const std::shared_ptr<SSEClient>& c) { return c.get() == client.get(); }),
+                    raw_stream_clients_.end());
+            }
         }
         
         // Log disconnection
@@ -1060,6 +1069,23 @@ private:
     
     std::mutex sse_mutex_;
     std::vector<std::shared_ptr<SSEClient>> sse_clients_;
+    // Track raw stream clients (for /graph-stream)
+    std::vector<std::shared_ptr<SSEClient>> raw_stream_clients_;
+    public:
+        // Return the number of connected raw stream (graphstream) clients
+        size_t raw_stream_client_count() {
+            std::lock_guard<std::mutex> lock(sse_mutex_);
+            return raw_stream_clients_.size();
+        }
+
+        // Remove a raw stream client from the list
+        void remove_raw_stream_client(const std::shared_ptr<SSEClient>& client) {
+            std::lock_guard<std::mutex> lock(sse_mutex_);
+            raw_stream_clients_.erase(
+                std::remove_if(raw_stream_clients_.begin(), raw_stream_clients_.end(),
+                    [&client](const std::shared_ptr<SSEClient>& c) { return c.get() == client.get(); }),
+                raw_stream_clients_.end());
+        }
     
     std::function<void()> raw_stream_connect_notify_;  // Fast notification for raw stream connects
     

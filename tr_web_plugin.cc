@@ -184,6 +184,10 @@ class Tr_Web : public Plugin_Api {
     };
 
     void enqueue_sse_event(const std::string& event, std::string data) {
+        // Only enqueue if there are connected SSE clients
+        if (server_.sse_client_count() == 0) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(event_queue_mutex_);
         static constexpr size_t MAX_EVENTS = 2000;
         if (event_queue_.size() >= MAX_EVENTS) {
@@ -194,6 +198,10 @@ class Tr_Web : public Plugin_Api {
     }
 
     void enqueue_graph_event(std::string data) {
+        // Only enqueue if there are connected raw stream (graphstream) clients
+        if (server_.raw_stream_client_count() == 0) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(graph_event_queue_mutex_);
         static constexpr size_t MAX_GRAPH_EVENTS = 1000;
         if (graph_event_queue_.size() >= MAX_GRAPH_EVENTS) {

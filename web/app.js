@@ -3243,6 +3243,61 @@ function exportAffiliationsJSON() {
     URL.revokeObjectURL(url);
 }
 
+// Refresh dashboard data when tab becomes visible again (fixes disjointed graphs after idle)
+document.addEventListener("visibilitychange", function() {
+    if (document.visibilityState !== "visible") return;
+
+    // Debounce rapid visibility changes
+    if (window.__trweb_visibility_debounce) clearTimeout(window.__trweb_visibility_debounce);
+    window.__trweb_visibility_debounce = setTimeout(() => {
+        // Reconnect only if not already connected - avoids fighting in-progress reconnect/backoff
+        if (!state.connected && typeof connect === 'function') {
+            connect();
+        }
+
+        // Do a full status fetch to refresh any missed data while backgrounded
+        if (typeof fetch === 'function' && !window.__trweb_visibility_fetch_in_progress) {
+            window.__trweb_visibility_fetch_in_progress = true;
+            fetch(`${BASE_PATH}api/status`, { credentials: 'include', cache: 'no-store' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.recorders) state.recorders = data.recorders;
+                    if (data.calls) state.calls = data.calls;
+                    if (data.systems) state.systems = data.systems;
+                    if (data.devices) state.devices = data.devices;
+                    if (data.rateHistory) state.rateHistory = data.rateHistory;
+                    if (data.callRateHistory) state.callRateHistory = data.callRateHistory;
+                    if (data.trunkMessages) state.trunkMessages = data.trunkMessages;
+                    if (data.unitAffiliations) state.unitAffiliations = data.unitAffiliations;
+                    if (data.consoleLogs) {
+                        state.consoleLogs = data.consoleLogs;
+                        hasScrolledConsole = false;
+                    }
+
+                    // Trigger UI updates after merging full status
+                    if (typeof updateRecordersTable === 'function') updateRecordersTable();
+                    if (typeof updateCallsTable === 'function') updateCallsTable();
+                    if (typeof updateSystemTabs === 'function') updateSystemTabs();
+                    if (typeof updateDevicesTiles === 'function') updateDevicesTiles();
+                    if (typeof updateStats === 'function') updateStats();
+                    if (typeof updateChart === 'function') updateChart();
+                    if (typeof updateCallRateChart === 'function') updateCallRateChart();
+                    if (typeof updateOmniMessages === 'function') updateOmniMessages();
+                })
+                .catch(err => console.error('visibility status refresh failed', err))
+                .finally(() => { window.__trweb_visibility_fetch_in_progress = false; });
+        } else {
+            // No fetch; just update UI from whatever we have
+            if (typeof updateStats === 'function') updateStats();
+            if (typeof updateChart === 'function') updateChart();
+            if (typeof updateCallRateChart === 'function') updateCallRateChart();
+            if (typeof updateCallsTable === 'function') updateCallsTable();
+        }
+
+        window.__trweb_visibility_debounce = null;
+    }, 300);
+});
+
 // Initialize search handler
 document.addEventListener('DOMContentLoaded', () => {
     const searchInput = document.getElementById('affiliationSearch');

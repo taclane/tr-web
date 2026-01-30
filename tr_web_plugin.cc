@@ -264,9 +264,15 @@ class Tr_Web : public Plugin_Api {
             for (const auto& [tg_id, count] : unit.tg_activity) {
                 if (tg_id == 0 || tg_id == -1) continue;
                 std::string edge_key = "TG-" + std::to_string(tg_id) + "-" + std::to_string(unit.id);
+                double unit_weight = (unit.tx_count > 0) ? static_cast<double>(count) / unit.tx_count : 0.0;
+                // Round to nearest 0.01, min 0.01 if > 0
+                if (unit_weight > 0.0) {
+                    unit_weight = std::max(0.01, std::round(unit_weight * 100.0) / 100.0);
+                }
                 edge_map[edge_key] = {
                     {"unit", unit.id},
-                    {"tg", tg_id}
+                    {"tg", tg_id},
+                    {"unit_weight", unit_weight}
                 };
             }
         }
@@ -293,12 +299,25 @@ class Tr_Web : public Plugin_Api {
             for (const auto& [unit_id, count] : tg.unit_activity) {
                 if (unit_id == 0 || unit_id == -1) continue;
                 std::string edge_key = "TG-" + std::to_string(tg.id) + "-" + std::to_string(unit_id);
-                edge_map[edge_key] = {
-                    {"unit", unit_id},
-                    {"tg", tg.id}
-                };
-                if (tg.encr_seen) {
-                    edge_map[edge_key]["encrypted"] = true;
+                double tg_weight = (tg.tx_count > 0) ? static_cast<double>(count) / tg.tx_count : 0.0;
+                // Round to nearest 0.01, min 0.01 if > 0
+                if (tg_weight > 0.0) {
+                    tg_weight = std::max(0.01, std::round(tg_weight * 100.0) / 100.0);
+                }
+                if (edge_map.contains(edge_key)) {
+                    edge_map[edge_key]["tg_weight"] = tg_weight;
+                    if (tg.encr_seen) {
+                        edge_map[edge_key]["encrypted"] = true;
+                    }
+                } else {
+                    edge_map[edge_key] = {
+                        {"unit", unit_id},
+                        {"tg", tg.id},
+                        {"tg_weight", tg_weight}
+                    };
+                    if (tg.encr_seen) {
+                        edge_map[edge_key]["encrypted"] = true;
+                    }
                 }
             }
         }
@@ -319,7 +338,12 @@ class Tr_Web : public Plugin_Api {
             json edge_data = {
                 {"directed", false},
                 {"source", unit_node},
-                {"target", tg_node}
+                {"target", tg_node},
+                // {"unit_weight", it.value().value("unit_weight", 0.0)},
+                // {"tg_weight", it.value().value("tg_weight", 0.0)},
+                {"weight", (it.value().value("unit_weight", 0.0) + it.value().value("tg_weight", 0.0))/2.0}
+                // {"weight", it.value().value("unit_weight", 0.0)}
+
             };
             if (edge_encrypted) {
                 edge_data["color"] = GEPHI_COLOR_RED;

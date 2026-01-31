@@ -56,6 +56,24 @@ function escapeHtml(s) {
         .replaceAll("'", '&#39;');
 }
 
+// Format WACN/SYSID for affiliation UI: fixed-width hex strings
+// - WACN: 5 hex chars
+// - SYSID: 3 hex chars
+function formatAffHex(value, places) {
+    if (value === undefined || value === null) return '';
+    // If value is already a numeric-like string or number, coerce
+    const n = Number(value);
+    if (!Number.isFinite(n) || isNaN(n)) {
+        // Treat as string (possibly already hex). Strip 0x prefix and uppercase.
+        let s = String(value).replace(/^0x/i, '').toUpperCase();
+        if (places > 0) s = s.padStart(places, '0');
+        return s;
+    }
+    let hex = Math.trunc(n).toString(16).toUpperCase();
+    if (places > 0) hex = hex.padStart(places, '0');
+    return hex;
+}
+
 function markEndedKey(key) {
     if (!key) return;
     state.endedKeyTimes.set(key, Date.now());
@@ -3024,8 +3042,8 @@ function renderAffiliationTable() {
             onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
             onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">`;
         html += '<td><strong style="font-size: 1.25em;">' + escapeHtml(item.id) + '</strong></td>';
-        html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(item.wacn) + '</code></td>';
-        html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(item.sysid) + '</code></td>';
+        html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(formatAffHex(item.wacn, 5)) + '</code></td>';
+        html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(formatAffHex(item.sysid, 3)) + '</code></td>';
         html += '<td>' + (item.alias ? '<span style="font-size: 1.15em; font-weight: 600;">' + escapeHtml(item.alias) + '</span>' : '<span style="color: var(--text-secondary);">—</span>') + '</td>';
         html += '<td>' + renderStatusBadge(item, isUnits) + '</td>';
         html += '<td>' + renderEncryptionBadge(item) + '</td>';

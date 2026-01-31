@@ -188,6 +188,7 @@ class Tr_Web : public Plugin_Api {
         if (server_.sse_client_count() == 0) {
             return;
         }
+        
         std::lock_guard<std::mutex> lock(event_queue_mutex_);
         static constexpr size_t MAX_EVENTS = 2000;
         if (event_queue_.size() >= MAX_EVENTS) {
@@ -202,6 +203,7 @@ class Tr_Web : public Plugin_Api {
         if (server_.raw_stream_client_count() == 0) {
             return;
         }
+
         std::lock_guard<std::mutex> lock(graph_event_queue_mutex_);
         static constexpr size_t MAX_GRAPH_EVENTS = 1000;
         if (graph_event_queue_.size() >= MAX_GRAPH_EVENTS) {
@@ -1328,8 +1330,8 @@ public:
         bool encrypted = call->get_encrypted();
         update_affiliation_state(sys, source_id, talkgroup_num, encrypted);
         
-        // Send graph streaming data for Gephi
-        send_gephi_unit_event(sys, source_id, talkgroup_num, encrypted);
+        // Send graph streaming data for Gephi (unit-tg pairing)
+        send_gephi_unit_tg_event(sys, source_id, talkgroup_num, encrypted);
         
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
@@ -1367,8 +1369,8 @@ public:
         // Update affiliation state (affiliations are typically not encrypted)
         update_affiliation_state(sys, source_id, talkgroup_num, false);
         
-        // Send graph streaming data for Gephi
-        send_gephi_unit_event(sys, source_id, talkgroup_num, false);
+        // Send graph streaming data for Gephi (unit-tg pairing)
+        send_gephi_unit_tg_event(sys, source_id, talkgroup_num, false);
         
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
@@ -1395,22 +1397,9 @@ public:
         json payload = {{"type", "unit_event"}, {"event", event_json}};
         enqueue_sse_event("unit_event", payload.dump());
         
-        // Update state: unit is now registered
         set_unit_registration(sys, source_id, true);
         
-        // Create unlinked Gephi node for registered unit (use state color)
-        if (source_id != -1 && source_id != 0) {
-            std::string node_id = std::to_string(source_id);
-            std::string color = get_unit_effective_color(sys, source_id);
-            json node_data = {
-                {"id", source_id},
-                {"label", unit_alias.empty() ? node_id : unit_alias},
-                {"color", color},
-                {"size", 15}
-            };
-            json add_node = {{"an", {{node_id, node_data}}}};
-            enqueue_graph_event(add_node.dump() + "\r\n");
-        }
+        send_gephi_unit_event(sys, source_id, false);
         
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
@@ -1534,7 +1523,7 @@ public:
         cache_trunk_message(event_json);
         enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
 
-        send_gephi_unit_event(sys, source_id, talkgroup_num, false);
+        send_gephi_unit_tg_event(sys, source_id, talkgroup_num, false);
 
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
@@ -1642,12 +1631,6 @@ private:
             this->request_gephi_initial_dump();
         });
         
-        // Test endpoint to manually generate graph events
-        server_.Get("/api/test_graph", [this](const httplib::Request& req, httplib::Response& res) {
-            json test_node = {{"an", {{"test1", {{"id", "test1"}, {"label", "Test Node"}, {"color", "#0099CC"}, {"size", 20}}}}}};
-            enqueue_graph_event(test_node.dump() + "\n");
-            res.set_content("{\"status\":\"graph event queued\"}", "application/json");
-        });
         
         // REST API endpoint for initial state
         server_.Get("/api/status", [this](const httplib::Request& req, httplib::Response& res) {
@@ -2332,7 +2315,7 @@ private:
         return change_edge.dump() + "\r\n";
     }
             
-    void send_gephi_unit_event(System* sys, long unit_id, long tg_id, bool encrypted = false) {
+    void send_gephi_unit_tg_event(System* sys, long unit_id, long tg_id, bool encrypted = false) {
         // Filter out anomalous IDs that are not valid for graph theory
         // -1 indicates unknown/invalid radio ID
         // 0 indicates uninitialized or missing unit/talkgroup ID
@@ -2364,6 +2347,22 @@ private:
         events << create_gephi_change_edge(unit_id, tg_id, encrypted);
         
         // Queue all events together
+        enqueue_graph_event(events.str());
+    }
+
+    // Send Gephi events for unit-only updates (no edges)
+    void send_gephi_unit_event(System* sys, long unit_id, bool encrypted = false) {
+        // Filter out anomalous IDs that are not valid for graph theory
+        if (unit_id == -1 || unit_id == 0) {
+            return;
+        }
+
+        std::string unit_alpha = sys->find_unit_tag(unit_id);
+
+        std::stringstream events;
+        events << create_gephi_add_unit_node(unit_id, unit_alpha, encrypted);
+        events << create_gephi_change_unit_node(unit_id, unit_alpha, encrypted);
+
         enqueue_graph_event(events.str());
     }
     

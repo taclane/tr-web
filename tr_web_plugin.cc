@@ -365,9 +365,6 @@ class Tr_Web : public Plugin_Api
         int node_count = 0;
         int edge_count = 0;
 
-        time_t now = time(NULL);
-        const time_t idle_threshold = affiliation_timeout_ * 3600;
-
         json all_nodes;
         json all_edges;
         json edge_map;
@@ -379,23 +376,9 @@ class Tr_Web : public Plugin_Api
                 continue;
             std::string node_id = std::to_string(unit.id);
             std::string label = unit.alias.empty() ? ("Unit " + std::to_string(unit.id)) : unit.alias;
-            std::string color;
-            if (!unit.registered)
-            {
-                color = "#666666";
-            }
-            else if ((now - unit.last_active) > idle_threshold)
-            {
-                color = "#888888";
-            }
-            else if (unit.encr_seen)
-            {
-                color = GEPHI_COLOR_RED;
-            }
-            else
-            {
-                color = GEPHI_COLOR_BLUE;
-            }
+            
+            // Use centralized color logic (single source of truth)
+            std::string color = get_unit_color(unit);
             json node_data = {
                 {"id", unit.id},
                 {"label", label},
@@ -529,14 +512,15 @@ class Tr_Web : public Plugin_Api
     }
 
     // Gephi streaming helper functions
-    std::string create_gephi_add_unit_node(long unit_id, const std::string &unit_alpha, bool encrypted)
+    std::string create_gephi_add_unit_node(System *sys, long unit_id, const std::string &unit_alpha, bool encrypted)
     {
         std::string node_id = std::to_string(unit_id);
+        std::string color = get_unit_effective_color(sys, unit_id);
 
         json node_data = {
             {"id", unit_id},
             {"label", unit_alpha.empty() ? node_id : unit_alpha},
-            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE},
+            {"color", color},
             {"size", 15}};
 
         if (encrypted)
@@ -548,19 +532,19 @@ class Tr_Web : public Plugin_Api
         return add_node.dump() + "\r\n";
     }
 
-    std::string create_gephi_change_unit_node(long unit_id, const std::string &unit_alpha, bool encrypted)
+    std::string create_gephi_change_unit_node(System *sys, long unit_id, const std::string &unit_alpha, bool encrypted)
     {
         std::string node_id = std::to_string(unit_id);
+        std::string color = get_unit_effective_color(sys, unit_id);
 
         json node_data = {
             {"id", unit_id},
             {"label", unit_alpha.empty() ? node_id : unit_alpha},
+            {"color", color},
             {"size", 15}};
 
-        // Preserve encryption color on change events
         if (encrypted)
         {
-            node_data["color"] = GEPHI_COLOR_RED;
             node_data["encryption"] = true;
         }
 
@@ -672,17 +656,17 @@ class Tr_Web : public Plugin_Api
         }
 
         // Always send both "add" and "change" events (no state tracking)
-        // - "add" events set initial color (Gephi ignores duplicates)
-        // - "change" events only set color if encrypted (prevents blue reset)
+        // - "add" events set initial color based on current state
+        // - "change" events update color dynamically (grey/blue/red)
         std::stringstream events;
 
         // Send add events (establish nodes/edges with correct initial colors)
-        events << create_gephi_add_unit_node(unit_id, unit_alpha, encrypted);
+        events << create_gephi_add_unit_node(sys, unit_id, unit_alpha, encrypted);
         events << create_gephi_add_talkgroup_node(tg_id, tg_alpha, encrypted);
         events << create_gephi_add_edge(unit_id, tg_id, encrypted);
 
-        // Send change events (update labels, only set color if encrypted)
-        events << create_gephi_change_unit_node(unit_id, unit_alpha, encrypted);
+        // Send change events (update labels and colors based on current state)
+        events << create_gephi_change_unit_node(sys, unit_id, unit_alpha, encrypted);
         events << create_gephi_change_talkgroup_node(tg_id, tg_alpha, encrypted);
         events << create_gephi_change_edge(unit_id, tg_id, encrypted);
 
@@ -702,8 +686,8 @@ class Tr_Web : public Plugin_Api
         std::string unit_alpha = sys->find_unit_tag(unit_id);
 
         std::stringstream events;
-        events << create_gephi_add_unit_node(unit_id, unit_alpha, encrypted);
-        events << create_gephi_change_unit_node(unit_id, unit_alpha, encrypted);
+        events << create_gephi_add_unit_node(sys, unit_id, unit_alpha, encrypted);
+        events << create_gephi_change_unit_node(sys, unit_id, unit_alpha, encrypted);
 
         enqueue_graph_event(events.str());
     }
@@ -876,6 +860,48 @@ public:
         unit.registered = registered;
     }
 
+    // Update unit state for non-voice events (acknowledgements, data, location, etc.)
+    // This refreshes the last_active timestamp without talkgroup affiliation
+    void update_unit_state(System *sys, long unit_id, bool encrypted = false)
+    {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        time_t now = time(NULL);
+
+        int wacn = sys->get_wacn();
+        int sysid = sys->get_sys_id();
+        std::string unit_key = make_unit_key(wacn, sysid, unit_id);
+
+        auto &unit = unit_states_[unit_key];
+        unit.id = unit_id;
+        unit.wacn = wacn;
+        unit.sysid = sysid;
+        if (unit.alias.empty())
+        {
+            unit.alias = sys->find_unit_tag(unit_id);
+        }
+        unit.last_active = now;
+        // Note: Don't change registration status - only explicit reg/dereg messages do that
+        if (encrypted)
+        {
+            unit.encr_seen = true;
+        }
+    }
+
+    // Helper: Get color for a unit based on its state (single source of truth)
+    std::string get_unit_color(const UnitState &unit) const
+    {
+        time_t now = time(NULL);
+        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
+        
+        // Grey if deregistered OR idle
+        if (!unit.registered || unit.last_active < idle_threshold)
+        {
+            return GEPHI_COLOR_GREY;
+        }
+
+        return unit.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
+    }
+
     // Get effective color for a unit based on state (for grey-to-color transitions)
     std::string get_unit_effective_color(System *sys, long unit_id) const
     {
@@ -891,17 +917,7 @@ public:
             return GEPHI_COLOR_BLUE; // Default
         }
 
-        const auto &unit = it->second;
-        time_t now = time(NULL);
-        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
-
-        // Grey if deregistered OR idle
-        if (!unit.registered || unit.last_active < idle_threshold)
-        {
-            return GEPHI_COLOR_GREY;
-        }
-
-        return unit.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
+        return get_unit_color(it->second);
     }
 
     // Get affiliation data for API
@@ -1776,15 +1792,17 @@ public:
         // Update state: unit is now deregistered
         set_unit_registration(sys, source_id, false);
 
-        // Change Gephi node color to grey for deregistered unit
+        // Change Gephi node color based on current state (should be grey after deregistration)
         if (source_id != -1 && source_id != 0)
         {
             std::string node_id = std::to_string(source_id);
+            std::string color = get_unit_effective_color(sys, source_id);
             json node_data = {
                 {"id", source_id},
                 {"label", unit_alias.empty() ? node_id : unit_alias},
-                {"color", GEPHI_COLOR_GREY},
-                {"size", 15}};
+                {"color", color},
+                {"size", 15},
+                {"deregistered", true}};
             json change_node = {{"cn", {{node_id, node_data}}}};
             enqueue_graph_event(change_node.dump() + "\r\n");
         }
@@ -1808,6 +1826,11 @@ public:
 
         cache_trunk_message(event_json);
         enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
+        
+        // Update unit state to track activity
+        update_unit_state(sys, source_id, false);
+        send_gephi_unit_event(sys, source_id, false);
+        
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
@@ -1827,6 +1850,11 @@ public:
 
         cache_trunk_message(event_json);
         enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
+        
+        // Update unit state to track activity
+        update_unit_state(sys, source_id, false);
+        send_gephi_unit_event(sys, source_id, false);
+        
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
@@ -1848,6 +1876,11 @@ public:
 
         cache_trunk_message(event_json);
         enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
+        
+        // Update unit state to track activity
+        update_unit_state(sys, source_id, false);
+        send_gephi_unit_tg_event(sys, source_id, talkgroup_num, false);
+        
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
@@ -1870,6 +1903,8 @@ public:
         cache_trunk_message(event_json);
         enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
 
+        // Update unit state to track activity
+        update_unit_state(sys, source_id, false);
         send_gephi_unit_tg_event(sys, source_id, talkgroup_num, false);
 
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
@@ -1907,6 +1942,46 @@ public:
         // Add fields not included in trunk-recorder's call JSON
         call_json["call_num"] = call_info.call_num;
         call_json["sys_num"] = call_info.sys_num;
+
+        // Handle conventional unit tracking (no grants for conventional systems)
+        // Trunked units are tracked via grant messages, so only process conventional
+        System *sys = nullptr;
+        for (auto *s : tr_systems_)
+        {
+            if (s->get_sys_num() == call_info.sys_num)
+            {
+                sys = s;
+                break;
+            }
+        }
+
+        if (sys)
+        {
+            std::string sys_type = sys->get_system_type();
+            bool is_conventional = (sys_type.find("conventional") != std::string::npos);
+
+            // Only process srcList for conventional systems to avoid duplication
+            if (is_conventional && call_json.contains("srcList") && call_json["srcList"].is_array())
+            {
+                long talkgroup = call_info.talkgroup;
+                bool encrypted = call_info.encrypted;
+
+                // Iterate through all units in the srcList
+                for (const auto &src_entry : call_json["srcList"])
+                {
+                    if (src_entry.contains("src") && src_entry["src"].is_number())
+                    {
+                        long unit_id = src_entry["src"];
+
+                        // Update affiliation state for this unit-talkgroup pair
+                        update_affiliation_state(sys, unit_id, talkgroup, encrypted);
+
+                        // Send Gephi event for the unit-talkgroup relationship
+                        send_gephi_unit_tg_event(sys, unit_id, talkgroup, encrypted);
+                    }
+                }
+            }
+        }
 
         // Cache for initial page load
         cache_call(call_json);

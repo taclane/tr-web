@@ -347,6 +347,14 @@
                     <span style="font-size: 14px; color: var(--text-primary);">Filter Bogons</span>
                 </label>
                 
+                <!-- WACN:SYSID Filter Dropdown -->
+                <select id="wacnSysidFilter" onchange="filterByWacnSysid(this.value)"
+                        style="padding: 8px 12px; background: var(--bg-secondary); color: var(--text-primary); 
+                               border: 1px solid var(--border); border-radius: 4px; cursor: pointer; 
+                               font-size: 14px; min-width: 150px;">
+                    <option value="all">All Systems</option>
+                </select>
+                
                 <!-- API Info Button -->
                 <button onclick="toggleApiInfo()" 
                         style="padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); 

@@ -2760,7 +2760,8 @@ const affiliationState = {
     sortColumn: 'id',
     sortDirection: 'asc',
     searchTerm: '',
-    filterBogons: true
+    filterBogons: true,
+    filterWacnSysid: 'all' // 'all' or 'wacn:sysid' format
 };
 
 function toggleApiInfo() {
@@ -2822,6 +2823,21 @@ function showAffiliationView(view) {
     renderAffiliationTable();
 }
 
+// Parse compact array format to object format
+// Schema: ["id", "wacn", "sysid", "alias", "encr_seen", "last_active", ...]
+// Data: [[123, 456, 789, "Unit 1", false, 1234567890, ...], ...]
+function parseCompactArray(dataArray, schema) {
+    if (!dataArray || !schema) return [];
+    
+    return dataArray.map(row => {
+        const obj = {};
+        schema.forEach((key, idx) => {
+            obj[key] = row[idx];
+        });
+        return obj;
+    });
+}
+
 async function loadAffiliations() {
     console.log('[Affiliations] loadAffiliations called');
     
@@ -2835,9 +2851,8 @@ async function loadAffiliations() {
     try {
         console.log('[Affiliations] Fetching data from /api/affiliations');
         
-        // Fetch only the current view to reduce payload size
-        const viewParam = currentView === 'units' ? 'units' : 'talkgroups';
-        const response = await fetch(`${BASE_PATH}api/affiliations?view=${viewParam}`, {
+        // Fetch both units and talkgroups so detail rows can show status circles
+        const response = await fetch(`${BASE_PATH}api/affiliations`, {
             credentials: 'same-origin',
             headers: {
                 'Accept': 'application/json'
@@ -2860,11 +2875,22 @@ async function loadAffiliations() {
             units: data.units?.length || 0, 
             talkgroups: data.talkgroups?.length || 0,
             total_units: data.total_units || 0,
-            total_talkgroups: data.total_talkgroups || 0
+            total_talkgroups: data.total_talkgroups || 0,
+            has_schema: !!data.schema
         });
         
-        affiliationState.units = data.units || [];
-        affiliationState.talkgroups = data.talkgroups || [];
+        // Convert compact array format to object format if schema is present
+        if (data.schema) {
+            affiliationState.units = parseCompactArray(data.units, data.schema.units);
+            affiliationState.talkgroups = parseCompactArray(data.talkgroups, data.schema.talkgroups);
+        } else {
+            // Fallback for old format
+            affiliationState.units = data.units || [];
+            affiliationState.talkgroups = data.talkgroups || [];
+        }
+        
+        // Populate WACN:SYSID filter dropdown
+        populateWacnSysidFilter();
         
         renderAffiliationTable();
     } catch (e) {
@@ -2982,6 +3008,12 @@ function filterAndSortData(items) {
         });
     }
     
+    // Apply WACN:SYSID filter
+    if (affiliationState.filterWacnSysid && affiliationState.filterWacnSysid !== 'all') {
+        const [wacn, sysid] = affiliationState.filterWacnSysid.split(':').map(Number);
+        filtered = filtered.filter(item => item.wacn === wacn && item.sysid === sysid);
+    }
+    
     // Apply search filter
     if (affiliationState.searchTerm) {
         const term = affiliationState.searchTerm.toLowerCase();
@@ -3038,6 +3070,7 @@ function filterAndSortData(items) {
 }
 
 function renderAffiliationTable() {
+    const startTime = performance.now();
     const view = affiliationState.currentView;
     const isUnits = view === 'units';
     const data = isUnits ? affiliationState.units : affiliationState.talkgroups;
@@ -3049,6 +3082,12 @@ function renderAffiliationTable() {
     // CRITICAL: Save scroll position before DOM update
     const container = document.querySelector('.tab-content');
     const scrollPos = container ? container.scrollTop : 0;
+    
+    // Create lookup maps for O(1) access instead of O(n) find() calls
+    const unitMap = new Map();
+    const tgMap = new Map();
+    affiliationState.units.forEach(u => unitMap.set(`${u.wacn}:${u.sysid}:${u.id}`, u));
+    affiliationState.talkgroups.forEach(tg => tgMap.set(`${tg.wacn}:${tg.sysid}:${tg.id}`, tg));
     
     // Build HTML in memory first
     const rowsHtml = filtered.map((item, idx) => {
@@ -3080,7 +3119,7 @@ function renderAffiliationTable() {
                         Associated ${isUnits ? 'Talkgroups' : 'Units'} (${Object.keys(associatedCounts).length})
                     </div>
                     <div style="display: flex; flex-wrap: wrap; gap: 6px;">
-                        ${renderAssociatedItemsCompact(associatedCounts, isUnits, item)}
+                        ${renderAssociatedItemsCompact(associatedCounts, isUnits, item, unitMap, tgMap)}
                     </div>
                 </div>
             </td>
@@ -3094,6 +3133,9 @@ function renderAffiliationTable() {
     if (container && scrollPos > 0) {
         container.scrollTop = scrollPos;
     }
+    
+    const endTime = performance.now();
+    console.log(`[Affiliations] Rendered ${filtered.length} items in ${(endTime - startTime).toFixed(2)}ms`);
 }
 // Highlight both header and detail row on mouseover
 function highlightAffiliationRows(rowId, detailsId, highlight) {
@@ -3119,7 +3161,7 @@ function toggleAffiliationDetails(detailsId) {
     }
 }
 
-function renderAssociatedItemsCompact(counts, isUnits, parentItem) {
+function renderAssociatedItemsCompact(counts, isUnits, parentItem, unitMap, tgMap) {
     if (!counts || Object.keys(counts).length === 0) {
         return '<span style="color: var(--text-secondary); font-size: 12px;">None</span>';
     }
@@ -3128,10 +3170,9 @@ function renderAssociatedItemsCompact(counts, isUnits, parentItem) {
     const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
     
     return sorted.map(([id, count]) => {
-        // Get the associated item's state to determine status and alias
-        const associatedItem = isUnits ? 
-            affiliationState.talkgroups.find(tg => tg.id == id && tg.wacn === parentItem.wacn && tg.sysid === parentItem.sysid) :
-            affiliationState.units.find(u => u.id == id && u.wacn === parentItem.wacn && u.sysid === parentItem.sysid);
+        // Use map lookup instead of find() for O(1) performance
+        const lookupKey = `${parentItem.wacn}:${parentItem.sysid}:${id}`;
+        const associatedItem = isUnits ? tgMap.get(lookupKey) : unitMap.get(lookupKey);
         
         const statusBadge = associatedItem ? getStatusBadge(associatedItem, !isUnits) : '';
         const clickHandler = isUnits ? 
@@ -3266,6 +3307,42 @@ function clearAffiliationSearch() {
     if (searchInput) searchInput.value = '';
     if (clearBtn) clearBtn.style.display = 'none';
     // Force full re-render and reset
+    renderAffiliationTable();
+}
+
+function populateWacnSysidFilter() {
+    const select = document.getElementById('wacnSysidFilter');
+    if (!select) return;
+    
+    // Collect unique WACN:SYSID combinations
+    const combinations = new Set();
+    affiliationState.units.forEach(u => combinations.add(`${u.wacn}:${u.sysid}`));
+    affiliationState.talkgroups.forEach(tg => combinations.add(`${tg.wacn}:${tg.sysid}`));
+    
+    // Sort and build options
+    const sorted = Array.from(combinations).sort();
+    
+    // Preserve current selection
+    const currentValue = select.value;
+    
+    // Clear and rebuild options
+    select.innerHTML = '<option value="all">All Systems</option>';
+    sorted.forEach(combo => {
+        const option = document.createElement('option');
+        option.value = combo;
+        const [wacn, sysid] = combo.split(':');
+        option.textContent = `WACN: 0x${parseInt(wacn).toString(16).toUpperCase().padStart(5, '0')} / SYSID: 0x${parseInt(sysid).toString(16).toUpperCase().padStart(3, '0')}`;
+        select.appendChild(option);
+    });
+    
+    // Restore selection if it still exists
+    if (currentValue && Array.from(select.options).some(opt => opt.value === currentValue)) {
+        select.value = currentValue;
+    }
+}
+
+function filterByWacnSysid(value) {
+    affiliationState.filterWacnSysid = value;
     renderAffiliationTable();
 }
 

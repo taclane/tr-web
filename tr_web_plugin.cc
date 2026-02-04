@@ -376,7 +376,7 @@ class Tr_Web : public Plugin_Api
                 continue;
             std::string node_id = std::to_string(unit.id);
             std::string label = unit.alias.empty() ? ("Unit " + std::to_string(unit.id)) : unit.alias;
-            
+
             // Use centralized color logic (single source of truth)
             std::string color = get_unit_color(unit);
             json node_data = {
@@ -471,7 +471,7 @@ class Tr_Web : public Plugin_Api
         if (!all_nodes.empty())
         {
             json an_msg = {{"an", all_nodes}};
-            server_.broadcast_raw_to_path("/graph-stream", an_msg.dump() + "\r\n");
+            server_.broadcast_raw_to_path("/graph-stream", an_msg.dump(-1) + "\r\n");
         }
 
         // Gather all edges
@@ -505,7 +505,7 @@ class Tr_Web : public Plugin_Api
         if (!all_edges.empty())
         {
             json ae_msg = {{"ae", all_edges}};
-            server_.broadcast_raw_to_path("/graph-stream", ae_msg.dump() + "\r\n");
+            server_.broadcast_raw_to_path("/graph-stream", ae_msg.dump(-1) + "\r\n");
         }
 
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Sent " << node_count << " nodes and " << edge_count << " edges to new Gephi connection";
@@ -529,7 +529,7 @@ class Tr_Web : public Plugin_Api
         }
 
         json add_node = {{"an", {{node_id, node_data}}}};
-        return add_node.dump() + "\r\n";
+        return add_node.dump(-1) + "\r\n";
     }
 
     std::string create_gephi_change_unit_node(System *sys, long unit_id, const std::string &unit_alpha, bool encrypted)
@@ -549,7 +549,7 @@ class Tr_Web : public Plugin_Api
         }
 
         json change_node = {{"cn", {{node_id, node_data}}}};
-        return change_node.dump() + "\r\n";
+        return change_node.dump(-1) + "\r\n";
     }
 
     std::string create_gephi_add_talkgroup_node(long tg_id, const std::string &tg_alpha, bool encrypted)
@@ -569,7 +569,7 @@ class Tr_Web : public Plugin_Api
         }
 
         json add_node = {{"an", {{node_id, node_data}}}};
-        return add_node.dump() + "\r\n";
+        return add_node.dump(-1) + "\r\n";
     }
 
     std::string create_gephi_change_talkgroup_node(long tg_id, const std::string &tg_alpha, bool encrypted)
@@ -590,7 +590,7 @@ class Tr_Web : public Plugin_Api
         }
 
         json change_node = {{"cn", {{node_id, node_data}}}};
-        return change_node.dump() + "\r\n";
+        return change_node.dump(-1) + "\r\n";
     }
 
     std::string create_gephi_add_edge(long unit_id, long tg_id, bool encrypted)
@@ -611,7 +611,7 @@ class Tr_Web : public Plugin_Api
         }
 
         json add_edge = {{"ae", {{edge_id, edge_data}}}};
-        return add_edge.dump() + "\r\n";
+        return add_edge.dump(-1) + "\r\n";
     }
 
     std::string create_gephi_change_edge(long unit_id, long tg_id, bool encrypted)
@@ -633,7 +633,7 @@ class Tr_Web : public Plugin_Api
         }
 
         json change_edge = {{"ce", {{edge_id, edge_data}}}};
-        return change_edge.dump() + "\r\n";
+        return change_edge.dump(-1) + "\r\n";
     }
 
     void send_gephi_unit_tg_event(System *sys, long unit_id, long tg_id, bool encrypted = false)
@@ -916,7 +916,7 @@ public:
             else
             {
                 // Regular endpoints accept either user or admin credentials
-                return (provided_creds == expected_creds) || 
+                return (provided_creds == expected_creds) ||
                        (!admin_username_.empty() && provided_creds == admin_creds);
             }
         }
@@ -929,7 +929,7 @@ public:
     {
         time_t now = time(NULL);
         time_t idle_threshold = now - (affiliation_timeout_ * 3600);
-        
+
         // Grey if deregistered OR idle
         if (!unit.registered || unit.last_active < idle_threshold)
         {
@@ -964,7 +964,11 @@ public:
         time_t now = time(NULL);
         time_t idle_threshold = now - (affiliation_timeout_ * 3600);
 
+        // Compact array-based format to reduce payload size
+        // Schema: [id, wacn, sysid, alias, encr_seen, last_active, registered, is_idle, tx_count, activity_map]
         json result = {
+            {"schema", json::object({{"units", json::array({"id", "wacn", "sysid", "alias", "encr_seen", "last_active", "registered", "is_idle", "tx_count", "tg_activity"})},
+                                     {"talkgroups", json::array({"id", "wacn", "sysid", "alias", "encr_seen", "last_active", "is_idle", "tx_count", "unit_activity"})}})},
             {"units", json::array()},
             {"talkgroups", json::array()},
             {"config", {{"timeout_hours", affiliation_timeout_}}},
@@ -995,16 +999,17 @@ public:
                     tg_counts[std::to_string(tg_pair.first)] = tg_pair.second;
                 }
 
-                result["units"].push_back({{"id", unit.id},
-                                           {"wacn", unit.wacn},
-                                           {"sysid", unit.sysid},
-                                           {"alias", unit.alias},
-                                           {"encr_seen", unit.encr_seen},
-                                           {"last_active", unit.last_active},
-                                           {"registered", unit.registered},
-                                           {"is_idle", is_idle},
-                                           {"tx_count", unit.tx_count},
-                                           {"tg_activity", tg_counts}});
+                // Array format: [id, wacn, sysid, alias, encr_seen, last_active, registered, is_idle, tx_count, tg_activity]
+                result["units"].push_back(json::array({unit.id,
+                                                       unit.wacn,
+                                                       unit.sysid,
+                                                       unit.alias,
+                                                       unit.encr_seen,
+                                                       unit.last_active,
+                                                       unit.registered,
+                                                       is_idle,
+                                                       unit.tx_count,
+                                                       tg_counts}));
                 count++;
             }
         }
@@ -1033,15 +1038,16 @@ public:
                     unit_counts[std::to_string(unit_pair.first)] = unit_pair.second;
                 }
 
-                result["talkgroups"].push_back({{"id", tg.id},
-                                                {"wacn", tg.wacn},
-                                                {"sysid", tg.sysid},
-                                                {"alias", tg.alias},
-                                                {"encr_seen", tg.encr_seen},
-                                                {"last_active", tg.last_active},
-                                                {"is_idle", is_idle},
-                                                {"tx_count", tg.tx_count},
-                                                {"unit_activity", unit_counts}});
+                // Array format: [id, wacn, sysid, alias, encr_seen, last_active, is_idle, tx_count, unit_activity]
+                result["talkgroups"].push_back(json::array({tg.id,
+                                                            tg.wacn,
+                                                            tg.sysid,
+                                                            tg.alias,
+                                                            tg.encr_seen,
+                                                            tg.last_active,
+                                                            is_idle,
+                                                            tg.tx_count,
+                                                            unit_counts}));
                 count++;
             }
         }
@@ -1446,7 +1452,7 @@ public:
             for (const auto &l : lines)
               payload["lines"].push_back(l);
             payload["dropped"] = dropped;
-            server_.broadcast_sse("console_batch", payload.dump());
+            server_.broadcast_sse("console_batch", payload.dump(-1));
           }
         }
 
@@ -1471,23 +1477,23 @@ public:
 
             if (flags & DIRTY_SYSTEMS) {
               json payload = {{"type", "systems"}, {"systems", systems}};
-              server_.broadcast_sse("systems", payload.dump());
+              server_.broadcast_sse("systems", payload.dump(-1));
             }
             if (flags & DIRTY_RECORDERS) {
               json payload = {{"type", "recorders"}, {"recorders", recorders}};
-              server_.broadcast_sse("recorders", payload.dump());
+              server_.broadcast_sse("recorders", payload.dump(-1));
             }
             if (flags & DIRTY_CALLS) {
               json payload = {{"type", "calls"}, {"calls_active", calls}};
-              server_.broadcast_sse("calls", payload.dump());
+              server_.broadcast_sse("calls", payload.dump(-1));
             }
             if (flags & DIRTY_RATES) {
               json payload = {{"type", "rates"}, {"rates", rates}};
-              server_.broadcast_sse("rates", payload.dump());
+              server_.broadcast_sse("rates", payload.dump(-1));
             }
             if (flags & DIRTY_DEVICES) {
               json payload = {{"type", "devices"}, {"devices", devices}};
-              server_.broadcast_sse("devices", payload.dump());
+              server_.broadcast_sse("devices", payload.dump(-1));
             }
           }
 
@@ -1512,7 +1518,7 @@ public:
           }
           if (dropped) {
             json payload = {{"type", "event_drop"}, {"dropped", dropped}};
-            server_.broadcast_sse("event_drop", payload.dump());
+            server_.broadcast_sse("event_drop", payload.dump(-1));
           }
         }
 
@@ -1694,7 +1700,7 @@ public:
 
                         // Send synthetic call_end event to frontend
                         json payload = {{"type", "call_end"}, {"call", prev_call_json}};
-                        enqueue_sse_event("call_end", payload.dump());
+                        enqueue_sse_event("call_end", payload.dump(-1));
                     }
                 }
             }
@@ -1726,7 +1732,7 @@ public:
         // Best-effort discrete call_start (cheap), queued for broadcast thread.
         json call_json = get_call_json(call);
         json payload = {{"type", "call_start"}, {"call", call_json}};
-        enqueue_sse_event("call_start", payload.dump());
+        enqueue_sse_event("call_start", payload.dump(-1));
 
         // Also log as a GRANT event for Omnitrunker
         System *sys = call->get_system();
@@ -1756,7 +1762,7 @@ public:
         cache_trunk_message(event_json);
 
         json grant_payload = {{"type", "unit_event"}, {"event", event_json}};
-        enqueue_sse_event("unit_event", grant_payload.dump());
+        enqueue_sse_event("unit_event", grant_payload.dump(-1));
 
         // Update affiliation state for proper Gephi coloring
         bool encrypted = call->get_encrypted();
@@ -1797,7 +1803,7 @@ public:
         cache_trunk_message(event_json);
 
         json payload = {{"type", "unit_event"}, {"event", event_json}};
-        enqueue_sse_event("unit_event", payload.dump());
+        enqueue_sse_event("unit_event", payload.dump(-1));
 
         // Update affiliation state (affiliations are typically not encrypted)
         update_affiliation_state(sys, source_id, talkgroup_num, false);
@@ -1828,7 +1834,7 @@ public:
         cache_trunk_message(event_json);
 
         json payload = {{"type", "unit_event"}, {"event", event_json}};
-        enqueue_sse_event("unit_event", payload.dump());
+        enqueue_sse_event("unit_event", payload.dump(-1));
 
         set_unit_registration(sys, source_id, true);
 
@@ -1857,7 +1863,7 @@ public:
         cache_trunk_message(event_json);
 
         json payload = {{"type", "unit_event"}, {"event", event_json}};
-        enqueue_sse_event("unit_event", payload.dump());
+        enqueue_sse_event("unit_event", payload.dump(-1));
 
         // Update state: unit is now deregistered
         set_unit_registration(sys, source_id, false);
@@ -1874,7 +1880,7 @@ public:
                 {"size", 15},
                 {"deregistered", true}};
             json change_node = {{"cn", {{node_id, node_data}}}};
-            enqueue_graph_event(change_node.dump() + "\r\n");
+            enqueue_graph_event(change_node.dump(-1) + "\r\n");
         }
 
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
@@ -1895,12 +1901,12 @@ public:
             {"tg_alpha", ""}};
 
         cache_trunk_message(event_json);
-        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
-        
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump(-1));
+
         // Update unit state to track activity
         update_unit_state(sys, source_id, false);
         send_gephi_unit_event(sys, source_id, false);
-        
+
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
@@ -1919,12 +1925,12 @@ public:
             {"tg_alpha", ""}};
 
         cache_trunk_message(event_json);
-        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
-        
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump(-1));
+
         // Update unit state to track activity
         update_unit_state(sys, source_id, false);
         send_gephi_unit_event(sys, source_id, false);
-        
+
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
@@ -1945,12 +1951,12 @@ public:
             {"tg_alpha", tg ? tg->alpha_tag : ""}};
 
         cache_trunk_message(event_json);
-        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
-        
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump(-1));
+
         // Update unit state to track activity
         update_unit_state(sys, source_id, false);
         send_gephi_unit_tg_event(sys, source_id, talkgroup_num, false);
-        
+
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
     }
@@ -1971,7 +1977,7 @@ public:
             {"tg_alpha", tg ? tg->alpha_tag : ""}};
 
         cache_trunk_message(event_json);
-        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump());
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump(-1));
 
         // Update unit state to track activity
         update_unit_state(sys, source_id, false);
@@ -2058,7 +2064,7 @@ public:
 
         // Queue the rich end-event for the broadcast thread.
         json payload = {{"type", "call_end"}, {"call", call_json}};
-        enqueue_sse_event("call_end", payload.dump());
+        enqueue_sse_event("call_end", payload.dump(-1));
         return 0;
     }
 
@@ -2171,7 +2177,7 @@ private:
         console_pending_dropped_ = 0;
       }
 
-      res.set_content(response.dump(), "application/json"); });
+      res.set_content(response.dump(-1), "application/json"); });
 
         // Rate history endpoint
         server_.Get("/api/rates/history", [this](const httplib::Request &req, httplib::Response &res)
@@ -2182,7 +2188,7 @@ private:
           return;
       }
       json response = get_rate_history();
-      res.set_content(response.dump(), "application/json"); });
+      res.set_content(response.dump(-1), "application/json"); });
 
         // Call rate history endpoint
         server_.Get("/api/calls/rate-history", [this](const httplib::Request &req, httplib::Response &res)
@@ -2193,7 +2199,7 @@ private:
           return;
       }
       json response = get_call_rate_history();
-      res.set_content(response.dump(), "application/json"); });
+      res.set_content(response.dump(-1), "application/json"); });
 
         // Console logs endpoint
         server_.Get("/api/console", [this](const httplib::Request &req, httplib::Response &res)
@@ -2204,7 +2210,7 @@ private:
           return;
       }
       json response = {{"lines", get_console_logs()}};
-      res.set_content(response.dump(), "application/json"); });
+      res.set_content(response.dump(-1), "application/json"); });
 
         // Affiliations data endpoint (with optional pagination)
         server_.Get("/api/affiliations", [this](const httplib::Request &req, httplib::Response &res)
@@ -2235,7 +2241,7 @@ private:
       }
 
       json response = get_affiliation_data(limit, units_only, talkgroups_only);
-      res.set_content(response.dump(), "application/json"); });
+      res.set_content(response.dump(-1), "application/json"); });
 
         // System data endpoints - parse sys_num from path
         server_.Get("/api/system/talkgroups", [this](const httplib::Request &req, httplib::Response &res)
@@ -2276,7 +2282,7 @@ private:
                        {"group", tg->group},
                        {"priority", tg->priority}});
       }
-      res.set_content(tgs.dump(), "application/json"); });
+      res.set_content(tgs.dump(-1), "application/json"); });
 
         server_.Get("/api/system/unit_tags", [this](const httplib::Request &req, httplib::Response &res)
                     {
@@ -2320,7 +2326,7 @@ private:
           {"mode", sys->get_unit_tags_mode()},
           {"count", tags.size()},
           {"tags", tags}};
-      res.set_content(response.dump(), "application/json"); });
+      res.set_content(response.dump(-1), "application/json"); });
 
         server_.Get("/api/system/unit_tags_ota", [this](const httplib::Request &req, httplib::Response &res)
                     {
@@ -2362,7 +2368,7 @@ private:
           {"file", sys->get_unit_tags_ota_file()},
           {"count", aliases.size()},
           {"aliases", aliases}};
-      res.set_content(response.dump(), "application/json"); });
+      res.set_content(response.dump(-1), "application/json"); });
 
         // Admin: Get login history
         server_.Get("/api/admin/login-history", [this](const httplib::Request &req, httplib::Response &res)
@@ -2385,7 +2391,7 @@ private:
         response.push_back(entry);
       }
 
-      res.set_content(response.dump(), "application/json"); });
+      res.set_content(response.dump(-1), "application/json"); });
 
         // Admin: Get trunk-recorder config
         server_.Get("/api/admin/config", [this](const httplib::Request &req, httplib::Response &res)
@@ -2401,7 +2407,7 @@ private:
         if (!config_file.good()) {
           res.status = 404;
           json error = {{"error", "Config file not found: " + config_path}};
-          res.set_content(error.dump(), "application/json");
+          res.set_content(error.dump(-1), "application/json");
           return;
         }
 
@@ -2410,11 +2416,11 @@ private:
         json response = {
             {"content", config_content},
             {"path", config_path}};
-        res.set_content(response.dump(), "application/json");
+        res.set_content(response.dump(-1), "application/json");
       } catch (const std::exception &e) {
         res.status = 500;
         json error = {{"error", std::string("Failed to read config: ") + e.what()}};
-        res.set_content(error.dump(), "application/json");
+        res.set_content(error.dump(-1), "application/json");
       } });
 
         // Admin: Save config (atomic with backup)
@@ -2434,7 +2440,7 @@ private:
           BOOST_LOG_TRIVIAL(error) << log_prefix_ << "Request body length: " << req.body.size();
           res.status = 400;
           json error = {{"error", std::string("Invalid request: ") + e.what()}};
-          res.set_content(error.dump(), "application/json");
+          res.set_content(error.dump(-1), "application/json");
           return;
         }
 
@@ -2454,7 +2460,7 @@ private:
         } catch (const std::exception &e) {
           res.status = 400;
           json error = {{"error", std::string("Invalid JSON: ") + e.what()}};
-          res.set_content(error.dump(), "application/json");
+          res.set_content(error.dump(-1), "application/json");
           return;
         }
 
@@ -2505,16 +2511,16 @@ private:
             {"success", true},
             {"backup", backup_path},
             {"message", "Configuration saved successfully"}};
-        res.set_content(response.dump(), "application/json");
+        res.set_content(response.dump(-1), "application/json");
 
       } catch (const json::exception &e) {
         res.status = 400;
         json error = {{"error", std::string("Invalid request: ") + e.what()}};
-        res.set_content(error.dump(), "application/json");
+        res.set_content(error.dump(-1), "application/json");
       } catch (const std::exception &e) {
         res.status = 500;
         json error = {{"error", std::string("Failed to save config: ") + e.what()}};
-        res.set_content(error.dump(), "application/json");
+        res.set_content(error.dump(-1), "application/json");
       } });
 
         // Admin: Restart trunk-recorder
@@ -2531,7 +2537,7 @@ private:
           {"status", "ok"},
           {"message", "Restart initiated"},
           {"timestamp", time(NULL)}};
-      res.set_content(response.dump(), "application/json");
+      res.set_content(response.dump(-1), "application/json");
 
       // Schedule restart in a separate thread to allow response to complete
       std::thread([this]() {
@@ -2572,7 +2578,7 @@ private:
       json response = {
           {"auth_level", auth_level},
           {"timestamp", time(NULL)}};
-      res.set_content(response.dump(), "application/json"); });
+      res.set_content(response.dump(-1), "application/json"); });
 
         // Health check
         server_.Get("/health", [this](const httplib::Request &req, httplib::Response &res)
@@ -2581,7 +2587,7 @@ private:
           {"status", "ok"},
           {"timestamp", time(NULL)},
           {"https", server_.is_https()}};
-      res.set_content(health.dump(), "application/json"); });
+      res.set_content(health.dump(-1), "application/json"); });
     }
 
     void resend_recorders()

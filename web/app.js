@@ -2825,12 +2825,19 @@ function showAffiliationView(view) {
 async function loadAffiliations() {
     console.log('[Affiliations] loadAffiliations called');
     
-    // Update loading message to show we're actually trying
-    // Show loading overlay or spinner if desired, but do not clear table
+    // Show loading indicator
+    const currentView = affiliationState.currentView;
+    const tbody = document.getElementById(currentView === 'units' ? 'unitTableBody' : 'talkgroupTableBody');
+    if (tbody && tbody.children.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:20px; color:var(--text-secondary);">Loading...</td></tr>';
+    }
     
     try {
         console.log('[Affiliations] Fetching data from /api/affiliations');
-        const response = await fetch(`${BASE_PATH}api/affiliations`, {
+        
+        // Fetch only the current view to reduce payload size
+        const viewParam = currentView === 'units' ? 'units' : 'talkgroups';
+        const response = await fetch(`${BASE_PATH}api/affiliations?view=${viewParam}`, {
             credentials: 'same-origin',
             headers: {
                 'Accept': 'application/json'
@@ -2842,12 +2849,20 @@ async function loadAffiliations() {
             console.error('[Affiliations] Failed to fetch:', response.status, response.statusText);
             const errorText = await response.text();
             console.error('[Affiliations] Error body:', errorText);
-            // Do not clear table while fetching
+            if (tbody) {
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:20px; color:var(--error);">Failed to load data</td></tr>';
+            }
             return;
         }
         
         const data = await response.json();
-        console.log('[Affiliations] Received data:', { units: data.units?.length || 0, talkgroups: data.talkgroups?.length || 0 });
+        console.log('[Affiliations] Received data:', { 
+            units: data.units?.length || 0, 
+            talkgroups: data.talkgroups?.length || 0,
+            total_units: data.total_units || 0,
+            total_talkgroups: data.total_talkgroups || 0
+        });
+        
         affiliationState.units = data.units || [];
         affiliationState.talkgroups = data.talkgroups || [];
         
@@ -2855,7 +2870,9 @@ async function loadAffiliations() {
     } catch (e) {
         console.error('[Affiliations] Exception caught:', e);
         console.error('[Affiliations] Stack:', e.stack);
-        // Do not clear table on error
+        if (tbody) {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:20px; color:var(--error);">Error loading data</td></tr>';
+        }
     }
 }
 
@@ -3028,46 +3045,55 @@ function renderAffiliationTable() {
     const filtered = filterAndSortData(data);
     
     const tbody = document.getElementById(isUnits ? 'unitTableBody' : 'talkgroupTableBody');
-    // Always fully rebuild the table to avoid orphaned/stale rows
-    tbody.innerHTML = filtered.map((item, idx) => {
+    
+    // CRITICAL: Save scroll position before DOM update
+    const container = document.querySelector('.tab-content');
+    const scrollPos = container ? container.scrollTop : 0;
+    
+    // Build HTML in memory first
+    const rowsHtml = filtered.map((item, idx) => {
         const associatedCounts = isUnits ? item.tg_activity : item.unit_activity;
         const itemKey = `${item.wacn}:${item.sysid}:${item.id}`;
-        const rowId = `aff-row-${itemKey.replace(/:/g, '-')}`;
-        const detailsId = `aff-details-${itemKey.replace(/:/g, '-')}`;
+        const rowId = `aff-row-${item.wacn}-${item.sysid}-${item.id}`;
+        const detailsId = `aff-details-${item.wacn}-${item.sysid}-${item.id}`;
         const hasAssociations = associatedCounts && Object.keys(associatedCounts).length > 0;
-        let html = '';
-        // Always allow toggling, but auto-collapse if no associations
-        html += `<tr id="${rowId}" class="affiliation-main-row" style="cursor: pointer; font-size: 15px;"
+        
+        return `<tr id="${rowId}" class="affiliation-main-row" style="cursor: pointer; font-size: 15px;"
             onclick="toggleAffiliationDetails('${detailsId}')"
             onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
-            onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">`;
-        html += '<td><strong style="font-size: 1.25em;">' + escapeHtml(item.id) + '</strong></td>';
-        html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(formatAffHex(item.wacn, 5)) + '</code></td>';
-        html += '<td><code style="color: var(--text-secondary); font-size: 12px;">' + escapeHtml(formatAffHex(item.sysid, 3)) + '</code></td>';
-        html += '<td>' + (item.alias ? '<span style="font-size: 1.15em; font-weight: 600;">' + escapeHtml(item.alias) + '</span>' : '<span style="color: var(--text-secondary);">—</span>') + '</td>';
-        html += '<td>' + renderStatusBadge(item, isUnits) + '</td>';
-        html += '<td>' + renderEncryptionBadge(item) + '</td>';
-        html += '<td>' + formatTimestamp(item.last_active) + '</td>';
-        html += '<td><strong>' + escapeHtml(item.tx_count) + '</strong></td>';
-        html += '</tr>';
-        // Details row: auto-collapse if no associations
-        html += `<tr id="${detailsId}" class="affiliation-details-row" style="display:${hasAssociations ? 'table-row' : 'none'};"
+            onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">
+            <td><strong style="font-size: 1.25em;">${escapeHtml(item.id)}</strong></td>
+            <td><code style="color: var(--text-secondary); font-size: 12px;">${escapeHtml(formatAffHex(item.wacn, 5))}</code></td>
+            <td><code style="color: var(--text-secondary); font-size: 12px;">${escapeHtml(formatAffHex(item.sysid, 3))}</code></td>
+            <td>${item.alias ? '<span style="font-size: 1.15em; font-weight: 600;">' + escapeHtml(item.alias) + '</span>' : '<span style="color: var(--text-secondary);">—</span>'}</td>
+            <td>${renderStatusBadge(item, isUnits)}</td>
+            <td>${renderEncryptionBadge(item)}</td>
+            <td>${formatTimestamp(item.last_active)}</td>
+            <td><strong>${escapeHtml(item.tx_count)}</strong></td>
+        </tr>
+        <tr id="${detailsId}" class="affiliation-details-row" style="display:${hasAssociations ? 'table-row' : 'none'};"
             onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
-            onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">`;
-        html += '<td colspan="8" style="padding: 0; background: var(--bg-tertiary);">';
-        html += '<div style="padding: 12px 16px; border-top: 1px solid var(--border);">';
-        html += '<div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; text-transform: uppercase; font-weight: 600;">';
-        html += 'Associated ' + (isUnits ? 'Talkgroups' : 'Units') + ' (' + Object.keys(associatedCounts).length + ')';
-        html += '</div>';
-        html += '<div style="display: flex; flex-wrap: wrap; gap: 6px;">';
-        html += renderAssociatedItemsCompact(associatedCounts, isUnits, item);
-        html += '</div>';
-        html += '</div>';
-        html += '</td>';
-        html += '</tr>';
-        return html;
+            onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">
+            <td colspan="8" style="padding: 0; background: var(--bg-tertiary);">
+                <div style="padding: 12px 16px; border-top: 1px solid var(--border);">
+                    <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; text-transform: uppercase; font-weight: 600;">
+                        Associated ${isUnits ? 'Talkgroups' : 'Units'} (${Object.keys(associatedCounts).length})
+                    </div>
+                    <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+                        ${renderAssociatedItemsCompact(associatedCounts, isUnits, item)}
+                    </div>
+                </div>
+            </td>
+        </tr>`;
     }).join('');
-    return;
+    
+    // Single DOM update
+    tbody.innerHTML = rowsHtml;
+    
+    // CRITICAL: Restore scroll position after DOM update
+    if (container && scrollPos > 0) {
+        container.scrollTop = scrollPos;
+    }
 }
 // Highlight both header and detail row on mouseover
 function highlightAffiliationRows(rowId, detailsId, highlight) {
@@ -3321,13 +3347,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const searchInput = document.getElementById('affiliationSearch');
     const clearBtn = document.getElementById('clearAffiliationSearch');
     
+    // Debounce helper
+    let searchDebounceTimer = null;
+    
     if (searchInput) {
         searchInput.addEventListener('input', (e) => {
             affiliationState.searchTerm = e.target.value;
             if (clearBtn) {
                 clearBtn.style.display = e.target.value ? 'block' : 'none';
             }
-            renderAffiliationTable();
+            
+            // Debounce rendering for better performance
+            clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = setTimeout(() => {
+                renderAffiliationTable();
+            }, 150); // 150ms delay
         });
     }
     

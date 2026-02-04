@@ -887,6 +887,43 @@ public:
         }
     }
 
+    // Helper: Check if request has valid authentication
+    bool check_auth(const httplib::Request &req, bool require_admin = false) const
+    {
+        // If no auth configured, allow access
+        if (username_.empty() || password_.empty())
+        {
+            return true;
+        }
+
+        auto auth_it = req.headers.find("Authorization");
+        if (auth_it == req.headers.end())
+        {
+            auth_it = req.headers.find("authorization");
+        }
+
+        if (auth_it != req.headers.end() && auth_it->second.substr(0, 6) == "Basic ")
+        {
+            std::string provided_creds = auth_it->second.substr(6);
+            std::string expected_creds = httplib::base64_encode(username_ + ":" + password_);
+            std::string admin_creds = httplib::base64_encode(admin_username_ + ":" + admin_password_);
+
+            if (require_admin)
+            {
+                // Admin endpoints require admin credentials
+                return !admin_username_.empty() && provided_creds == admin_creds;
+            }
+            else
+            {
+                // Regular endpoints accept either user or admin credentials
+                return (provided_creds == expected_creds) || 
+                       (!admin_username_.empty() && provided_creds == admin_creds);
+            }
+        }
+
+        return false;
+    }
+
     // Helper: Get color for a unit based on its state (single source of truth)
     std::string get_unit_color(const UnitState &unit) const
     {
@@ -921,7 +958,7 @@ public:
     }
 
     // Get affiliation data for API
-    json get_affiliation_data() const
+    json get_affiliation_data(int limit = 0, bool units_only = false, bool talkgroups_only = false) const
     {
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
         time_t now = time(NULL);
@@ -930,51 +967,83 @@ public:
         json result = {
             {"units", json::array()},
             {"talkgroups", json::array()},
-            {"config", {{"timeout_hours", affiliation_timeout_}}}};
+            {"config", {{"timeout_hours", affiliation_timeout_}}},
+            {"total_units", unit_states_.size()},
+            {"total_talkgroups", talkgroup_states_.size()}};
 
-        for (const auto &pair : unit_states_)
+        if (!talkgroups_only)
         {
-            const auto &unit = pair.second;
-            bool is_idle = unit.last_active < idle_threshold;
-
-            json tg_counts = json::object();
-            for (const auto &tg_pair : unit.tg_activity)
+            int count = 0;
+            for (const auto &pair : unit_states_)
             {
-                tg_counts[std::to_string(tg_pair.first)] = tg_pair.second;
-            }
+                if (limit > 0 && count >= limit)
+                    break;
 
-            result["units"].push_back({{"id", unit.id},
-                                       {"wacn", unit.wacn},
-                                       {"sysid", unit.sysid},
-                                       {"alias", unit.alias},
-                                       {"encr_seen", unit.encr_seen},
-                                       {"last_active", unit.last_active},
-                                       {"registered", unit.registered},
-                                       {"is_idle", is_idle},
-                                       {"tx_count", unit.tx_count},
-                                       {"tg_activity", tg_counts}});
+                const auto &unit = pair.second;
+                // Skip bogons
+                if (unit.id == 0 || unit.id == -1)
+                    continue;
+
+                bool is_idle = unit.last_active < idle_threshold;
+
+                json tg_counts = json::object();
+                for (const auto &tg_pair : unit.tg_activity)
+                {
+                    // Skip bogon talkgroups
+                    if (tg_pair.first == 0 || tg_pair.first == -1)
+                        continue;
+                    tg_counts[std::to_string(tg_pair.first)] = tg_pair.second;
+                }
+
+                result["units"].push_back({{"id", unit.id},
+                                           {"wacn", unit.wacn},
+                                           {"sysid", unit.sysid},
+                                           {"alias", unit.alias},
+                                           {"encr_seen", unit.encr_seen},
+                                           {"last_active", unit.last_active},
+                                           {"registered", unit.registered},
+                                           {"is_idle", is_idle},
+                                           {"tx_count", unit.tx_count},
+                                           {"tg_activity", tg_counts}});
+                count++;
+            }
         }
 
-        for (const auto &pair : talkgroup_states_)
+        if (!units_only)
         {
-            const auto &tg = pair.second;
-            bool is_idle = tg.last_active < idle_threshold;
-
-            json unit_counts = json::object();
-            for (const auto &unit_pair : tg.unit_activity)
+            int count = 0;
+            for (const auto &pair : talkgroup_states_)
             {
-                unit_counts[std::to_string(unit_pair.first)] = unit_pair.second;
-            }
+                if (limit > 0 && count >= limit)
+                    break;
 
-            result["talkgroups"].push_back({{"id", tg.id},
-                                            {"wacn", tg.wacn},
-                                            {"sysid", tg.sysid},
-                                            {"alias", tg.alias},
-                                            {"encr_seen", tg.encr_seen},
-                                            {"last_active", tg.last_active},
-                                            {"is_idle", is_idle},
-                                            {"tx_count", tg.tx_count},
-                                            {"unit_activity", unit_counts}});
+                const auto &tg = pair.second;
+                // Skip bogons
+                if (tg.id == 0 || tg.id == -1)
+                    continue;
+
+                bool is_idle = tg.last_active < idle_threshold;
+
+                json unit_counts = json::object();
+                for (const auto &unit_pair : tg.unit_activity)
+                {
+                    // Skip bogon units
+                    if (unit_pair.first == 0 || unit_pair.first == -1)
+                        continue;
+                    unit_counts[std::to_string(unit_pair.first)] = unit_pair.second;
+                }
+
+                result["talkgroups"].push_back({{"id", tg.id},
+                                                {"wacn", tg.wacn},
+                                                {"sysid", tg.sysid},
+                                                {"alias", tg.alias},
+                                                {"encr_seen", tg.encr_seen},
+                                                {"last_active", tg.last_active},
+                                                {"is_idle", is_idle},
+                                                {"tx_count", tg.tx_count},
+                                                {"unit_activity", unit_counts}});
+                count++;
+            }
         }
 
         return result;
@@ -1307,17 +1376,18 @@ public:
             tr_config_json_ = json();
         }
 
-        // Setup authentication
-        if (!username_.empty() && !password_.empty())
-        {
-            server_.set_auth(username_, password_);
-        }
+        // Authentication is now handled per-endpoint to avoid issues with SSE
+        // SSE (EventSource) cannot send auth headers, so global auth breaks the connection
+        // Instead, we check auth on each protected endpoint individually
+        // if (!username_.empty() && !password_.empty())
+        // {
+        //     server_.set_auth(username_, password_);
+        // }
 
-        // Setup admin authentication
-        if (!admin_username_.empty() && !admin_password_.empty())
-        {
-            server_.set_admin_auth(admin_username_, admin_password_);
-        }
+        // if (!admin_username_.empty() && !admin_password_.empty())
+        // {
+        //     server_.set_admin_auth(admin_username_, admin_password_);
+        // }
 
         // Setup HTTPS if configured
         if (!ssl_cert_.empty() && !ssl_key_.empty())
@@ -2065,6 +2135,13 @@ private:
         // REST API endpoint for initial state
         server_.Get("/api/status", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      // Check auth
+      if (!check_auth(req)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+          return;
+      }
+
       json response;
       {
         std::lock_guard<std::mutex> lock(data_mutex_);
@@ -2099,32 +2176,75 @@ private:
         // Rate history endpoint
         server_.Get("/api/rates/history", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      if (!check_auth(req)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+          return;
+      }
       json response = get_rate_history();
       res.set_content(response.dump(), "application/json"); });
 
         // Call rate history endpoint
         server_.Get("/api/calls/rate-history", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      if (!check_auth(req)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+          return;
+      }
       json response = get_call_rate_history();
       res.set_content(response.dump(), "application/json"); });
 
         // Console logs endpoint
         server_.Get("/api/console", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      if (!check_auth(req)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+          return;
+      }
       json response = {{"lines", get_console_logs()}};
       res.set_content(response.dump(), "application/json"); });
 
-        // Affiliations data endpoint
+        // Affiliations data endpoint (with optional pagination)
         server_.Get("/api/affiliations", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      // BOOST_LOG_TRIVIAL(info) << "[tr-web] API /api/affiliations called. unit_states_ size: " << unit_states_.size() << ", talkgroup_states_ size: " << talkgroup_states_.size();
-      json response = get_affiliation_data();
-      // BOOST_LOG_TRIVIAL(info) << "[tr-web] API response units count: " << response["units"].size() << ", talkgroups count: " << response["talkgroups"].size();
+      // Check auth (SSE doesn't need auth, but API endpoints do)
+      if (!check_auth(req)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+          return;
+      }
+
+      // Parse optional query parameters for pagination
+      int limit = 0;
+      bool units_only = false;
+      bool talkgroups_only = false;
+      
+      auto limit_it = req.params.find("limit");
+      if (limit_it != req.params.end()) {
+          try {
+              limit = std::stoi(limit_it->second);
+          } catch(...) {}
+      }
+      
+      auto view_it = req.params.find("view");
+      if (view_it != req.params.end()) {
+          if (view_it->second == "units") units_only = true;
+          else if (view_it->second == "talkgroups") talkgroups_only = true;
+      }
+
+      json response = get_affiliation_data(limit, units_only, talkgroups_only);
       res.set_content(response.dump(), "application/json"); });
 
         // System data endpoints - parse sys_num from path
         server_.Get("/api/system/talkgroups", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      if (!check_auth(req)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+          return;
+      }
       // Parse sys_num from query parameter
       auto it = req.params.find("sys_num");
       if (it == req.params.end()) {
@@ -2160,6 +2280,11 @@ private:
 
         server_.Get("/api/system/unit_tags", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      if (!check_auth(req)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+          return;
+      }
       auto it = req.params.find("sys_num");
       if (it == req.params.end()) {
         res.status = 400;
@@ -2199,6 +2324,11 @@ private:
 
         server_.Get("/api/system/unit_tags_ota", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      if (!check_auth(req)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+          return;
+      }
       auto it = req.params.find("sys_num");
       if (it == req.params.end()) {
         res.status = 400;
@@ -2237,6 +2367,11 @@ private:
         // Admin: Get login history
         server_.Get("/api/admin/login-history", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      if (!check_auth(req, true)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder Admin\"");
+          return;
+      }
       auto history = server_.get_login_history();
       json response = json::array();
 
@@ -2255,6 +2390,11 @@ private:
         // Admin: Get trunk-recorder config
         server_.Get("/api/admin/config", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      if (!check_auth(req, true)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder Admin\"");
+          return;
+      }
       try {
         std::string config_path = tr_config_->config_file;
         std::ifstream config_file(config_path);
@@ -2280,6 +2420,11 @@ private:
         // Admin: Save config (atomic with backup)
         server_.Post("/api/admin/save-config", [this](const httplib::Request &req, httplib::Response &res)
                      {
+      if (!check_auth(req, true)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder Admin\"");
+          return;
+      }
       try {
         json request_data;
         try {
@@ -2375,6 +2520,11 @@ private:
         // Admin: Restart trunk-recorder
         server_.Post("/api/admin/restart", [this](const httplib::Request &req, httplib::Response &res)
                      {
+      if (!check_auth(req, true)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder Admin\"");
+          return;
+      }
       BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Restart requested via web admin interface";
 
       json response = {
@@ -2395,6 +2545,11 @@ private:
         // Whoami - returns current user's auth level without requiring admin
         server_.Get("/api/whoami", [this](const httplib::Request &req, httplib::Response &res)
                     {
+      if (!check_auth(req)) {
+          res.status = 401;
+          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+          return;
+      }
       std::string auth_level = "none";
 
       // Check if user has admin credentials

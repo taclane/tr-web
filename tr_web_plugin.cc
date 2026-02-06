@@ -224,7 +224,9 @@ class Tr_Web : public Plugin_Api
     static const size_t MAX_RATE_HISTORY = 1200; // 60 min at 3 sec intervals
 
     // Call rate history per system (keeps 60 minutes of data)
+    // Note: Call rate is sampled irregularly (on call state changes), so we use time-based trimming
     std::map<std::string, std::deque<RatePoint>> call_rate_history_;
+    static constexpr time_t CALL_RATE_RETENTION_SECONDS = 3600; // 60 minutes
 
     // Recent call history cache (last N completed calls)
     mutable std::mutex call_history_mutex_;
@@ -1272,8 +1274,9 @@ public:
         auto &history = call_rate_history_[sys_name];
         history.push_back(point);
 
-        // Trim to max size (60 minutes of data)
-        while (history.size() > MAX_RATE_HISTORY)
+        // Trim by time (60 minutes) rather than count, since call rate is sampled irregularly
+        time_t cutoff = point.timestamp - CALL_RATE_RETENTION_SECONDS;
+        while (!history.empty() && history.front().timestamp < cutoff)
         {
             history.pop_front();
         }

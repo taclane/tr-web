@@ -208,6 +208,14 @@ class Tr_Web : public Plugin_Api
     std::vector<System *> tr_systems_;
     std::vector<Call *> tr_calls_;
 
+    // Device frequency ranges (cached once at startup)
+    struct DeviceRange {
+        int num;
+        double min_hz;
+        double max_hz;
+    };
+    std::vector<DeviceRange> device_ranges_;
+
     // Thread-safe data cache
     mutable std::mutex data_mutex_;
     json cached_recorders_;
@@ -1646,6 +1654,18 @@ public:
 
     int setup_config(std::vector<Source *> sources, std::vector<System *> systems) override
     {
+        // Cache device frequency ranges once at startup
+        device_ranges_.clear();
+        device_ranges_.reserve(tr_sources_.size());
+        for (auto *source : tr_sources_)
+        {
+            device_ranges_.push_back({
+                source->get_num(),
+                source->get_min_hz(),
+                source->get_max_hz()
+            });
+        }
+
         // Refresh recorders
         resend_recorders();
         resend_devices();
@@ -2131,6 +2151,21 @@ private:
         server_.Get("/", [](const httplib::Request &req, httplib::Response &res)
                     { res.set_content(tr_web::HTML_PAGE, "text/html; charset=utf-8"); });
 
+        // Favicon endpoint - serves SVG icon
+        server_.Get("/favicon.svg", [](const httplib::Request &req, httplib::Response &res)
+                    { 
+                        const char* svg = R"(<svg width="40" height="40" viewBox="0 0 1200 1200" xmlns="http://www.w3.org/2000/svg"><path fill="#66b3ff" d="m787.35 373.6v-291.25c9.5273-8.7461 15.938-20.941 15.938-35.004-0.003906-26.086-21.254-47.34-47.512-47.34-26.258 0-47.496 21.254-47.496 47.34 0 14.062 6.4062 26.258 15.938 35.004v287.03h-92.664v-104.69c0-17.34-14.219-31.402-31.559-31.402-17.496 0-31.559 14.062-31.559 31.402v104.69h-70.621v-57.816c0-26.09-21.254-47.184-47.34-47.184-26.09 0-47.34 21.098-47.34 47.184v66.875c-18.914 10.945-32.355 30.625-32.355 53.918v254.69c0 34.691 9.6836 78.59 21.562 97.656s21.562 62.965 21.562 97.656v254.53c0 34.691 28.441 63.133 63.121 63.133h245.94c34.691 0 63.133-28.441 63.133-63.133v-254.54c0-34.691 9.6953-78.59 21.562-97.656 11.867-19.066 21.562-62.965 21.562-97.656l0.003907-254.68c-0.011719-27.191-17.676-49.848-41.879-58.75zm-1.2617 305.62h-372.18v-31.559h372.19v31.559zm0-66.25h-372.18v-31.559h372.19v31.559zm0-66.41h-372.18v-31.559h372.19v31.559zm0-66.25h-372.18v-31.559h372.19v31.559z"/></svg>)";
+                        res.set_content(svg, "image/svg+xml"); 
+                    });
+
+        // Fallback ICO favicon for Safari
+        server_.Get("/favicon.ico", [](const httplib::Request &req, httplib::Response &res)
+                    { 
+                        // Redirect to SVG version
+                        res.status = 302;
+                        res.set_header("Location", "/favicon.svg");
+                    });
+
         // SSE endpoint for live updates
         server_.SSE("/events");
 
@@ -2597,12 +2632,58 @@ private:
     {
         json recorders_json = json::array();
 
+        // Add regular recorders
         for (auto *source : tr_sources_)
         {
             std::vector<Recorder *> sourceRecorders = source->get_recorders();
             for (auto *recorder : sourceRecorders)
             {
                 recorders_json.push_back(get_recorder_json(recorder));
+            }
+        }
+
+        // Add control channels as pseudo-recorders
+        for (auto *sys : tr_systems_)
+        {
+            if (sys->control_channel_count() > 0)
+            {
+                double ctrl_freq = sys->get_current_control_channel();
+                
+                // Find which device this control channel belongs to using cached ranges
+                int device_num = -1;
+                for (const auto &range : device_ranges_)
+                {
+                    if (ctrl_freq >= range.min_hz && ctrl_freq <= range.max_hz)
+                    {
+                        device_num = range.num;
+                        break;
+                    }
+                }
+                
+                // Capitalize system type to match recorder type format (P25, not p25)
+                std::string sys_type = sys->get_system_type();
+                if (!sys_type.empty()) {
+                    sys_type[0] = std::toupper(sys_type[0]);
+                }
+                
+                // Create pseudo-recorder for control channel
+                json ctrl_recorder = {
+                    {"id", "ctrl_" + std::to_string(sys->get_sys_num())},
+                    {"src_num", device_num},
+                    {"rec_num", "CC" + std::to_string(sys->get_sys_num())},  // Special marker for control channel
+                    {"type", sys_type + " CC"},
+                    {"duration", 0.0},
+                    {"freq", ctrl_freq},
+                    {"count", 0},
+                    {"rec_state", 0},  // MONITORING state
+                    {"rec_state_type", "MONITORING"},
+                    {"squelched", false},
+                    {"is_control_channel", true},
+                    {"sys_num", sys->get_sys_num()},
+                    {"sys_name", sys->get_short_name()}
+                };
+                
+                recorders_json.push_back(ctrl_recorder);
             }
         }
 

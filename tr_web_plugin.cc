@@ -202,6 +202,16 @@ class Tr_Web : public Plugin_Api
     std::string log_prefix_;
     size_t console_max_lines_ = 5000;
 
+    // Pre-computed credentials for constant-time comparison
+    std::string expected_user_creds_;
+    std::string expected_admin_creds_;
+
+    // Rate limiting for authentication attempts
+    mutable std::mutex auth_rate_limit_mutex_;
+    mutable std::map<std::string, std::vector<time_t>> auth_attempts_;
+    static constexpr size_t MAX_AUTH_ATTEMPTS = 10;
+    static constexpr time_t AUTH_WINDOW_SECONDS = 60;
+
     // Trunk-Recorder references
     Config *tr_config_;
     std::vector<Source *> tr_sources_;
@@ -897,6 +907,60 @@ public:
         }
     }
 
+    // Helper: Constant-time string comparison to prevent timing attacks
+    bool constant_time_compare(const std::string &a, const std::string &b) const
+    {
+        if (a.length() != b.length())
+        {
+            return false;
+        }
+        volatile unsigned char result = 0;
+        for (size_t i = 0; i < a.length(); ++i)
+        {
+            result |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+        }
+        return result == 0;
+    }
+
+    // Helper: Check if IP is rate limited
+    bool is_rate_limited(const std::string &client_ip) const
+    {
+        std::lock_guard<std::mutex> lock(auth_rate_limit_mutex_);
+        auto it = auth_attempts_.find(client_ip);
+        if (it == auth_attempts_.end())
+        {
+            return false;
+        }
+
+        time_t now = time(NULL);
+        // Count recent attempts within the time window
+        size_t recent_attempts = 0;
+        for (time_t attempt_time : it->second)
+        {
+            if (now - attempt_time < AUTH_WINDOW_SECONDS)
+            {
+                ++recent_attempts;
+            }
+        }
+        return recent_attempts >= MAX_AUTH_ATTEMPTS;
+    }
+
+    // Helper: Record authentication attempt
+    void record_auth_attempt(const std::string &client_ip) const
+    {
+        std::lock_guard<std::mutex> lock(auth_rate_limit_mutex_);
+        time_t now = time(NULL);
+        auto &attempts = auth_attempts_[client_ip];
+        
+        // Remove old attempts outside the window
+        attempts.erase(
+            std::remove_if(attempts.begin(), attempts.end(),
+                          [now](time_t t) { return now - t >= AUTH_WINDOW_SECONDS; }),
+            attempts.end());
+        
+        attempts.push_back(now);
+    }
+
     // Helper: Check if request has valid authentication
     bool check_auth(const httplib::Request &req, bool require_admin = false) const
     {
@@ -906,32 +970,84 @@ public:
             return true;
         }
 
+        // Extract client IP for rate limiting and logging
+        std::string client_ip = "unknown";
+        auto remote_addr = req.headers.find("X-Forwarded-For");
+        if (remote_addr != req.headers.end())
+        {
+            client_ip = remote_addr->second;
+        }
+        else
+        {
+            remote_addr = req.headers.find("X-Real-IP");
+            if (remote_addr != req.headers.end())
+            {
+                client_ip = remote_addr->second;
+            }
+        }
+
+        // Check rate limiting
+        if (is_rate_limited(client_ip))
+        {
+            BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Rate limit exceeded for " << client_ip 
+                                       << " on " << req.path;
+            return false;
+        }
+
         auto auth_it = req.headers.find("Authorization");
         if (auth_it == req.headers.end())
         {
-            auth_it = req.headers.find("authorization");
+            record_auth_attempt(client_ip);
+            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Missing Authorization header from " 
+                                     << client_ip << " for " << req.path;
+            return false;
         }
 
-        if (auth_it != req.headers.end() && auth_it->second.substr(0, 6) == "Basic ")
+        const std::string &auth_header = auth_it->second;
+        if (auth_header.length() < 7 || auth_header.substr(0, 6) != "Basic ")
         {
-            std::string provided_creds = auth_it->second.substr(6);
-            std::string expected_creds = httplib::base64_encode(username_ + ":" + password_);
-            std::string admin_creds = httplib::base64_encode(admin_username_ + ":" + admin_password_);
-
-            if (require_admin)
-            {
-                // Admin endpoints require admin credentials
-                return !admin_username_.empty() && provided_creds == admin_creds;
-            }
-            else
-            {
-                // Regular endpoints accept either user or admin credentials
-                return (provided_creds == expected_creds) ||
-                       (!admin_username_.empty() && provided_creds == admin_creds);
-            }
+            record_auth_attempt(client_ip);
+            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Invalid Authorization format from " 
+                                     << client_ip << " for " << req.path;
+            return false;
         }
 
-        return false;
+        std::string provided_creds = auth_header.substr(6);
+        
+        // Validate base64 format (basic check - must contain only valid base64 characters)
+        if (provided_creds.empty() || 
+            provided_creds.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != std::string::npos)
+        {
+            record_auth_attempt(client_ip);
+            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Invalid base64 credentials from " 
+                                     << client_ip << " for " << req.path;
+            return false;
+        }
+
+        bool auth_success = false;
+        if (require_admin)
+        {
+            // Admin endpoints require admin credentials
+            auth_success = !expected_admin_creds_.empty() && 
+                          constant_time_compare(provided_creds, expected_admin_creds_);
+        }
+        else
+        {
+            // Regular endpoints accept either user or admin credentials
+            auth_success = constant_time_compare(provided_creds, expected_user_creds_) ||
+                          (!expected_admin_creds_.empty() && 
+                           constant_time_compare(provided_creds, expected_admin_creds_));
+        }
+
+        if (!auth_success)
+        {
+            record_auth_attempt(client_ip);
+            BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Authentication failed for " 
+                                       << client_ip << " on " << req.path 
+                                       << (require_admin ? " (admin required)" : "");
+        }
+
+        return auth_success;
     }
 
     // Helper: Get color for a unit based on its state (single source of truth)
@@ -1347,6 +1463,16 @@ public:
         console_max_lines_ = config_data.value("console_lines", 5000);
         theme_ = config_data.value("theme", "nostromo");
 
+        // Pre-compute credentials for constant-time comparison
+        if (!username_.empty() && !password_.empty())
+        {
+            expected_user_creds_ = httplib::base64_encode(username_ + ":" + password_);
+        }
+        if (!admin_username_.empty() && !admin_password_.empty())
+        {
+            expected_admin_creds_ = httplib::base64_encode(admin_username_ + ":" + admin_password_);
+        }
+
         // Affiliation tracking configuration
         affiliation_timeout_ = config_data.value("affiliation_timeout", 12);
         affiliation_cache_ = config_data.value("affiliation_cache", "affiliations.json");
@@ -1393,20 +1519,6 @@ public:
             tr_config_json_ = json();
         }
 
-
-        // Enable authentication in httplib for SSE/RawStream endpoints
-        // While browser EventSource API cannot send custom headers, server-to-server
-        // connections (like Gephi, curl, wget) should be authenticated
-        if (!username_.empty() && !password_.empty())
-        {
-            server_.set_auth(username_, password_);
-        }
-
-        if (!admin_username_.empty() && !admin_password_.empty())
-        {
-            server_.set_admin_auth(admin_username_, admin_password_);
-        }
-
         // Setup HTTPS if configured
         if (!ssl_cert_.empty() && !ssl_key_.empty())
         {
@@ -1415,6 +1527,16 @@ public:
                 BOOST_LOG_TRIVIAL(error) << log_prefix_ << "Failed to load SSL certificates!";
                 BOOST_LOG_TRIVIAL(error) << log_prefix_ << "Falling back to HTTP";
             }
+        }
+
+        // Setup authentication for REST API endpoints (httplib built-in)
+        if (!username_.empty() && !password_.empty())
+        {
+            server_.set_auth(username_, password_);
+        }
+        if (!admin_username_.empty() && !admin_password_.empty())
+        {
+            server_.set_admin_auth(admin_username_, admin_password_);
         }
 
         // Setup routes

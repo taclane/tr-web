@@ -1393,18 +1393,19 @@ public:
             tr_config_json_ = json();
         }
 
-        // Authentication is now handled per-endpoint to avoid issues with SSE
-        // SSE (EventSource) cannot send auth headers, so global auth breaks the connection
-        // Instead, we check auth on each protected endpoint individually
-        // if (!username_.empty() && !password_.empty())
-        // {
-        //     server_.set_auth(username_, password_);
-        // }
 
-        // if (!admin_username_.empty() && !admin_password_.empty())
-        // {
-        //     server_.set_admin_auth(admin_username_, admin_password_);
-        // }
+        // Enable authentication in httplib for SSE/RawStream endpoints
+        // While browser EventSource API cannot send custom headers, server-to-server
+        // connections (like Gephi, curl, wget) should be authenticated
+        if (!username_.empty() && !password_.empty())
+        {
+            server_.set_auth(username_, password_);
+        }
+
+        if (!admin_username_.empty() && !admin_password_.empty())
+        {
+            server_.set_admin_auth(admin_username_, admin_password_);
+        }
 
         // Setup HTTPS if configured
         if (!ssl_cert_.empty() && !ssl_key_.empty())
@@ -2175,6 +2176,10 @@ private:
         // Notify when Gephi clients connect so we can send current state
         server_.set_raw_stream_connect_notify([this]()
                                               { this->request_gephi_initial_dump(); });
+
+        // Set authentication callback for SSE/RawStream endpoints
+        server_.set_sse_auth_callback([this](const httplib::Request &req) -> bool
+                                      { return this->check_auth(req); });
 
         // REST API endpoint for initial state
         server_.Get("/api/status", [this](const httplib::Request &req, httplib::Response &res)

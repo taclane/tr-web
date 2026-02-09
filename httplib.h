@@ -448,6 +448,12 @@ namespace httplib
             raw_stream_connect_notify_ = notify;
         }
 
+        // Set authentication callback for SSE/RawStream endpoints
+        void set_sse_auth_callback(std::function<bool(const Request&)> callback)
+        {
+            sse_auth_callback_ = callback;
+        }
+
         // Send SSE event to all connected clients (except raw stream clients)
         void broadcast_sse(const std::string &event, const std::string &data)
         {
@@ -956,6 +962,20 @@ namespace httplib
 
             if (is_sse)
             {
+                // Authenticate SSE/RawStream connections if callback is set
+                if (sse_auth_callback_)
+                {
+                    if (!sse_auth_callback_(req))
+                    {
+                        res.status = 401;
+                        res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+                        res.set_content("Unauthorized", "text/plain");
+                        send_response(socket, req, res);
+                        socket->close();
+                        return;
+                    }
+                }
+
                 std::string client_ip = get_client_ip(socket->fd());
                 handle_sse_client(socket, req, client_ip);
                 return;
@@ -1268,6 +1288,8 @@ namespace httplib
         std::vector<std::shared_ptr<SSEClient>> sse_clients_;
         // Track raw stream clients (for /graph-stream)
         std::vector<std::shared_ptr<SSEClient>> raw_stream_clients_;
+        std::function<void()> raw_stream_connect_notify_;
+        std::function<bool(const Request&)> sse_auth_callback_;
 
     public:
         // Return the number of connected raw stream (graphstream) clients
@@ -1287,8 +1309,6 @@ namespace httplib
                                { return c.get() == client.get(); }),
                 raw_stream_clients_.end());
         }
-
-        std::function<void()> raw_stream_connect_notify_; // Fast notification for raw stream connects
 
         bool auth_enabled_ = false;
         std::string auth_credentials_;

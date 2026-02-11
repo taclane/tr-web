@@ -114,26 +114,68 @@ function pruneCallCaches() {
     capMap(state.missingSince, 5000);
 }
 
+// Helper to add auth headers to fetch requests
+function getAuthHeaders() {
+    const headers = {};
+    const token = localStorage.getItem('session_token');
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+    return headers;
+}
+
+// Wrapper around fetch that handles 401 responses by showing login modal
+async function authenticatedFetch(url, options = {}) {
+    // Add auth headers
+    if (!options.headers) {
+        options.headers = {};
+    }
+    Object.assign(options.headers, getAuthHeaders());
+    
+    // Always include credentials for cookie-based auth
+    if (!options.credentials) {
+        options.credentials = 'include';
+    }
+    
+    const response = await fetch(url, options);
+    
+    // If we get 401, session expired - show login modal
+    if (response.status === 401) {
+        // Clear stored token
+        localStorage.removeItem('session_token');
+        // Show login modal
+        showLoginModal();
+        // Throw error to prevent further processing
+        throw new Error('Authentication required');
+    }
+    
+    return response;
+}
+
 // Authentication utilities  
 async function getCurrentAuthLevel() {
     try {
         const response = await fetch(`${BASE_PATH}/api/whoami`, {
             credentials: 'include',
+            headers: getAuthHeaders(),
             cache: 'no-store'
         });
         
         if (response.ok) {
             const data = await response.json();
             if (data.auth_level === 'admin') {
-                return { level: 'admin', label: 'Administrator' };
+                return { level: 'admin', label: 'Administrator', username: data.username };
+            } else if (data.auth_level === 'user') {
+                return { level: 'user', label: 'Read-Only', username: data.username };
             } else if (data.auth_level === 'info') {
-                return { level: 'info', label: 'Read-Only' };
+                // Legacy compatibility
+                return { level: 'info', label: 'Read-Only', username: data.username };
             }
         }
     } catch (err) {
         console.error('Error detecting auth level:', err);
     }
-    return { level: 'none', label: 'Unauthenticated' };
+    return { level: 'none', label: 'Unauthenticated', username: '' };
 }
 
 async function detectAuthLevelFromAdminAccess() {
@@ -153,16 +195,29 @@ async function detectAuthLevelFromAdminAccess() {
 }
 
 function logout() {
-    // Clear credentials by sending wrong credentials to trigger 401
-    fetch(`${BASE_PATH}/api/health`, {
+    // Close SSE connection immediately
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+    }
+    
+    // Call the logout endpoint to delete session
+    fetch(`${BASE_PATH}/api/logout`, {
+        method: 'POST',
+        credentials: 'include',
         headers: {
-            'Authorization': 'Basic ' + btoa('logout:logout')
+            ...getAuthHeaders(),
+            'Content-Type': 'application/json'
         }
     }).then(() => {
-        // Reload page to trigger browser auth prompt
+        // Clear any stored tokens
+        localStorage.removeItem('session_token');
+        // Reload page to reset state
         window.location.reload();
-    }).catch(() => {
-        // Even if fetch fails, reload to clear state
+    }).catch((err) => {
+        console.error('Logout error:', err);
+        // Even if logout fails, clear local state and reload
+        localStorage.removeItem('session_token');
         window.location.reload();
     });
 }
@@ -173,10 +228,73 @@ async function updateAuthDisplay() {
     const logoutBtn = document.getElementById('logoutBtn');
     
     if (authInfo.level !== 'none') {
-        authLevelEl.innerHTML = `<span class="badge badge-${authInfo.level}">${authInfo.label}</span>`;
+        const displayLabel = authInfo.username ? `${authInfo.label} (${authInfo.username})` : authInfo.label;
+        authLevelEl.innerHTML = `<span class="badge badge-${authInfo.level}">${displayLabel}</span>`;
         authLevelEl.style.display = 'inline';
         logoutBtn.style.display = 'inline-block';
+        return true; // Authenticated
+    } else {
+        // Clear auth display when not authenticated
+        authLevelEl.innerHTML = '';
+        authLevelEl.style.display = 'none';
+        logoutBtn.style.display = 'none';
     }
+    return false; // Not authenticated
+}
+
+async function handleLogin(event) {
+    event.preventDefault();
+    
+    const username = document.getElementById('loginUsername').value;
+    const password = document.getElementById('loginPassword').value;
+    const errorEl = document.getElementById('loginError');
+    
+    try {
+        const response = await fetch(`${BASE_PATH}/api/login`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            credentials: 'include',
+            body: JSON.stringify({ username, password })
+        });
+        
+        if (response.ok) {
+            const data = await response.json();
+            // Store token in localStorage as backup
+            if (data.token) {
+                localStorage.setItem('session_token', data.token);
+            }
+            // Hide modal and reload to initialize authenticated state
+            document.getElementById('loginModal').style.display = 'none';
+            window.location.reload();
+        } else {
+            const error = await response.json();
+            errorEl.textContent = error.error || 'Invalid credentials';
+            errorEl.style.display = 'block';
+        }
+    } catch (err) {
+        console.error('Login error:', err);
+        errorEl.textContent = 'Connection error. Please try again.';
+        errorEl.style.display = 'block';
+    }
+}
+
+function showLoginModal() {
+    const modal = document.getElementById('loginModal');
+    modal.style.display = 'flex';
+    // Clear previous error
+    document.getElementById('loginError').style.display = 'none';
+    // Focus username field
+    setTimeout(() => document.getElementById('loginUsername').focus(), 100);
+}
+
+async function checkAuthAndShowLogin() {
+    const isAuthenticated = await updateAuthDisplay();
+    if (!isAuthenticated) {
+        showLoginModal();
+    }
+    return isAuthenticated;
 }
 
 function cssVar(name, fallback) {
@@ -203,6 +321,8 @@ function getChartPalette() {
 let eventSource = null;
 let reconnectTimeout = null;
 let lastDisconnectedAt = 0;
+let lastSseDataTime = 0; // Track last time we received SSE data
+const SSE_STALE_THRESHOLD_MS = 30000; // Consider connection stale if no data for 30 seconds
 
 // Themes
 const THEMES = [
@@ -239,6 +359,7 @@ function connect() {
     
     eventSource.onopen = () => {
         state.connected = true;
+        lastSseDataTime = Date.now(); // Reset data timestamp on connect
         updateConnectionStatus();
         console.log('SSE connected');
 
@@ -253,19 +374,30 @@ function connect() {
         lastDisconnectedAt = 0;
     };
     
-    eventSource.onerror = () => {
+    eventSource.onerror = async () => {
         state.connected = false;
         updateConnectionStatus();
         eventSource.close();
 
         if (!lastDisconnectedAt) lastDisconnectedAt = Date.now();
         
-        // Reconnect after 3 seconds
+        // Check if we're still authenticated before reconnecting
+        const authInfo = await getCurrentAuthLevel();
+        if (authInfo.level === 'none') {
+            // Not authenticated anymore - show login modal instead of reconnecting
+            console.log('SSE disconnected: not authenticated');
+            await updateAuthDisplay();
+            showLoginModal();
+            return;
+        }
+        
+        // Still authenticated - reconnect after 3 seconds
         if (reconnectTimeout) clearTimeout(reconnectTimeout);
         reconnectTimeout = setTimeout(connect, 3000);
     };
     
     eventSource.addEventListener('recorders', (e) => {
+        lastSseDataTime = Date.now(); // Track data reception
         const data = JSON.parse(e.data);
         state.recorders = data.recorders || [];
         updateRecordersTable();
@@ -273,6 +405,7 @@ function connect() {
     });
     
     eventSource.addEventListener('calls', (e) => {
+        lastSseDataTime = Date.now(); // Track data reception
         const data = JSON.parse(e.data);
         const nextCalls = data.calls_active || [];
 
@@ -392,6 +525,7 @@ function connect() {
     }, 1000);
     
     eventSource.addEventListener('systems', (e) => {
+        lastSseDataTime = Date.now(); // Track data reception
         const data = JSON.parse(e.data);
         state.systems = data.systems || [];
         // Preserve active system index when updating
@@ -409,6 +543,7 @@ function connect() {
     });
     
     eventSource.addEventListener('rates', (e) => {
+        lastSseDataTime = Date.now(); // Track data reception
         const data = JSON.parse(e.data);
         if (Array.isArray(data.rates)) {
             const timestamp = Date.now();
@@ -441,6 +576,7 @@ function connect() {
     });
     
     eventSource.addEventListener('console', (e) => {
+        lastSseDataTime = Date.now(); // Track data reception
         const data = JSON.parse(e.data);
         if (data.line) {
             addConsoleLine(data.line);
@@ -2010,9 +2146,7 @@ function updateCallRateChart() {
 
 // Admin functions
 function refreshLoginHistory() {
-    fetch(`${BASE_PATH}api/admin/login-history`, {
-        credentials: 'include'
-    })
+    authenticatedFetch(`${BASE_PATH}api/admin/login-history`)
     .then(response => {
         if (!response.ok) throw new Error('Failed to load login history');
         return response.json();
@@ -2118,9 +2252,7 @@ function loadConfig() {
     hasUnsavedChanges = false;
     updateLineNumbers();
     
-    fetch(`${BASE_PATH}api/admin/config`, {
-        credentials: 'include'
-    })
+    authenticatedFetch(`${BASE_PATH}api/admin/config`)
     .then(response => {
         if (!response.ok) throw new Error('Failed to load config');
         return response.json();
@@ -2241,9 +2373,8 @@ function saveConfig() {
     
     if (status) status.textContent = 'Saving...';
     
-    fetch(`${BASE_PATH}api/admin/save-config`, {
+    authenticatedFetch(`${BASE_PATH}api/admin/save-config`, {
         method: 'POST',
-        credentials: 'include',
         headers: {
             'Content-Type': 'application/json'
         },
@@ -2395,9 +2526,8 @@ function restartTrunkRecorder() {
         return;
     }
     
-    fetch(`${BASE_PATH}api/admin/restart`, {
-        method: 'POST',
-        credentials: 'include'
+    authenticatedFetch(`${BASE_PATH}api/admin/restart`, {
+        method: 'POST'
     })
     .then(response => {
         if (!response.ok) throw new Error('Failed to initiate restart');
@@ -2414,7 +2544,7 @@ function restartTrunkRecorder() {
 
 // Tab switching
 // Initialize
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     initThemePicker();
     initRecentRetentionPicker();
     // Default theme unless overridden by config
@@ -2422,15 +2552,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
     initChart();
     initWrapToggle();
+    
+    // Check authentication before connecting
+    const isAuthenticated = await checkAuthAndShowLogin();
+    if (!isAuthenticated) {
+        // Don't connect or fetch data until logged in
+        return;
+    }
+    
     connect();
     
-    // Detect and display auth level
-    updateAuthDisplay();
-    
     // Fetch initial data
-    fetch(`${BASE_PATH}api/status`, {
-        credentials: 'include'
-    })
+    authenticatedFetch(`${BASE_PATH}api/status`)
         .then(r => r.json())
         .then(data => {
             if (data.recorders) state.recorders = data.recorders;
@@ -3370,49 +3503,63 @@ document.addEventListener("visibilitychange", function() {
 
     // Debounce rapid visibility changes
     if (window.__trweb_visibility_debounce) clearTimeout(window.__trweb_visibility_debounce);
-    window.__trweb_visibility_debounce = setTimeout(() => {
-        // Reconnect only if not already connected - avoids fighting in-progress reconnect/backoff
-        if (!state.connected && typeof connect === 'function') {
-            connect();
+    window.__trweb_visibility_debounce = setTimeout(async () => {
+        const now = Date.now();
+        const timeSinceLastData = now - lastSseDataTime;
+        const connectionIsStale = timeSinceLastData > SSE_STALE_THRESHOLD_MS;
+        
+        const needsReconnect = (!state.connected || connectionIsStale) && typeof connect === 'function';
+        
+        if (needsReconnect && connectionIsStale) {
+            console.log(`SSE connection stale (${Math.round(timeSinceLastData/1000)}s since last data), will reconnect after fetching historical data`);
         }
 
         // Do a full status fetch to refresh any missed data while backgrounded
+        // IMPORTANT: Do this BEFORE reconnecting so historical data loads before fresh SSE events arrive
         if (typeof fetch === 'function' && !window.__trweb_visibility_fetch_in_progress) {
             window.__trweb_visibility_fetch_in_progress = true;
-            fetch(`${BASE_PATH}api/status`, { credentials: 'include', cache: 'no-store' })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.recorders) state.recorders = data.recorders;
-                    if (data.calls) state.calls = data.calls;
-                    if (data.systems) state.systems = data.systems;
-                    if (data.devices) state.devices = data.devices;
-                    if (data.rateHistory) state.rateHistory = data.rateHistory;
-                    if (data.callRateHistory) state.callRateHistory = data.callRateHistory;
-                    if (data.trunkMessages) state.trunkMessages = data.trunkMessages;
-                    if (data.unitAffiliations) state.unitAffiliations = data.unitAffiliations;
-                    if (data.consoleLogs) {
-                        state.consoleLogs = data.consoleLogs;
-                        hasScrolledConsole = false;
-                    }
+            try {
+                const r = await fetch(`${BASE_PATH}api/status`, { credentials: 'include', cache: 'no-store' });
+                const data = await r.json();
+                
+                if (data.recorders) state.recorders = data.recorders;
+                if (data.calls) state.calls = data.calls;
+                if (data.systems) state.systems = data.systems;
+                if (data.devices) state.devices = data.devices;
+                if (data.rateHistory) state.rateHistory = data.rateHistory;
+                if (data.callRateHistory) state.callRateHistory = data.callRateHistory;
+                if (data.trunkMessages) state.trunkMessages = data.trunkMessages;
+                if (data.unitAffiliations) state.unitAffiliations = data.unitAffiliations;
+                if (data.consoleLogs) {
+                    state.consoleLogs = data.consoleLogs;
+                    hasScrolledConsole = false;
+                }
 
-                    // Trigger UI updates after merging full status
-                    if (typeof updateRecordersTable === 'function') updateRecordersTable();
-                    if (typeof updateCallsTable === 'function') updateCallsTable();
-                    if (typeof updateSystemTabs === 'function') updateSystemTabs();
-                    if (typeof updateDevicesTiles === 'function') updateDevicesTiles();
-                    if (typeof updateStats === 'function') updateStats();
-                    if (typeof updateChart === 'function') updateChart();
-                    if (typeof updateCallRateChart === 'function') updateCallRateChart();
-                    if (typeof updateOmniMessages === 'function') updateOmniMessages();
-                })
-                .catch(err => console.error('visibility status refresh failed', err))
-                .finally(() => { window.__trweb_visibility_fetch_in_progress = false; });
+                // Trigger UI updates after merging full status
+                if (typeof updateRecordersTable === 'function') updateRecordersTable();
+                if (typeof updateCallsTable === 'function') updateCallsTable();
+                if (typeof updateSystemTabs === 'function') updateSystemTabs();
+                if (typeof updateDevicesTiles === 'function') updateDevicesTiles();
+                if (typeof updateStats === 'function') updateStats();
+                if (typeof updateChart === 'function') updateChart();
+                if (typeof updateCallRateChart === 'function') updateCallRateChart();
+                if (typeof updateOmniMessages === 'function') updateOmniMessages();
+            } catch (err) {
+                console.error('visibility status refresh failed', err);
+            } finally {
+                window.__trweb_visibility_fetch_in_progress = false;
+            }
         } else {
             // No fetch; just update UI from whatever we have
             if (typeof updateStats === 'function') updateStats();
             if (typeof updateChart === 'function') updateChart();
             if (typeof updateCallRateChart === 'function') updateCallRateChart();
             if (typeof updateCallsTable === 'function') updateCallsTable();
+        }
+        
+        // NOW reconnect SSE after historical data is loaded
+        if (needsReconnect) {
+            connect();
         }
 
         window.__trweb_visibility_debounce = null;

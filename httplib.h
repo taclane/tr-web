@@ -418,6 +418,24 @@ namespace httplib
             return std::vector<LoginAttempt>(login_history_.begin(), login_history_.end());
         }
 
+        // Track login attempt manually (for session-based auth)
+        void track_login_attempt(const std::string &username, const std::string &client_ip, bool success, const std::string &access_level)
+        {
+            std::lock_guard<std::mutex> lock(login_history_mutex_);
+            LoginAttempt attempt;
+            attempt.timestamp = time(nullptr);
+            attempt.username = username;
+            attempt.client_ip = client_ip;
+            attempt.success = success;
+            attempt.access_level = access_level;
+
+            login_history_.push_back(attempt);
+            if (login_history_.size() > MAX_LOGIN_HISTORY)
+            {
+                login_history_.pop_front();
+            }
+        }
+
         // Route handlers
         void Get(const std::string &path, Handler handler)
         {
@@ -865,8 +883,9 @@ namespace httplib
             bool requires_admin = (req.path.find("/api/admin/") == 0);
             std::string client_ip = get_client_ip(socket->fd());
 
-            // Only check auth if: (1) auth is enabled for non-admin paths, OR (2) this is an admin path
-            bool needs_auth_check = (auth_enabled_ && !skip_auth) || requires_admin;
+            // Only check httplib auth if explicitly enabled (plugin handles auth via require_auth/require_admin_auth)
+            // Changed: Removed || requires_admin so plugin auth can handle admin endpoints
+            bool needs_auth_check = (auth_enabled_ && !skip_auth);
 
             if (needs_auth_check)
             {
@@ -968,7 +987,15 @@ namespace httplib
                     if (!sse_auth_callback_(req))
                     {
                         res.status = 401;
-                        res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+                        
+                        // Only send WWW-Authenticate if Basic Auth was attempted (avoid browser dialogs for session auth)
+                        std::string auth_header = get_header_ci(req, "Authorization");
+                        bool has_basic_auth = (!auth_header.empty() && auth_header.find("Basic ") == 0);
+                        if (has_basic_auth)
+                        {
+                            res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
+                        }
+                        
                         res.set_content("Unauthorized", "text/plain");
                         send_response(socket, req, res);
                         socket->close();

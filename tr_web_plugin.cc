@@ -212,6 +212,18 @@ class Tr_Web : public Plugin_Api
     static constexpr size_t MAX_AUTH_ATTEMPTS = 10;
     static constexpr time_t AUTH_WINDOW_SECONDS = 60;
 
+    // Session management
+    struct Session {
+        std::string token;
+        std::string username;
+        bool is_admin;
+        time_t created;
+        time_t last_access;
+    };
+    mutable std::mutex sessions_mutex_;
+    std::map<std::string, Session> sessions_; // token -> Session
+    static constexpr time_t SESSION_TIMEOUT_SECONDS = 2592000; // 30 days (updates on each request)
+
     // Trunk-Recorder references
     Config *tr_config_;
     std::vector<Source *> tr_sources_;
@@ -219,7 +231,8 @@ class Tr_Web : public Plugin_Api
     std::vector<Call *> tr_calls_;
 
     // Device frequency ranges (cached once at startup)
-    struct DeviceRange {
+    struct DeviceRange
+    {
         int num;
         double min_hz;
         double max_hz;
@@ -399,19 +412,19 @@ class Tr_Web : public Plugin_Api
 
             // Use centralized color logic (single source of truth)
             std::string color = get_unit_color(unit);
+            
+            // Get status using unlocked version (we already hold affiliation_state_mutex_)
+            std::string status = get_unit_status_unlocked(unit.wacn, unit.sysid, unit.id);
+            
             json node_data = {
                 {"id", unit.id},
                 {"label", label},
                 {"color", color},
-                {"size", 15}};
-            if (unit.encr_seen)
-            {
-                node_data["encryption"] = true;
-            }
-            if (!unit.registered)
-            {
-                node_data["deregistered"] = true;
-            }
+                {"size", 15},
+                {"encryption", unit.encr_seen},
+                {"status", status}};
+                // {"deregistered", !unit.registered}};
+
             all_nodes[node_id] = node_data;
             node_count++;
 
@@ -442,15 +455,16 @@ class Tr_Web : public Plugin_Api
             std::string node_id = "TG-" + std::to_string(tg.id);
             std::string label = tg.alias.empty() ? ("TG " + std::to_string(tg.id)) : tg.alias;
             std::string color = tg.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN;
+            // Get status using unlocked version (we already hold affiliation_state_mutex_)
+            std::string status = get_talkgroup_status_unlocked(tg.wacn, tg.sysid, tg.id);
             json node_data = {
                 {"id", node_id},
                 {"label", label},
                 {"color", color},
-                {"size", 25}};
-            if (tg.encr_seen)
-            {
-                node_data["encryption"] = true;
-            }
+                {"size", 25},
+                {"encryption", tg.encr_seen},
+                {"status", status}};
+
             all_nodes[node_id] = node_data;
             node_count++;
 
@@ -479,11 +493,8 @@ class Tr_Web : public Plugin_Api
                     edge_map[edge_key] = {
                         {"unit", unit_id},
                         {"tg", tg.id},
-                        {"tg_weight", tg_weight}};
-                    if (tg.encr_seen)
-                    {
-                        edge_map[edge_key]["encrypted"] = true;
-                    }
+                        {"tg_weight", tg_weight},
+                        {"encrypted", tg.encr_seen}};
                 }
             }
         }
@@ -503,21 +514,18 @@ class Tr_Web : public Plugin_Api
             std::string unit_node = std::to_string(unit_id);
             std::string tg_node = "TG-" + std::to_string(tg_id);
             bool edge_encrypted = it.value().value("encrypted", false);
+            std::string color = edge_encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_BLACK;
             json edge_data = {
-                {"directed", false},
                 {"source", unit_node},
                 {"target", tg_node},
+                {"directed", false},
+                {"color", color},
+                {"encryption", edge_encrypted},
                 // {"unit_weight", it.value().value("unit_weight", 0.0)},
                 // {"tg_weight", it.value().value("tg_weight", 0.0)},
-                {"weight", (it.value().value("unit_weight", 0.0) + it.value().value("tg_weight", 0.0)) / 2.0}
                 // {"weight", it.value().value("unit_weight", 0.0)}
+                {"weight", (it.value().value("unit_weight", 0.0) + it.value().value("tg_weight", 0.0)) / 2.0}};
 
-            };
-            if (edge_encrypted)
-            {
-                edge_data["color"] = GEPHI_COLOR_RED;
-                edge_data["encryption"] = true;
-            }
             all_edges[edge_id] = edge_data;
             edge_count++;
         }
@@ -536,17 +544,15 @@ class Tr_Web : public Plugin_Api
     {
         std::string node_id = std::to_string(unit_id);
         std::string color = get_unit_effective_color(sys, unit_id);
+        std::string status = get_unit_status(sys, unit_id);
 
         json node_data = {
             {"id", unit_id},
             {"label", unit_alpha.empty() ? node_id : unit_alpha},
             {"color", color},
+            {"status", status},
+            {"encryption", encrypted},
             {"size", 15}};
-
-        if (encrypted)
-        {
-            node_data["encryption"] = true;
-        }
 
         json add_node = {{"an", {{node_id, node_data}}}};
         return add_node.dump(-1) + "\r\n";
@@ -556,58 +562,51 @@ class Tr_Web : public Plugin_Api
     {
         std::string node_id = std::to_string(unit_id);
         std::string color = get_unit_effective_color(sys, unit_id);
+        std::string status = get_unit_status(sys, unit_id);
 
         json node_data = {
             {"id", unit_id},
             {"label", unit_alpha.empty() ? node_id : unit_alpha},
             {"color", color},
+            {"status", status},
+            {"encryption", encrypted},
             {"size", 15}};
-
-        if (encrypted)
-        {
-            node_data["encryption"] = true;
-        }
 
         json change_node = {{"cn", {{node_id, node_data}}}};
         return change_node.dump(-1) + "\r\n";
     }
 
-    std::string create_gephi_add_talkgroup_node(long tg_id, const std::string &tg_alpha, bool encrypted)
+    std::string create_gephi_add_talkgroup_node(System *sys, long tg_id, const std::string &tg_alpha, bool encrypted)
     {
         std::string node_id = "TG-" + std::to_string(tg_id);
         std::string label = tg_alpha.empty() ? std::to_string(tg_id) : tg_alpha;
+        std::string status = get_talkgroup_status(sys->get_wacn(), sys->get_sys_id(), tg_id);
 
         json node_data = {
             {"id", node_id},
             {"label", label},
             {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
+            {"status", status},
+            {"encryption", encrypted},
             {"size", 25}};
-
-        if (encrypted)
-        {
-            node_data["encryption"] = true;
-        }
 
         json add_node = {{"an", {{node_id, node_data}}}};
         return add_node.dump(-1) + "\r\n";
     }
 
-    std::string create_gephi_change_talkgroup_node(long tg_id, const std::string &tg_alpha, bool encrypted)
+    std::string create_gephi_change_talkgroup_node(System *sys, long tg_id, const std::string &tg_alpha, bool encrypted)
     {
         std::string node_id = "TG-" + std::to_string(tg_id);
         std::string label = tg_alpha.empty() ? std::to_string(tg_id) : tg_alpha;
+        std::string status = get_talkgroup_status(sys->get_wacn(), sys->get_sys_id(), tg_id);
 
         json node_data = {
             {"id", node_id},
             {"label", label},
+            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
+            {"status", status},
+            {"encryption", encrypted},
             {"size", 25}};
-
-        // Only include color/encryption if encrypted (prevents resetting red to green on unencrypted events)
-        if (encrypted)
-        {
-            node_data["color"] = GEPHI_COLOR_RED;
-            node_data["encryption"] = true;
-        }
 
         json change_node = {{"cn", {{node_id, node_data}}}};
         return change_node.dump(-1) + "\r\n";
@@ -622,13 +621,9 @@ class Tr_Web : public Plugin_Api
         json edge_data = {
             {"source", unit_node},
             {"target", tg_node},
-            {"directed", false}};
-
-        if (encrypted)
-        {
-            edge_data["color"] = GEPHI_COLOR_RED;
-            edge_data["encryption"] = true;
-        }
+            {"directed", false},
+            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
+            {"encryption", encrypted}};
 
         json add_edge = {{"ae", {{edge_id, edge_data}}}};
         return add_edge.dump(-1) + "\r\n";
@@ -643,14 +638,9 @@ class Tr_Web : public Plugin_Api
         json edge_data = {
             {"source", unit_node},
             {"target", tg_node},
-            {"directed", false}};
-
-        // Only include color/encryption if encrypted
-        if (encrypted)
-        {
-            edge_data["color"] = GEPHI_COLOR_RED;
-            edge_data["encryption"] = true;
-        }
+            {"directed", false},
+            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
+            {"encryption", encrypted}};
 
         json change_edge = {{"ce", {{edge_id, edge_data}}}};
         return change_edge.dump(-1) + "\r\n";
@@ -682,12 +672,12 @@ class Tr_Web : public Plugin_Api
 
         // Send add events (establish nodes/edges with correct initial colors)
         events << create_gephi_add_unit_node(sys, unit_id, unit_alpha, encrypted);
-        events << create_gephi_add_talkgroup_node(tg_id, tg_alpha, encrypted);
+        events << create_gephi_add_talkgroup_node(sys, tg_id, tg_alpha, encrypted);
         events << create_gephi_add_edge(unit_id, tg_id, encrypted);
 
         // Send change events (update labels and colors based on current state)
         events << create_gephi_change_unit_node(sys, unit_id, unit_alpha, encrypted);
-        events << create_gephi_change_talkgroup_node(tg_id, tg_alpha, encrypted);
+        events << create_gephi_change_talkgroup_node(sys, tg_id, tg_alpha, encrypted);
         events << create_gephi_change_edge(unit_id, tg_id, encrypted);
 
         // Queue all events together
@@ -717,6 +707,7 @@ class Tr_Web : public Plugin_Api
     static constexpr const char *GEPHI_COLOR_RED = "#a83232";
     static constexpr const char *GEPHI_COLOR_GREEN = "#32a852";
     static constexpr const char *GEPHI_COLOR_GREY = "#808080";
+    static constexpr const char *GEPHI_COLOR_BLACK = "#000000";
 
     // State maps (same as mqtt_status)
     std::map<short, std::string> tr_state_ = {
@@ -925,6 +916,13 @@ public:
     // Helper: Check if IP is rate limited
     bool is_rate_limited(const std::string &client_ip) const
     {
+        // Don't rate limit "unknown" IPs (typically localhost without proxy headers)
+        // This allows local testing and direct connections to work
+        if (client_ip == "unknown")
+        {
+            return false;
+        }
+        
         std::lock_guard<std::mutex> lock(auth_rate_limit_mutex_);
         auto it = auth_attempts_.find(client_ip);
         if (it == auth_attempts_.end())
@@ -951,13 +949,14 @@ public:
         std::lock_guard<std::mutex> lock(auth_rate_limit_mutex_);
         time_t now = time(NULL);
         auto &attempts = auth_attempts_[client_ip];
-        
+
         // Remove old attempts outside the window
         attempts.erase(
             std::remove_if(attempts.begin(), attempts.end(),
-                          [now](time_t t) { return now - t >= AUTH_WINDOW_SECONDS; }),
+                           [now](time_t t)
+                           { return now - t >= AUTH_WINDOW_SECONDS; }),
             attempts.end());
-        
+
         attempts.push_back(now);
     }
 
@@ -989,7 +988,7 @@ public:
         // Check rate limiting
         if (is_rate_limited(client_ip))
         {
-            BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Rate limit exceeded for " << client_ip 
+            BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Rate limit exceeded for " << client_ip
                                        << " on " << req.path;
             return false;
         }
@@ -998,7 +997,7 @@ public:
         if (auth_it == req.headers.end())
         {
             record_auth_attempt(client_ip);
-            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Missing Authorization header from " 
+            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Missing Authorization header from "
                                      << client_ip << " for " << req.path;
             return false;
         }
@@ -1007,19 +1006,19 @@ public:
         if (auth_header.length() < 7 || auth_header.substr(0, 6) != "Basic ")
         {
             record_auth_attempt(client_ip);
-            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Invalid Authorization format from " 
+            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Invalid Authorization format from "
                                      << client_ip << " for " << req.path;
             return false;
         }
 
         std::string provided_creds = auth_header.substr(6);
-        
+
         // Validate base64 format (basic check - must contain only valid base64 characters)
-        if (provided_creds.empty() || 
+        if (provided_creds.empty() ||
             provided_creds.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != std::string::npos)
         {
             record_auth_attempt(client_ip);
-            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Invalid base64 credentials from " 
+            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Invalid base64 credentials from "
                                      << client_ip << " for " << req.path;
             return false;
         }
@@ -1028,26 +1027,213 @@ public:
         if (require_admin)
         {
             // Admin endpoints require admin credentials
-            auth_success = !expected_admin_creds_.empty() && 
-                          constant_time_compare(provided_creds, expected_admin_creds_);
+            auth_success = !expected_admin_creds_.empty() &&
+                           constant_time_compare(provided_creds, expected_admin_creds_);
         }
         else
         {
             // Regular endpoints accept either user or admin credentials
             auth_success = constant_time_compare(provided_creds, expected_user_creds_) ||
-                          (!expected_admin_creds_.empty() && 
-                           constant_time_compare(provided_creds, expected_admin_creds_));
+                           (!expected_admin_creds_.empty() &&
+                            constant_time_compare(provided_creds, expected_admin_creds_));
         }
 
         if (!auth_success)
         {
             record_auth_attempt(client_ip);
-            BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Authentication failed for " 
-                                       << client_ip << " on " << req.path 
+            BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Authentication failed for "
+                                       << client_ip << " on " << req.path
                                        << (require_admin ? " (admin required)" : "");
         }
 
         return auth_success;
+    }
+
+    // ============================================================================
+    // SESSION MANAGEMENT
+    // ============================================================================
+
+    /// Generate a random session token
+    std::string generate_session_token() const
+    {
+        std::stringstream ss;
+        ss << std::hex << time(NULL) << "-" << rand() << "-" << rand();
+        return httplib::base64_encode(ss.str());
+    }
+
+    /// Create a new session for a user
+    std::string create_session(const std::string &username, bool is_admin)
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        
+        std::string token = generate_session_token();
+        time_t now = time(NULL);
+        
+        Session session;
+        session.token = token;
+        session.username = username;
+        session.is_admin = is_admin;
+        session.created = now;
+        session.last_access = now;
+        
+        sessions_[token] = session;
+        
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Created session for " << username 
+                                 << (is_admin ? " (admin)" : " (user)");
+        return token;
+    }
+
+    /// Check if a session token is valid and not expired
+    bool validate_session(const std::string &token, bool require_admin = false)
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        
+        auto it = sessions_.find(token);
+        if (it == sessions_.end())
+        {
+            return false;
+        }
+        
+        time_t now = time(NULL);
+        Session &session = it->second;
+        
+        // Check if session expired
+        if (now - session.last_access > SESSION_TIMEOUT_SECONDS)
+        {
+            sessions_.erase(it);
+            return false;
+        }
+        
+        // Check admin requirement
+        if (require_admin && !session.is_admin)
+        {
+            return false;
+        }
+        
+        // Update last access time
+        session.last_access = now;
+        return true;
+    }
+
+    /// Get session info (for whoami endpoint)
+    bool get_session_info(const std::string &token, std::string &username, bool &is_admin)
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        
+        auto it = sessions_.find(token);
+        if (it == sessions_.end())
+        {
+            return false;
+        }
+        
+        username = it->second.username;
+        is_admin = it->second.is_admin;
+        return true;
+    }
+
+    /// Delete a session (logout)
+    void delete_session(const std::string &token)
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        sessions_.erase(token);
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Deleted session";
+    }
+
+    /// Clean up expired sessions (called periodically)
+    void cleanup_expired_sessions()
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        time_t now = time(NULL);
+        
+        for (auto it = sessions_.begin(); it != sessions_.end();)
+        {
+            if (now - it->second.last_access > SESSION_TIMEOUT_SECONDS)
+            {
+                it = sessions_.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    /// Check authentication: session token OR Basic Auth
+    /// This allows both web interface (session) and external tools (Basic Auth) to work
+    bool check_auth_hybrid(const httplib::Request &req, bool require_admin = false) const
+    {
+        // First check for session token in Authorization header or cookie
+        std::string auth_header = req.get_header("Authorization");
+        if (!auth_header.empty() && auth_header.find("Bearer ") == 0)
+        {
+            std::string token = auth_header.substr(7); // Remove "Bearer "
+            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Checking Bearer token for " << req.path 
+                                     << " (require_admin=" << require_admin << ")";
+            bool valid = const_cast<Tr_Web*>(this)->validate_session(token, require_admin);
+            if (valid) {
+                BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Bearer token validated successfully";
+                return true;
+            }
+            BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Bearer token validation failed";
+        }
+        
+        // Check for token in cookie
+        std::string cookie_header = req.get_header("Cookie");
+        if (!cookie_header.empty())
+        {
+            // Simple cookie parsing: look for session=TOKEN
+            size_t pos = cookie_header.find("session=");
+            if (pos != std::string::npos)
+            {
+                size_t start = pos + 8; // Length of "session="
+                size_t end = cookie_header.find(";", start);
+                std::string token = cookie_header.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Checking cookie token for " << req.path 
+                                         << " (require_admin=" << require_admin << ")";
+                if (const_cast<Tr_Web*>(this)->validate_session(token, require_admin))
+                {
+                    BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Cookie token validated successfully";
+                    return true;
+                }
+                BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Cookie token validation failed";
+            }
+        }
+        
+        // Fall back to HTTP Basic Auth (for SSE/graphstream and external tools)
+        BOOST_LOG_TRIVIAL(debug) << log_prefix_ << "Falling back to Basic Auth for " << req.path;
+        return check_auth(req, require_admin);
+    }
+
+    /// Helper: Check if request has valid user authentication (for API endpoints)
+    /// Returns true if authenticated, false otherwise
+    /// NOTE: Does NOT set WWW-Authenticate header to avoid triggering browser auth dialogs
+    /// Frontend should handle 401 responses by showing login modal
+    bool require_auth(const httplib::Request &req, httplib::Response &res)
+    {
+        if (!check_auth_hybrid(req, false))
+        {
+            res.status = 401;
+            // Do NOT set WWW-Authenticate header - we use session-based auth with frontend login modal
+            res.set_content("{\"error\": \"Authentication required\"}", "application/json");
+            return false;
+        }
+        return true;
+    }
+
+    /// Helper: Check if request has valid admin authentication (for admin API endpoints)
+    /// Returns true if authenticated as admin, false otherwise
+    /// NOTE: Does NOT set WWW-Authenticate header to avoid triggering browser auth dialogs
+    /// Frontend should handle 401 responses by showing login modal
+    bool require_admin_auth(const httplib::Request &req, httplib::Response &res)
+    {
+        if (!check_auth_hybrid(req, true))
+        {
+            res.status = 401;
+            // Do NOT set WWW-Authenticate header - we use session-based auth with frontend login modal
+            res.set_content("{\"error\": \"Admin authentication required\"}", "application/json");
+            return false;
+        }
+        return true;
     }
 
     // Helper: Get color for a unit based on its state (single source of truth)
@@ -1063,6 +1249,86 @@ public:
         }
 
         return unit.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
+    }
+
+    /// Get status string for a unit based on its state
+    /// Returns: "active" (recently active), "idle" (inactive but registered), or "off" (deregistered)
+    std::string get_unit_status(System *sys, long unit_id) const
+    {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        return get_unit_status_unlocked(sys->get_wacn(), sys->get_sys_id(), unit_id);
+    }
+
+    /// Internal helper: Get unit status without acquiring lock (caller must hold affiliation_state_mutex_)
+    std::string get_unit_status_unlocked(int wacn, int sysid, long unit_id) const
+    {
+        std::string unit_key = make_unit_key(wacn, sysid, unit_id);
+
+        auto it = unit_states_.find(unit_key);
+        if (it == unit_states_.end())
+        {
+            return "u_off";
+        }
+
+        const UnitState &unit = it->second;
+        time_t now = time(NULL);
+        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
+
+        // Off: deregistered units
+        if (!unit.registered)
+        {
+            return "u_off";
+        }
+        // Idle: registered but no recent activity
+        else if (unit.last_active < idle_threshold)
+        {
+            return "u_idle";
+        }
+        // Active: recent activity within timeout window
+        else
+        {
+            return "u_active";
+        }
+    }
+
+    /// Get status string for a talkgroup based on recent activity
+    /// Returns: "active" (recently active), "idle" (no recent activity), or "off" (never seen)
+    std::string get_talkgroup_status(int wacn, int sysid, long tg_id) const
+    {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        return get_talkgroup_status_unlocked(wacn, sysid, tg_id);
+    }
+
+    /// Internal helper: Get talkgroup status without acquiring lock (caller must hold affiliation_state_mutex_)
+    std::string get_talkgroup_status_unlocked(int wacn, int sysid, long tg_id) const
+    {
+        std::string tg_key = make_tg_key(wacn, sysid, tg_id);
+        auto it = talkgroup_states_.find(tg_key);
+        
+        if (it == talkgroup_states_.end())
+        {
+            return "tg_off";
+        }
+
+        const TalkgroupState &tg = it->second;
+        time_t now = time(NULL);
+        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
+
+        // Active: recent activity within timeout window
+        if (tg.last_active > idle_threshold)
+        {
+            return "tg_active";
+        }
+        // Idle: seen before but no recent activity
+        else if (tg.last_active > 0)
+        {
+            return "tg_idle";
+        }
+        // Off: never seen activity
+        else
+        {
+            return "tg_off";
+        }
     }
 
     // Get effective color for a unit based on state (for grey-to-color transitions)
@@ -1529,18 +1795,26 @@ public:
             }
         }
 
-        // Setup authentication for REST API endpoints (httplib built-in)
-        if (!username_.empty() && !password_.empty())
-        {
-            server_.set_auth(username_, password_);
-        }
+        // Setup routes first
+        setup_routes();
+
+        // Configure httplib authentication (used as backup / for SSE endpoints)
+        // Admin credentials protect admin endpoints if plugin auth fails
         if (!admin_username_.empty() && !admin_password_.empty())
         {
             server_.set_admin_auth(admin_username_, admin_password_);
+            BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Configured httplib admin auth";
         }
 
-        // Setup routes
-        setup_routes();
+        // Enable SSE authentication callback for /events and /graph-stream
+        server_.set_sse_auth_callback([this](const httplib::Request &req) -> bool {
+            return this->check_auth_hybrid(req, false);
+        });
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Configured SSE authentication callback";
+
+        // Note: We use session-based auth for web interface and Basic Auth for SSE/external tools
+        // Authentication is checked manually in each endpoint via require_auth() / require_admin_auth()
+        // This allows proper login/logout functionality while keeping SSE/graphstream working
 
         // Setup console log capture
         setup_log_capture();
@@ -1689,6 +1963,14 @@ public:
           }
         }
 
+        // Periodic cleanup of expired sessions (every ~1 minute)
+        static time_t last_session_cleanup = time(NULL);
+        time_t session_check_time = time(NULL);
+        if (session_check_time - last_session_cleanup >= 60) {
+          cleanup_expired_sessions();
+          last_session_cleanup = session_check_time;
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
       } });
 
@@ -1782,11 +2064,9 @@ public:
         device_ranges_.reserve(tr_sources_.size());
         for (auto *source : tr_sources_)
         {
-            device_ranges_.push_back({
-                source->get_num(),
-                source->get_min_hz(),
-                source->get_max_hz()
-            });
+            device_ranges_.push_back({source->get_num(),
+                                      source->get_min_hz(),
+                                      source->get_max_hz()});
         }
 
         // Refresh recorders
@@ -2014,20 +2294,8 @@ public:
         // Update state: unit is now deregistered
         set_unit_registration(sys, source_id, false);
 
-        // Change Gephi node color based on current state (should be grey after deregistration)
-        if (source_id != -1 && source_id != 0)
-        {
-            std::string node_id = std::to_string(source_id);
-            std::string color = get_unit_effective_color(sys, source_id);
-            json node_data = {
-                {"id", source_id},
-                {"label", unit_alias.empty() ? node_id : unit_alias},
-                {"color", color},
-                {"size", 15},
-                {"deregistered", true}};
-            json change_node = {{"cn", {{node_id, node_data}}}};
-            enqueue_graph_event(change_node.dump(-1) + "\r\n");
-        }
+        // Send Gephi update (standardized builder will include updated status and color)
+        send_gephi_unit_event(sys, source_id, false);
 
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);
         return 0;
@@ -2277,17 +2545,15 @@ private:
         // Favicon endpoint - serves SVG icon
         server_.Get("/favicon.svg", [](const httplib::Request &req, httplib::Response &res)
                     { 
-                        const char* svg = R"(<svg width="40" height="40" viewBox="0 0 1200 1200" xmlns="http://www.w3.org/2000/svg"><path fill="#66b3ff" d="m787.35 373.6v-291.25c9.5273-8.7461 15.938-20.941 15.938-35.004-0.003906-26.086-21.254-47.34-47.512-47.34-26.258 0-47.496 21.254-47.496 47.34 0 14.062 6.4062 26.258 15.938 35.004v287.03h-92.664v-104.69c0-17.34-14.219-31.402-31.559-31.402-17.496 0-31.559 14.062-31.559 31.402v104.69h-70.621v-57.816c0-26.09-21.254-47.184-47.34-47.184-26.09 0-47.34 21.098-47.34 47.184v66.875c-18.914 10.945-32.355 30.625-32.355 53.918v254.69c0 34.691 9.6836 78.59 21.562 97.656s21.562 62.965 21.562 97.656v254.53c0 34.691 28.441 63.133 63.121 63.133h245.94c34.691 0 63.133-28.441 63.133-63.133v-254.54c0-34.691 9.6953-78.59 21.562-97.656 11.867-19.066 21.562-62.965 21.562-97.656l0.003907-254.68c-0.011719-27.191-17.676-49.848-41.879-58.75zm-1.2617 305.62h-372.18v-31.559h372.19v31.559zm0-66.25h-372.18v-31.559h372.19v31.559zm0-66.41h-372.18v-31.559h372.19v31.559zm0-66.25h-372.18v-31.559h372.19v31.559z"/></svg>)";
-                        res.set_content(svg, "image/svg+xml"); 
-                    });
+                        const char* svg = R"(<svg width="40" height="40" viewBox="0 0 1200 1200" xmlns="http://www.w3.org/2000/svg"><path fill="#e94560" d="m787.35 373.6v-291.25c9.5273-8.7461 15.938-20.941 15.938-35.004-0.003906-26.086-21.254-47.34-47.512-47.34-26.258 0-47.496 21.254-47.496 47.34 0 14.062 6.4062 26.258 15.938 35.004v287.03h-92.664v-104.69c0-17.34-14.219-31.402-31.559-31.402-17.496 0-31.559 14.062-31.559 31.402v104.69h-70.621v-57.816c0-26.09-21.254-47.184-47.34-47.184-26.09 0-47.34 21.098-47.34 47.184v66.875c-18.914 10.945-32.355 30.625-32.355 53.918v254.69c0 34.691 9.6836 78.59 21.562 97.656s21.562 62.965 21.562 97.656v254.53c0 34.691 28.441 63.133 63.121 63.133h245.94c34.691 0 63.133-28.441 63.133-63.133v-254.54c0-34.691 9.6953-78.59 21.562-97.656 11.867-19.066 21.562-62.965 21.562-97.656l0.003907-254.68c-0.011719-27.191-17.676-49.848-41.879-58.75zm-1.2617 305.62h-372.18v-31.559h372.19v31.559zm0-66.25h-372.18v-31.559h372.19v31.559zm0-66.41h-372.18v-31.559h372.19v31.559zm0-66.25h-372.18v-31.559h372.19v31.559z"/></svg>)";
+                        res.set_content(svg, "image/svg+xml"); });
 
         // Fallback ICO favicon for Safari
         server_.Get("/favicon.ico", [](const httplib::Request &req, httplib::Response &res)
                     { 
                         // Redirect to SVG version
                         res.status = 302;
-                        res.set_header("Location", "/favicon.svg");
-                    });
+                        res.set_header("Location", "/favicon.svg"); });
 
         // SSE endpoint for live updates
         server_.SSE("/events");
@@ -2299,19 +2565,110 @@ private:
         server_.set_raw_stream_connect_notify([this]()
                                               { this->request_gephi_initial_dump(); });
 
-        // Set authentication callback for SSE/RawStream endpoints
-        server_.set_sse_auth_callback([this](const httplib::Request &req) -> bool
-                                      { return this->check_auth(req); });
+        // NOTE: We do NOT use set_sse_auth_callback() because httplib adds WWW-Authenticate
+        // headers that trigger browser auth dialogs. Instead, SSE connects and auth is
+        // checked via session cookies. If the session expires, frontend will detect
+        // 401 responses on API calls and show the login modal.
+        // For Gephi/external tools, they can still use HTTP Basic Auth on /graph-stream
+
+        // Login endpoint - validates credentials and returns session token
+        server_.Post("/api/login", [this](const httplib::Request &req, httplib::Response &res)
+                     {
+      try {
+        json request_data = json::parse(req.body);
+        std::string username = request_data.value("username", "");
+        std::string password = request_data.value("password", "");
+        
+        // Get client IP for logging
+        std::string client_ip = req.get_header("X-Forwarded-For");
+        if (client_ip.empty()) {
+          client_ip = req.get_header("X-Real-IP");
+        }
+        if (client_ip.empty()) {
+          client_ip = "unknown";
+        }
+
+        if (username.empty() || password.empty()) {
+          res.status = 400;
+          res.set_content("{\"error\": \"Username and password required\"}", "application/json");
+          return;
+        }
+
+        // Check credentials
+        std::string provided_creds = httplib::base64_encode(username + ":" + password);
+        bool is_admin = false;
+        bool auth_success = false;
+
+        if (constant_time_compare(provided_creds, expected_admin_creds_)) {
+          auth_success = true;
+          is_admin = true;
+        } else if (constant_time_compare(provided_creds, expected_user_creds_)) {
+          auth_success = true;
+          is_admin = false;
+        }
+
+        if (!auth_success) {
+          // Track failed login attempt
+          server_.track_login_attempt(username, client_ip, false, "failed");
+          res.status = 401;
+          res.set_content("{\"error\": \"Invalid credentials\"}", "application/json");
+          return;
+        }
+
+        // Track successful login attempt
+        server_.track_login_attempt(username, client_ip, true, is_admin ? "admin" : "user");
+        
+        // Create session
+        std::string token = create_session(username, is_admin);
+        
+        // Set cookie so EventSource (SSE) can authenticate automatically
+        res.set_header("Set-Cookie", "session=" + token + "; Path=/; HttpOnly; SameSite=Strict");
+        
+        json response = {
+            {"token", token},
+            {"auth_level", is_admin ? "admin" : "user"}};
+        res.set_content(response.dump(-1), "application/json");
+
+      } catch (const std::exception &e) {
+        res.status = 400;
+        json error = {{"error", std::string("Invalid request: ") + e.what()}};
+        res.set_content(error.dump(-1), "application/json");
+      } });
+
+        // Logout endpoint - deletes session token
+        server_.Post("/api/logout", [this](const httplib::Request &req, httplib::Response &res)
+                     {
+      // Extract token from Authorization header or cookie
+      std::string token;
+      std::string auth_header = req.get_header("Authorization");
+      if (!auth_header.empty() && auth_header.find("Bearer ") == 0) {
+        token = auth_header.substr(7);
+      } else {
+        std::string cookie_header = req.get_header("Cookie");
+        if (!cookie_header.empty()) {
+          size_t pos = cookie_header.find("session=");
+          if (pos != std::string::npos) {
+            size_t start = pos + 8;
+            size_t end = cookie_header.find(";", start);
+            token = cookie_header.substr(start, end == std::string::npos ? std::string::npos : end - start);
+          }
+        }
+      }
+
+      if (!token.empty()) {
+        delete_session(token);
+      }
+
+      // Clear the session cookie
+      res.set_header("Set-Cookie", "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+
+      json response = {{"message", "Logged out successfully"}};
+      res.set_content(response.dump(-1), "application/json"); });
 
         // REST API endpoint for initial state
         server_.Get("/api/status", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      // Check auth
-      if (!check_auth(req)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-          return;
-      }
+      if (!require_auth(req, res)) return;
 
       json response;
       {
@@ -2347,45 +2704,31 @@ private:
         // Rate history endpoint
         server_.Get("/api/rates/history", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      if (!check_auth(req)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-          return;
-      }
+      if (!require_auth(req, res)) return;
+      
       json response = get_rate_history();
       res.set_content(response.dump(-1), "application/json"); });
 
         // Call rate history endpoint
         server_.Get("/api/calls/rate-history", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      if (!check_auth(req)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-          return;
-      }
+      if (!require_auth(req, res)) return;
+      
       json response = get_call_rate_history();
       res.set_content(response.dump(-1), "application/json"); });
 
         // Console logs endpoint
         server_.Get("/api/console", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      if (!check_auth(req)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-          return;
-      }
+      if (!require_auth(req, res)) return;
+      
       json response = {{"lines", get_console_logs()}};
       res.set_content(response.dump(-1), "application/json"); });
 
         // Affiliations data endpoint (with optional pagination)
         server_.Get("/api/affiliations", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      // Check auth (SSE doesn't need auth, but API endpoints do)
-      if (!check_auth(req)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-          return;
-      }
+      if (!require_auth(req, res)) return;
 
       // Parse optional query parameters for pagination
       int limit = 0;
@@ -2411,11 +2754,8 @@ private:
         // System data endpoints - parse sys_num from path
         server_.Get("/api/system/talkgroups", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      if (!check_auth(req)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-          return;
-      }
+      if (!require_auth(req, res)) return;
+      
       // Parse sys_num from query parameter
       auto it = req.params.find("sys_num");
       if (it == req.params.end()) {
@@ -2451,11 +2791,8 @@ private:
 
         server_.Get("/api/system/unit_tags", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      if (!check_auth(req)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-          return;
-      }
+      if (!require_auth(req, res)) return;
+      
       auto it = req.params.find("sys_num");
       if (it == req.params.end()) {
         res.status = 400;
@@ -2495,11 +2832,8 @@ private:
 
         server_.Get("/api/system/unit_tags_ota", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      if (!check_auth(req)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-          return;
-      }
+      if (!require_auth(req, res)) return;
+      
       auto it = req.params.find("sys_num");
       if (it == req.params.end()) {
         res.status = 400;
@@ -2538,11 +2872,8 @@ private:
         // Admin: Get login history
         server_.Get("/api/admin/login-history", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      if (!check_auth(req, true)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder Admin\"");
-          return;
-      }
+      if (!require_admin_auth(req, res)) return;
+      
       auto history = server_.get_login_history();
       json response = json::array();
 
@@ -2561,11 +2892,8 @@ private:
         // Admin: Get trunk-recorder config
         server_.Get("/api/admin/config", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      if (!check_auth(req, true)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder Admin\"");
-          return;
-      }
+      if (!require_admin_auth(req, res)) return;
+      
       try {
         std::string config_path = tr_config_->config_file;
         std::ifstream config_file(config_path);
@@ -2591,11 +2919,8 @@ private:
         // Admin: Save config (atomic with backup)
         server_.Post("/api/admin/save-config", [this](const httplib::Request &req, httplib::Response &res)
                      {
-      if (!check_auth(req, true)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder Admin\"");
-          return;
-      }
+      if (!require_admin_auth(req, res)) return;
+      
       try {
         json request_data;
         try {
@@ -2691,11 +3016,8 @@ private:
         // Admin: Restart trunk-recorder
         server_.Post("/api/admin/restart", [this](const httplib::Request &req, httplib::Response &res)
                      {
-      if (!check_auth(req, true)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder Admin\"");
-          return;
-      }
+      if (!require_admin_auth(req, res)) return;
+      
       BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Restart requested via web admin interface";
 
       json response = {
@@ -2713,35 +3035,57 @@ private:
         kill(getpid(), SIGHUP);
       }).detach(); });
 
-        // Whoami - returns current user's auth level without requiring admin
+        // Whoami - returns current user's auth level and username
         server_.Get("/api/whoami", [this](const httplib::Request &req, httplib::Response &res)
                     {
-      if (!check_auth(req)) {
-          res.status = 401;
-          res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-          return;
-      }
-      std::string auth_level = "none";
-
-      // Check if user has admin credentials
-      auto auth_it = req.headers.find("Authorization");
-      if (auth_it == req.headers.end()) {
-        auth_it = req.headers.find("authorization");
+      if (!check_auth_hybrid(req, false)) {
+        res.status = 401;
+        res.set_content("{\"error\": \"Not authenticated\"}", "application/json");
+        return;
       }
 
-      if (auth_it != req.headers.end() && auth_it->second.substr(0, 6) == "Basic ") {
-        std::string decoded_creds = auth_it->second.substr(6);
+      std::string auth_level = "user";
+      std::string username = "";
+      
+      // Try to get session info first
+      std::string token;
+      std::string auth_header = req.get_header("Authorization");
+      if (!auth_header.empty() && auth_header.find("Bearer ") == 0) {
+        token = auth_header.substr(7);
+      } else {
+        std::string cookie_header = req.get_header("Cookie");
+        if (!cookie_header.empty()) {
+          size_t pos = cookie_header.find("session=");
+          if (pos != std::string::npos) {
+            size_t start = pos + 8;
+            size_t end = cookie_header.find(";", start);
+            token = cookie_header.substr(start, end == std::string::npos ? std::string::npos : end - start);
+          }
+        }
+      }
 
-        // Compare against stored credentials (already base64 encoded)
-        if (!admin_username_.empty() && decoded_creds == httplib::base64_encode(admin_username_ + ":" + admin_password_)) {
-          auth_level = "admin";
-        } else if (!username_.empty() && decoded_creds == httplib::base64_encode(username_ + ":" + password_)) {
-          auth_level = "info";
+      bool is_admin = false;
+      if (!token.empty() && get_session_info(token, username, is_admin)) {
+        // Got session info
+        auth_level = is_admin ? "admin" : "user";
+      } else {
+        // Fall back to Basic Auth parsing
+        auth_header = req.get_header("Authorization");
+        if (!auth_header.empty() && auth_header.find("Basic ") == 0) {
+          std::string provided_creds = auth_header.substr(6);
+          if (!expected_admin_creds_.empty() && constant_time_compare(provided_creds, expected_admin_creds_)) {
+            auth_level = "admin";
+            username = admin_username_.empty() ? "admin" : admin_username_;
+          } else if (!expected_user_creds_.empty() && constant_time_compare(provided_creds, expected_user_creds_)) {
+            auth_level = "user";
+            username = username_.empty() ? "user" : username_;
+          }
         }
       }
 
       json response = {
           {"auth_level", auth_level},
+          {"username", username},
           {"timestamp", time(NULL)}};
       res.set_content(response.dump(-1), "application/json"); });
 
@@ -2775,7 +3119,7 @@ private:
             if (sys->control_channel_count() > 0)
             {
                 double ctrl_freq = sys->get_current_control_channel();
-                
+
                 // Find which device this control channel belongs to using cached ranges
                 int device_num = -1;
                 for (const auto &range : device_ranges_)
@@ -2786,30 +3130,30 @@ private:
                         break;
                     }
                 }
-                
+
                 // Capitalize system type to match recorder type format (P25, not p25)
                 std::string sys_type = sys->get_system_type();
-                if (!sys_type.empty()) {
+                if (!sys_type.empty())
+                {
                     sys_type[0] = std::toupper(sys_type[0]);
                 }
-                
+
                 // Create pseudo-recorder for control channel
                 json ctrl_recorder = {
                     {"id", "ctrl_" + std::to_string(sys->get_sys_num())},
                     {"src_num", device_num},
-                    {"rec_num", "CC" + std::to_string(sys->get_sys_num())},  // Special marker for control channel
+                    {"rec_num", "CC" + std::to_string(sys->get_sys_num())}, // Special marker for control channel
                     {"type", sys_type + " CC"},
                     {"duration", 0.0},
                     {"freq", ctrl_freq},
                     {"count", 0},
-                    {"rec_state", 0},  // MONITORING state
+                    {"rec_state", 0}, // MONITORING state
                     {"rec_state_type", "MONITORING"},
                     {"squelched", false},
                     {"is_control_channel", true},
                     {"sys_num", sys->get_sys_num()},
-                    {"sys_name", sys->get_short_name()}
-                };
-                
+                    {"sys_name", sys->get_short_name()}};
+
                 recorders_json.push_back(ctrl_recorder);
             }
         }

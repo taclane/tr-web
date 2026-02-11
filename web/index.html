@@ -9,6 +9,29 @@
     <style>/* INJECT_CSS */</style>
 </head>
 <body>
+    <!-- Login Modal -->
+    <div id="loginModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 9999; align-items: center; justify-content: center;">
+        <div style="background: var(--bg-secondary, #2a2a2a); padding: 30px; border-radius: 8px; max-width: 400px; width: 90%; box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+            <h2 style="margin-top: 0; color: var(--text-primary, #fff);">Login Required</h2>
+            <form id="loginForm" onsubmit="handleLogin(event)">
+                <div style="margin-bottom: 15px;">
+                    <label for="loginUsername" style="display: block; margin-bottom: 5px; color: var(--text-primary, #fff);">Username:</label>
+                    <input type="text" id="loginUsername" required autocomplete="username" 
+                           style="width: 100%; padding: 8px; background: var(--bg-primary, #1a1a1a); border: 1px solid var(--border-color, #444); color: var(--text-primary, #fff); border-radius: 4px; box-sizing: border-box;">
+                </div>
+                <div style="margin-bottom: 20px;">
+                    <label for="loginPassword" style="display: block; margin-bottom: 5px; color: var(--text-primary, #fff);">Password:</label>
+                    <input type="password" id="loginPassword" required autocomplete="current-password"
+                           style="width: 100%; padding: 8px; background: var(--bg-primary, #1a1a1a); border: 1px solid var(--border-color, #444); color: var(--text-primary, #fff); border-radius: 4px; box-sizing: border-box;">
+                </div>
+                <div id="loginError" style="display: none; color: #ff4444; margin-bottom: 15px; padding: 8px; background: rgba(255,68,68,0.1); border-radius: 4px;"></div>
+                <button type="submit" style="width: 100%; padding: 10px; background: var(--accent, #00b4d8); color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: bold;">
+                    Login
+                </button>
+            </form>
+        </div>
+    </div>
+
     <div class="header">
         <div style="display: flex; align-items: center; gap: 15px; color: var(--accent);">
             <svg width="40" height="40" viewBox="0 0 1200 1200" xmlns="http://www.w3.org/2000/svg" style="flex-shrink: 0; fill: currentColor;">
@@ -391,7 +414,7 @@
                             <li>Click the Green [+] button to add a client connection</li>
                                 <li>URL: <code id="graphStreamUrl" style="background: var(--bg-tertiary); padding: 2px 6px; border-radius: 3px; 
                                           color: var(--accent); user-select: all; cursor: text;"></code>
-                                <button id="copyGraphStreamUrl" style="margin-left: 8px; padding: 2px 8px; background: var(--bg-tertiary); border: 1px solid var(--border); 
+                                <button id="copyGraphStreamUrl" style="margin-left: 8px; padding: 2px 8px; background: var(--accent); border: 1px solid var(--border); 
                                            border-radius: 3px; cursor: pointer; font-size: 12px;">Copy</button>
                                                         <li style="margin-top: 8px; color: var(--text-secondary); font-size: 13px;">
                                                             <b>Note:</b> If you have configured a username and password in the plugin, you must enter them in Gephi's authentication fields.

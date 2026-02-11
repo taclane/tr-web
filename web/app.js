@@ -3047,6 +3047,20 @@ function formatTimestamp(timestamp) {
     return `${Math.floor(diff / 86400)}d ago`;
 }
 
+function renderTxCount(txCount) {
+    // Handle new format [voice, data] or old format (single int)
+    if (Array.isArray(txCount)) {
+        const voice = txCount[0] || 0;
+        const data = txCount[1] || 0;
+        if (data === 0) {
+            return escapeHtml(voice);
+        }
+        return `${escapeHtml(voice)} <span style="color: var(--text-secondary); font-size: 0.9em;">(${escapeHtml(data)})</span>`;
+    }
+    // Old format: single integer
+    return escapeHtml(txCount || 0);
+}
+
 function renderStatusBadge(item, isUnit) {
     const now = Math.floor(Date.now() / 1000);
     const idleThreshold = 12 * 3600;
@@ -3194,6 +3208,16 @@ function filterAndSortData(items) {
             bVal = (bVal || '').toLowerCase();
         }
         
+        // Handle tx_count: sort by voice count only (first element if array)
+        if (col === 'tx_count') {
+            if (Array.isArray(aVal)) {
+                aVal = aVal[0] || 0;
+            }
+            if (Array.isArray(bVal)) {
+                bVal = bVal[0] || 0;
+            }
+        }
+        
         if (aVal < bVal) return affiliationState.sortDirection === 'asc' ? -1 : 1;
         if (aVal > bVal) return affiliationState.sortDirection === 'asc' ? 1 : -1;
         return 0;
@@ -3241,7 +3265,7 @@ function renderAffiliationTable() {
             <td>${renderStatusBadge(item, isUnits)}</td>
             <td>${renderEncryptionBadge(item)}</td>
             <td>${formatTimestamp(item.last_active)}</td>
-            <td><strong>${escapeHtml(item.tx_count)}</strong></td>
+            <td><strong>${renderTxCount(item.tx_count)}</strong></td>
         </tr>
         <tr id="${detailsId}" class="affiliation-details-row" style="display:${hasAssociations ? 'table-row' : 'none'};"
             onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
@@ -3299,8 +3323,29 @@ function renderAssociatedItemsCompact(counts, isUnits, parentItem, unitMap, tgMa
         return '<span style="color: var(--text-secondary); font-size: 12px;">None</span>';
     }
     
-    // Sort by transmission count descending
-    const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    // Helper to get total transmissions (backward compatible)
+    const getTotalTx = (count) => {
+        if (Array.isArray(count)) {
+            return (count[0] || 0) + (count[1] || 0);
+        }
+        return count || 0;
+    };
+    
+    // Helper to format count display (backward compatible)
+    const formatCount = (count) => {
+        if (Array.isArray(count)) {
+            const voice = count[0] || 0;
+            const data = count[1] || 0;
+            if (data === 0) {
+                return voice;
+            }
+            return `${voice}+${data}`;
+        }
+        return count || 0;
+    };
+    
+    // Sort by total transmission count descending
+    const sorted = Object.entries(counts).sort((a, b) => getTotalTx(b[1]) - getTotalTx(a[1]));
     
     return sorted.map(([id, count]) => {
         // Use map lookup instead of find() for O(1) performance
@@ -3327,7 +3372,7 @@ function renderAssociatedItemsCompact(counts, isUnits, parentItem, unitMap, tgMa
                  title="${associatedItem && associatedItem.alias ? `${id}: ${associatedItem.alias}` : id}">
                 ${statusBadge}
                 <strong style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;">${escapeHtml(displayText)}</strong>
-                <span style="color: var(--text-secondary); margin-left: 2px;">(${count})</span>
+                <span style="color: var(--text-secondary); margin-left: 2px;">(${formatCount(count)})</span>
             </div>
         `;
     }).join('');

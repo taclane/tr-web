@@ -282,6 +282,12 @@ class Tr_Web : public Plugin_Api
     // ============================================================================
 
     // State tracking for units and talkgroups (for Gephi coloring and Affiliations UI)
+    struct TxCount
+    {
+        int voice = 0;  // Voice transmissions (grants)
+        int data = 0;   // Data only (affiliations, locations)
+    };
+
     struct UnitState
     {
         long id = 0;
@@ -291,8 +297,8 @@ class Tr_Web : public Plugin_Api
         bool encr_seen = false; // Has ever transmitted encrypted
         time_t last_active = 0;
         bool registered = false;
-        int tx_count = 0;
-        std::map<long, int> tg_activity; // tg_id -> count (heatmap data)
+        TxCount tx_count;  // [voice, data] transmissions
+        std::map<long, TxCount> tg_activity; // tg_id -> [voice, data] counts (heatmap data)
     };
 
     struct TalkgroupState
@@ -303,8 +309,8 @@ class Tr_Web : public Plugin_Api
         std::string alias;
         bool encr_seen = false; // Has ever had encrypted traffic
         time_t last_active = 0;
-        int tx_count = 0;
-        std::map<long, int> unit_activity; // unit_id -> count (heatmap data)
+        TxCount tx_count;  // [voice, data] transmissions
+        std::map<long, TxCount> unit_activity; // unit_id -> [voice, data] counts (heatmap data)
     };
 
     // Composite key for multi-system support: "wacn:sysid:id"
@@ -428,13 +434,14 @@ class Tr_Web : public Plugin_Api
             all_nodes[node_id] = node_data;
             node_count++;
 
-            // Add unit->tg pairings to edge_map
+            // Add unit->tg pairings to edge_map (voice transmissions only)
             for (const auto &[tg_id, count] : unit.tg_activity)
             {
                 if (tg_id == 0 || tg_id == -1)
                     continue;
                 std::string edge_key = "TG-" + std::to_string(tg_id) + "-" + std::to_string(unit.id);
-                double unit_weight = (unit.tx_count > 0) ? static_cast<double>(count) / unit.tx_count : 0.0;
+                // Use voice count only for now (future: separate edges for voice/data)
+                double unit_weight = (unit.tx_count.voice > 0) ? static_cast<double>(count.voice) / unit.tx_count.voice : 0.0;
                 // Round to nearest 0.01, min 0.01 if > 0
                 if (unit_weight > 0.0)
                 {
@@ -469,12 +476,14 @@ class Tr_Web : public Plugin_Api
             node_count++;
 
             // Add tg->unit pairings to edge_map (reverse), and set encrypted if tg.encr_seen
+            // Voice transmissions only for now (future: separate edges for voice/data)
             for (const auto &[unit_id, count] : tg.unit_activity)
             {
                 if (unit_id == 0 || unit_id == -1)
                     continue;
                 std::string edge_key = "TG-" + std::to_string(tg.id) + "-" + std::to_string(unit_id);
-                double tg_weight = (tg.tx_count > 0) ? static_cast<double>(count) / tg.tx_count : 0.0;
+                // Use voice count only for now
+                double tg_weight = (tg.tx_count.voice > 0) ? static_cast<double>(count.voice) / tg.tx_count.voice : 0.0;
                 // Round to nearest 0.01, min 0.01 if > 0
                 if (tg_weight > 0.0)
                 {
@@ -802,7 +811,7 @@ public:
     // UNIT AND STATE TRACKING
     // ============================================================================
 
-    // Update unit/talkgroup state tracking (for Gephi colors and Affiliations UI)
+    // Update unit/talkgroup state tracking for VOICE calls (grants)
     void update_affiliation_state(System *sys, long unit_id, long tg_id, bool encrypted)
     {
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
@@ -824,8 +833,8 @@ public:
         }
         unit.last_active = now;
         unit.registered = true; // Active transmission means registered
-        unit.tx_count++;
-        unit.tg_activity[tg_id]++; // Track per-TG frequency
+        unit.tx_count.voice++;  // Voice transmission
+        unit.tg_activity[tg_id].voice++; // Track per-TG voice frequency
         if (encrypted)
         {
             unit.encr_seen = true;
@@ -842,12 +851,52 @@ public:
             tg.alias = talkgroup ? talkgroup->alpha_tag : "";
         }
         tg.last_active = now;
-        tg.tx_count++;
-        tg.unit_activity[unit_id]++; // Track per-unit frequency
+        tg.tx_count.voice++;  // Voice transmission
+        tg.unit_activity[unit_id].voice++; // Track per-unit voice frequency
         if (encrypted)
         {
             tg.encr_seen = true;
         }
+    }
+
+    // Update unit/talkgroup state tracking for DATA events (affiliations, locations)
+    void update_affiliation_state_data(System *sys, long unit_id, long tg_id)
+    {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        time_t now = time(NULL);
+
+        int wacn = sys->get_wacn();
+        int sysid = sys->get_sys_id();
+        std::string unit_key = make_unit_key(wacn, sysid, unit_id);
+        std::string tg_key = make_tg_key(wacn, sysid, tg_id);
+
+        // Update unit state
+        auto &unit = unit_states_[unit_key];
+        unit.id = unit_id;
+        unit.wacn = wacn;
+        unit.sysid = sysid;
+        if (unit.alias.empty())
+        {
+            unit.alias = sys->find_unit_tag(unit_id);
+        }
+        unit.last_active = now;
+        unit.registered = true; // Active means registered
+        unit.tx_count.data++;  // Data transmission
+        unit.tg_activity[tg_id].data++; // Track per-TG data frequency
+
+        // Update talkgroup state
+        auto &tg = talkgroup_states_[tg_key];
+        tg.id = tg_id;
+        tg.wacn = wacn;
+        tg.sysid = sysid;
+        if (tg.alias.empty())
+        {
+            Talkgroup *talkgroup = sys->find_talkgroup(tg_id);
+            tg.alias = talkgroup ? talkgroup->alpha_tag : "";
+        }
+        tg.last_active = now;
+        tg.tx_count.data++;  // Data transmission
+        tg.unit_activity[unit_id].data++; // Track per-unit data frequency
     }
 
     void set_unit_registration(System *sys, long unit_id, bool registered)
@@ -1388,7 +1437,8 @@ public:
                     // Skip bogon talkgroups
                     if (tg_pair.first == 0 || tg_pair.first == -1)
                         continue;
-                    tg_counts[std::to_string(tg_pair.first)] = tg_pair.second;
+                    // Serialize TxCount as [voice, data] array
+                    tg_counts[std::to_string(tg_pair.first)] = json::array({tg_pair.second.voice, tg_pair.second.data});
                 }
 
                 // Array format: [id, wacn, sysid, alias, encr_seen, last_active, registered, is_idle, tx_count, tg_activity]
@@ -1400,7 +1450,7 @@ public:
                                                        unit.last_active,
                                                        unit.registered,
                                                        is_idle,
-                                                       unit.tx_count,
+                                                       json::array({unit.tx_count.voice, unit.tx_count.data}), // [voice, data]
                                                        tg_counts}));
                 count++;
             }
@@ -1427,7 +1477,8 @@ public:
                     // Skip bogon units
                     if (unit_pair.first == 0 || unit_pair.first == -1)
                         continue;
-                    unit_counts[std::to_string(unit_pair.first)] = unit_pair.second;
+                    // Serialize TxCount as [voice, data] array
+                    unit_counts[std::to_string(unit_pair.first)] = json::array({unit_pair.second.voice, unit_pair.second.data});
                 }
 
                 // Array format: [id, wacn, sysid, alias, encr_seen, last_active, is_idle, tx_count, unit_activity]
@@ -1438,7 +1489,7 @@ public:
                                                             tg.encr_seen,
                                                             tg.last_active,
                                                             is_idle,
-                                                            tg.tx_count,
+                                                            json::array({tg.tx_count.voice, tg.tx_count.data}), // [voice, data]
                                                             unit_counts}));
                 count++;
             }
@@ -1470,7 +1521,7 @@ public:
                     json tg_counts = json::object();
                     for (const auto &tg_pair : unit.tg_activity)
                     {
-                        tg_counts[std::to_string(tg_pair.first)] = tg_pair.second;
+                        tg_counts[std::to_string(tg_pair.first)] = json::array({tg_pair.second.voice, tg_pair.second.data});
                     }
                     persist_data["units"].push_back({{"id", unit.id},
                                                      {"wacn", unit.wacn},
@@ -1479,7 +1530,7 @@ public:
                                                      {"encr_seen", unit.encr_seen},
                                                      {"last_active", unit.last_active},
                                                      {"registered", unit.registered},
-                                                     {"tx_count", unit.tx_count},
+                                                     {"tx_count", json::array({unit.tx_count.voice, unit.tx_count.data})},
                                                      {"tg_activity", tg_counts}});
                 }
 
@@ -1489,7 +1540,7 @@ public:
                     json unit_counts = json::object();
                     for (const auto &unit_pair : tg.unit_activity)
                     {
-                        unit_counts[std::to_string(unit_pair.first)] = unit_pair.second;
+                        unit_counts[std::to_string(unit_pair.first)] = json::array({unit_pair.second.voice, unit_pair.second.data});
                     }
                     persist_data["talkgroups"].push_back({{"id", tg.id},
                                                           {"wacn", tg.wacn},
@@ -1497,7 +1548,7 @@ public:
                                                           {"alias", tg.alias},
                                                           {"encr_seen", tg.encr_seen},
                                                           {"last_active", tg.last_active},
-                                                          {"tx_count", tg.tx_count},
+                                                          {"tx_count", json::array({tg.tx_count.voice, tg.tx_count.data})},
                                                           {"unit_activity", unit_counts}});
                 }
             }
@@ -1572,14 +1623,45 @@ public:
                     unit.encr_seen = unit_json.value("encr_seen", false);
                     unit.last_active = unit_json.value("last_active", 0L);
                     unit.registered = unit_json.value("registered", false);
-                    unit.tx_count = unit_json.value("tx_count", 0);
+                    
+                    // Backward compatibility: handle both old format (int) and new format ([int, int])
+                    if (unit_json.contains("tx_count"))
+                    {
+                        if (unit_json["tx_count"].is_array())
+                        {
+                            auto arr = unit_json["tx_count"];
+                            unit.tx_count.voice = arr.size() > 0 ? arr[0].get<int>() : 0;
+                            unit.tx_count.data = arr.size() > 1 ? arr[1].get<int>() : 0;
+                        }
+                        else
+                        {
+                            // Old format: single int represents voice count only
+                            unit.tx_count.voice = unit_json.value("tx_count", 0);
+                            unit.tx_count.data = 0;
+                        }
+                    }
 
                     if (unit_json.contains("tg_activity"))
                     {
                         for (auto &item : unit_json["tg_activity"].items())
                         {
                             long tg_id = std::stol(item.key());
-                            int count = item.value();
+                            TxCount count;
+                            
+                            // Backward compatibility: handle both old and new formats
+                            if (item.value().is_array())
+                            {
+                                auto arr = item.value();
+                                count.voice = arr.size() > 0 ? arr[0].get<int>() : 0;
+                                count.data = arr.size() > 1 ? arr[1].get<int>() : 0;
+                            }
+                            else
+                            {
+                                // Old format: single int represents voice count only
+                                count.voice = item.value();
+                                count.data = 0;
+                            }
+                            
                             unit.tg_activity[tg_id] = count;
                         }
                     }
@@ -1601,14 +1683,45 @@ public:
                     tg.alias = tg_json.value("alias", "");
                     tg.encr_seen = tg_json.value("encr_seen", false);
                     tg.last_active = tg_json.value("last_active", 0L);
-                    tg.tx_count = tg_json.value("tx_count", 0);
+                    
+                    // Backward compatibility: handle both old format (int) and new format ([int, int])
+                    if (tg_json.contains("tx_count"))
+                    {
+                        if (tg_json["tx_count"].is_array())
+                        {
+                            auto arr = tg_json["tx_count"];
+                            tg.tx_count.voice = arr.size() > 0 ? arr[0].get<int>() : 0;
+                            tg.tx_count.data = arr.size() > 1 ? arr[1].get<int>() : 0;
+                        }
+                        else
+                        {
+                            // Old format: single int represents voice count only
+                            tg.tx_count.voice = tg_json.value("tx_count", 0);
+                            tg.tx_count.data = 0;
+                        }
+                    }
 
                     if (tg_json.contains("unit_activity"))
                     {
                         for (auto &item : tg_json["unit_activity"].items())
                         {
                             long unit_id = std::stol(item.key());
-                            int count = item.value();
+                            TxCount count;
+                            
+                            // Backward compatibility: handle both old and new formats
+                            if (item.value().is_array())
+                            {
+                                auto arr = item.value();
+                                count.voice = arr.size() > 0 ? arr[0].get<int>() : 0;
+                                count.data = arr.size() > 1 ? arr[1].get<int>() : 0;
+                            }
+                            else
+                            {
+                                // Old format: single int represents voice count only
+                                count.voice = item.value();
+                                count.data = 0;
+                            }
+                            
                             tg.unit_activity[unit_id] = count;
                         }
                     }
@@ -2231,8 +2344,8 @@ public:
         json payload = {{"type", "unit_event"}, {"event", event_json}};
         enqueue_sse_event("unit_event", payload.dump(-1));
 
-        // Update affiliation state (affiliations are typically not encrypted)
-        update_affiliation_state(sys, source_id, talkgroup_num, false);
+        // Update affiliation tracking for data event (not voice grant)
+        update_affiliation_state_data(sys, source_id, talkgroup_num);
 
         // Send graph streaming data for Gephi (unit-tg pairing)
         send_gephi_unit_tg_event(sys, source_id, talkgroup_num, false);
@@ -2393,8 +2506,8 @@ public:
         cache_trunk_message(event_json);
         enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump(-1));
 
-        // Update unit state to track activity
-        update_unit_state(sys, source_id, false);
+        // Update affiliation tracking for data event
+        update_affiliation_state_data(sys, source_id, talkgroup_num);
         send_gephi_unit_tg_event(sys, source_id, talkgroup_num, false);
 
         dirty_flags_.fetch_or(DIRTY_TRUNK_MESSAGES);

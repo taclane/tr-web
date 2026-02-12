@@ -452,23 +452,38 @@ class Tr_Web : public Plugin_Api
             all_nodes[node_id] = node_data;
             node_count++;
 
-            // Add unit->tg pairings to edge_map (voice transmissions only)
+            // Add unit->tg pairings to edge_map
+            // Voice links use voice counts only; data-only links use data counts
             for (const auto &[tg_id, count] : unit.tg_activity)
             {
                 if (tg_id == 0 || tg_id == -1)
                     continue;
                 std::string edge_key = "TG-" + std::to_string(tg_id) + "-" + std::to_string(unit.id);
-                // Use voice count only for now (future: separate edges for voice/data)
-                double unit_weight = (unit.tx_count.voice > 0) ? static_cast<double>(count.voice) / unit.tx_count.voice : 0.0;
+                
+                double unit_weight = 0.0;
+                
+                if (count.voice > 0)
+                {
+                    // Voice exists: calculate weight from voice transmissions only
+                    unit_weight = (unit.tx_count.voice > 0) ? static_cast<double>(count.voice) / unit.tx_count.voice : 0.0;
+                }
+                else if (count.data > 0)
+                {
+                    // Data only: calculate weight from data transmissions only
+                    unit_weight = (unit.tx_count.data > 0) ? static_cast<double>(count.data) / unit.tx_count.data : 0.0;
+                }
+                
                 // Round to nearest 0.01, min 0.01 if > 0
                 if (unit_weight > 0.0)
                 {
                     unit_weight = std::max(0.01, std::round(unit_weight * 100.0) / 100.0);
                 }
+                
                 edge_map[edge_key] = {
                     {"unit", unit.id},
                     {"tg", tg_id},
-                    {"unit_weight", unit_weight}};
+                    {"unit_weight", unit_weight},
+                    {"has_voice", count.voice > 0}};
             }
         }
 
@@ -479,14 +494,14 @@ class Tr_Web : public Plugin_Api
                 continue;
             std::string node_id = "TG-" + std::to_string(tg.id);
             std::string label = tg.alias.empty() ? ("TG " + std::to_string(tg.id)) : tg.alias;
-            std::string color = tg.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN;
+            std::string color = get_talkgroup_color(tg);
             // Get status using unlocked version (we already hold affiliation_state_mutex_)
             std::string status = get_talkgroup_status_unlocked(tg.wacn, tg.sysid, tg.id);
             json node_data = {
                 {"id", node_id},
                 {"label", label},
                 {"color", color},
-                {"size", 25},
+                {"size", 30},
                 {"encryption", tg.encr_seen},
                 {"status", status}};
 
@@ -494,19 +509,28 @@ class Tr_Web : public Plugin_Api
             node_count++;
 
             // Add tg->unit pairings to edge_map (reverse), and set encrypted if tg.encr_seen
-            // Voice transmissions only for now (future: separate edges for voice/data)
+            // Voice links use voice counts only; data-only links ignore tg weight (set to 0)
             for (const auto &[unit_id, count] : tg.unit_activity)
             {
                 if (unit_id == 0 || unit_id == -1)
                     continue;
                 std::string edge_key = "TG-" + std::to_string(tg.id) + "-" + std::to_string(unit_id);
-                // Use voice count only for now
-                double tg_weight = (tg.tx_count.voice > 0) ? static_cast<double>(count.voice) / tg.tx_count.voice : 0.0;
-                // Round to nearest 0.01, min 0.01 if > 0
-                if (tg_weight > 0.0)
+                
+                double tg_weight = 0.0;
+                
+                if (count.voice > 0)
                 {
-                    tg_weight = std::max(0.01, std::round(tg_weight * 100.0) / 100.0);
+                    // Voice exists: calculate weight from voice transmissions only
+                    tg_weight = (tg.tx_count.voice > 0) ? static_cast<double>(count.voice) / tg.tx_count.voice : 0.0;
+                    
+                    // Round to nearest 0.01, min 0.01 if > 0
+                    if (tg_weight > 0.0)
+                    {
+                        tg_weight = std::max(0.01, std::round(tg_weight * 100.0) / 100.0);
+                    }
                 }
+                // else: data only, tg_weight stays 0.0 (ignore tg side for data-only edges)
+                
                 if (edge_map.contains(edge_key))
                 {
                     edge_map[edge_key]["tg_weight"] = tg_weight;
@@ -521,7 +545,8 @@ class Tr_Web : public Plugin_Api
                         {"unit", unit_id},
                         {"tg", tg.id},
                         {"tg_weight", tg_weight},
-                        {"encrypted", tg.encr_seen}};
+                        {"encrypted", tg.encr_seen},
+                        {"has_voice", count.voice > 0}};
                 }
             }
         }
@@ -542,14 +567,13 @@ class Tr_Web : public Plugin_Api
             std::string tg_node = "TG-" + std::to_string(tg_id);
             
             // Determine status and color based on voice/data counts
-            // Look up the TxCount for this unit-tg pair
             std::string status = "affil";  // Default to affiliation
             std::string color = GEPHI_COLOR_BLUE;  // Default to blue
             bool edge_encrypted = it.value().value("encrypted", false);
+            bool has_voice = it.value().value("has_voice", false);
             
             // Check if this edge has any voice transmissions
-            double voice_weight = it.value().value("unit_weight", 0.0);
-            if (voice_weight > 0.0)
+            if (has_voice)
             {
                 // Grant-based edge: check encryption
                 if (edge_encrypted)
@@ -629,14 +653,15 @@ class Tr_Web : public Plugin_Api
         std::string node_id = "TG-" + std::to_string(tg_id);
         std::string label = tg_alpha.empty() ? std::to_string(tg_id) : tg_alpha;
         std::string status = get_talkgroup_status(sys->get_wacn(), sys->get_sys_id(), tg_id);
+        std::string color = get_talkgroup_effective_color(sys, tg_id);
 
         json node_data = {
             {"id", node_id},
             {"label", label},
-            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
+            {"color", color},
             {"status", status},
             {"encryption", encrypted},
-            {"size", 25}};
+            {"size", 30}};
 
         json add_node = {{"an", {{node_id, node_data}}}};
         return add_node.dump(-1) + "\r\n";
@@ -647,14 +672,15 @@ class Tr_Web : public Plugin_Api
         std::string node_id = "TG-" + std::to_string(tg_id);
         std::string label = tg_alpha.empty() ? std::to_string(tg_id) : tg_alpha;
         std::string status = get_talkgroup_status(sys->get_wacn(), sys->get_sys_id(), tg_id);
+        std::string color = get_talkgroup_effective_color(sys, tg_id);
 
         json node_data = {
             {"id", node_id},
             {"label", label},
-            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
+            {"color", color},
             {"status", status},
             {"encryption", encrypted},
-            {"size", 25}};
+            {"size", 30}};
 
         json change_node = {{"cn", {{node_id, node_data}}}};
         return change_node.dump(-1) + "\r\n";
@@ -699,7 +725,7 @@ class Tr_Web : public Plugin_Api
         // Filter out anomalous IDs that are not valid for graph theory
         // -1 indicates unknown/invalid radio ID
         // 0 indicates uninitialized or missing unit/talkgroup ID
-        if (unit_id == -1 || unit_id == 0 || tg_id == 0)
+        if (unit_id == -1 || unit_id == 0 || tg_id == 0 || tg_id == -1)
         {
             return;
         }
@@ -801,8 +827,14 @@ class Tr_Web : public Plugin_Api
 
     // Gephi streaming constants
     static constexpr const char *GEPHI_COLOR_BLUE = "#0099CC";
-    static constexpr const char *GEPHI_COLOR_RED = "#a83232";
+    // static constexpr const char *GEPHI_COLOR_LT_BLUE = "#80d5f6";
+    static constexpr const char *GEPHI_COLOR_LT_BLUE = "#b8edff";
+    // static constexpr const char *GEPHI_COLOR_RED = "#a83232";
+    static constexpr const char *GEPHI_COLOR_RED = "#cc0035";
+    // static constexpr const char *GEPHI_COLOR_LT_RED = "#e57373";
+    static constexpr const char *GEPHI_COLOR_LT_RED = "#ffb8cb";
     static constexpr const char *GEPHI_COLOR_GREEN = "#32a852";
+    static constexpr const char *GEPHI_COLOR_LT_GREEN = "#81c784";
     static constexpr const char *GEPHI_COLOR_GREY = "#808080";
     static constexpr const char *GEPHI_COLOR_BLACK = "#000000";
 
@@ -902,6 +934,12 @@ public:
     // Update unit/talkgroup state tracking for VOICE calls (grants)
     void update_affiliation_state(System *sys, long unit_id, long tg_id, bool encrypted)
     {
+        // Filter out bogon IDs
+        if (unit_id == 0 || unit_id == -1 || tg_id == 0 || tg_id == -1)
+        {
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
         time_t now = time(NULL);
 
@@ -950,6 +988,12 @@ public:
     // Update unit/talkgroup state tracking for DATA events (affiliations, locations)
     void update_affiliation_state_data(System *sys, long unit_id, long tg_id)
     {
+        // Filter out bogon IDs
+        if (unit_id == 0 || unit_id == -1 || tg_id == 0 || tg_id == -1)
+        {
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
         time_t now = time(NULL);
 
@@ -1429,10 +1473,25 @@ public:
         // Grey if deregistered OR idle
         if (!unit.registered || unit.last_active < idle_threshold)
         {
-            return GEPHI_COLOR_GREY;
+            //return GEPHI_COLOR_GREY;
+            return unit.encr_seen ? GEPHI_COLOR_LT_RED : GEPHI_COLOR_LT_BLUE;
         }
 
         return unit.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
+    }
+    
+    std::string get_talkgroup_color(const TalkgroupState &tg) const
+    {
+        time_t now = time(NULL);
+        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
+
+        // Light color if idle
+        if (tg.last_active < idle_threshold)
+        {
+            return tg.encr_seen ? GEPHI_COLOR_LT_RED : GEPHI_COLOR_LT_BLUE;
+        }
+
+        return tg.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
     }
 
     /// Get status string for a unit based on its state
@@ -1451,27 +1510,28 @@ public:
         auto it = unit_states_.find(unit_key);
         if (it == unit_states_.end())
         {
-            return "u_off";
+            return "u_unknown";
         }
 
         const UnitState &unit = it->second;
         time_t now = time(NULL);
         time_t idle_threshold = now - (affiliation_timeout_ * 3600);
+        bool encrypted = unit.encr_seen;
 
         // Off: deregistered units
         if (!unit.registered)
         {
-            return "u_off";
+            return encrypted ? "u_enc_off" : "u_off";
         }
         // Idle: registered but no recent activity
         else if (unit.last_active < idle_threshold)
         {
-            return "u_idle";
+            return encrypted ? "u_enc_idle" : "u_idle";
         }
         // Active: recent activity within timeout window
         else
         {
-            return "u_active";
+            return encrypted ? "u_enc_active" : "u_active";
         }
     }
 
@@ -1491,27 +1551,28 @@ public:
         
         if (it == talkgroup_states_.end())
         {
-            return "tg_off";
+            return "tg_unknown";
         }
 
         const TalkgroupState &tg = it->second;
         time_t now = time(NULL);
         time_t idle_threshold = now - (affiliation_timeout_ * 3600);
+        bool encrypted = tg.encr_seen;
 
         // Active: recent activity within timeout window
         if (tg.last_active > idle_threshold)
         {
-            return "tg_active";
+            return encrypted ? "tg_enc_active" : "tg_active";
         }
         // Idle: seen before but no recent activity
         else if (tg.last_active > 0)
         {
-            return "tg_idle";
+            return encrypted ? "tg_enc_idle" : "tg_idle";
         }
         // Off: never seen activity
         else
         {
-            return "tg_off";
+            return "tg_unknown";
         }
     }
 
@@ -1531,6 +1592,23 @@ public:
         }
 
         return get_unit_color(it->second);
+    }
+    
+    std::string get_talkgroup_effective_color(System *sys, long tg_id) const
+    {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+
+        int wacn = sys->get_wacn();
+        int sysid = sys->get_sys_id();
+        std::string tg_key = make_tg_key(wacn, sysid, tg_id);
+
+        auto it = talkgroup_states_.find(tg_key);
+        if (it == talkgroup_states_.end())
+        {
+            return GEPHI_COLOR_GREEN; // Default
+        }
+
+        return get_talkgroup_color(it->second);
     }
 
     // Get affiliation data for API
@@ -1819,6 +1897,15 @@ public:
                         }
                     }
 
+                    // Recalculate tx_count from activity map (ignore stored values)
+                    unit.tx_count.voice = 0;
+                    unit.tx_count.data = 0;
+                    for (const auto &tg_pair : unit.tg_activity)
+                    {
+                        unit.tx_count.voice += tg_pair.second.voice;
+                        unit.tx_count.data += tg_pair.second.data;
+                    }
+
                     std::string key = make_unit_key(unit.wacn, unit.sysid, unit.id);
                     unit_states_[key] = unit;
                 }
@@ -1877,6 +1964,15 @@ public:
                             
                             tg.unit_activity[unit_id] = count;
                         }
+                    }
+
+                    // Recalculate tx_count from activity map (ignore stored values)
+                    tg.tx_count.voice = 0;
+                    tg.tx_count.data = 0;
+                    for (const auto &unit_pair : tg.unit_activity)
+                    {
+                        tg.tx_count.voice += unit_pair.second.voice;
+                        tg.tx_count.data += unit_pair.second.data;
                     }
 
                     std::string key = make_tg_key(tg.wacn, tg.sysid, tg.id);

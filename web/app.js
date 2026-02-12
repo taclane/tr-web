@@ -2931,7 +2931,6 @@ const affiliationState = {
     sortColumn: 'id',
     sortDirection: 'asc',
     searchTerm: '',
-    filterBogons: true,
     filterWacnSysid: 'all' // 'all' or 'wacn:sysid' format
 };
 
@@ -3169,29 +3168,7 @@ function sortAffiliationTable(view, column) {
 
 function filterAndSortData(items) {
     let filtered = items;
-    // Apply bogon filter (unit/tg 0, -1)
-    const filterBogons = document.getElementById('filterBogonsCheckbox')?.checked ?? true;
-    if (filterBogons) {
-        filtered = filtered.filter(item => item.id !== 0 && item.id !== -1);
-        // Deep filter associations as well
-        filtered = filtered.map(item => {
-            // Clone to avoid mutating original
-            const newItem = { ...item };
-            if (newItem.tg_activity) {
-                newItem.tg_activity = Object.fromEntries(
-                    Object.entries(newItem.tg_activity)
-                        .filter(([tgid]) => tgid !== '0' && tgid !== '-1')
-                );
-            }
-            if (newItem.unit_activity) {
-                newItem.unit_activity = Object.fromEntries(
-                    Object.entries(newItem.unit_activity)
-                        .filter(([uid]) => uid !== '0' && uid !== '-1')
-                );
-            }
-            return newItem;
-        });
-    }
+    // Bogons are now filtered on backend, no need to filter here
     
     // Apply WACN:SYSID filter
     if (affiliationState.filterWacnSysid && affiliationState.filterWacnSysid !== 'all') {

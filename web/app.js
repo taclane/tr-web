@@ -355,7 +355,18 @@ function connect() {
         eventSource.close();
     }
     
-    eventSource = new EventSource(`${BASE_PATH}events`);
+    try {
+        eventSource = new EventSource(`${BASE_PATH}events`);
+    } catch (err) {
+        console.error('Failed to create EventSource:', err);
+        state.connected = false;
+        updateConnectionStatus();
+        
+        // Retry after 5 seconds
+        if (reconnectTimeout) clearTimeout(reconnectTimeout);
+        reconnectTimeout = setTimeout(connect, 5000);
+        return;
+    }
     
     eventSource.onopen = () => {
         state.connected = true;
@@ -374,21 +385,29 @@ function connect() {
         lastDisconnectedAt = 0;
     };
     
-    eventSource.onerror = async () => {
+    eventSource.onerror = async (err) => {
+        console.error('SSE error:', err);
         state.connected = false;
         updateConnectionStatus();
-        eventSource.close();
+        
+        if (eventSource) {
+            eventSource.close();
+        }
 
         if (!lastDisconnectedAt) lastDisconnectedAt = Date.now();
         
         // Check if we're still authenticated before reconnecting
-        const authInfo = await getCurrentAuthLevel();
-        if (authInfo.level === 'none') {
-            // Not authenticated anymore - show login modal instead of reconnecting
-            console.log('SSE disconnected: not authenticated');
-            await updateAuthDisplay();
-            showLoginModal();
-            return;
+        try {
+            const authInfo = await getCurrentAuthLevel();
+            if (authInfo.level === 'none') {
+                // Not authenticated anymore - show login modal instead of reconnecting
+                console.log('SSE disconnected: not authenticated');
+                await updateAuthDisplay();
+                showLoginModal();
+                return;
+            }
+        } catch (authErr) {
+            console.error('Auth check failed during SSE error:', authErr);
         }
         
         // Still authenticated - reconnect after 3 seconds
@@ -2671,6 +2690,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     setInterval(() => {
         updateVoiceChannels();
     }, 1000);
+    
+    // Periodically check for stale SSE connections (every 15 seconds)
+    setInterval(() => {
+        if (!state.connected) return; // Already disconnected, onerror will handle reconnection
+        
+        const now = Date.now();
+        const timeSinceLastData = now - lastSseDataTime;
+        
+        // If no data received for longer than threshold, force reconnect
+        if (timeSinceLastData > SSE_STALE_THRESHOLD_MS) {
+            console.warn(`SSE connection appears stale (${Math.round(timeSinceLastData/1000)}s since last data), forcing reconnect`);
+            state.connected = false;
+            updateConnectionStatus();
+            if (eventSource) {
+                eventSource.close();
+            }
+            connect();
+        }
+    }, 15000);
     
     // Load admin data when admin tab is shown
     window.showMainTab = showMainTab;

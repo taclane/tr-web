@@ -123,9 +123,15 @@ class Tr_Web : public Plugin_Api
 
     json get_console_logs() const
     {
-        std::lock_guard<std::mutex> lock(console_mutex_);
+        // Copy data while holding lock, build JSON after releasing
+        std::deque<std::string> logs_copy;
+        {
+            std::lock_guard<std::mutex> lock(console_mutex_);
+            logs_copy = console_logs_;
+        }
+        
         json logs = json::array();
-        for (const auto &line : console_logs_)
+        for (const auto &line : logs_copy)
         {
             logs.push_back(line);
         }
@@ -144,9 +150,15 @@ class Tr_Web : public Plugin_Api
 
     json get_call_history() const
     {
-        std::lock_guard<std::mutex> lock(call_history_mutex_);
+        // Copy data while holding lock, build JSON after releasing
+        std::deque<json> history_copy;
+        {
+            std::lock_guard<std::mutex> lock(call_history_mutex_);
+            history_copy = call_history_;
+        }
+        
         json history = json::array();
-        for (const auto &call : call_history_)
+        for (const auto &call : history_copy)
         {
             history.push_back(call);
         }
@@ -165,9 +177,15 @@ class Tr_Web : public Plugin_Api
 
     json get_trunk_messages() const
     {
-        std::lock_guard<std::mutex> lock(trunk_messages_mutex_);
+        // Copy data while holding lock, build JSON after releasing
+        std::deque<json> messages_copy;
+        {
+            std::lock_guard<std::mutex> lock(trunk_messages_mutex_);
+            messages_copy = trunk_messages_;
+        }
+        
         json messages = json::array();
-        for (const auto &msg : trunk_messages_)
+        for (const auto &msg : messages_copy)
         {
             messages.push_back(msg);
         }
@@ -514,7 +532,7 @@ class Tr_Web : public Plugin_Api
             server_.broadcast_raw_to_path("/graph-stream", an_msg.dump(-1) + "\r\n");
         }
 
-        // Gather all edges
+        // Gather all edges with status-based coloring
         for (auto it = edge_map.begin(); it != edge_map.end(); ++it)
         {
             std::string edge_id = it.key();
@@ -522,17 +540,38 @@ class Tr_Web : public Plugin_Api
             long tg_id = it.value()["tg"];
             std::string unit_node = std::to_string(unit_id);
             std::string tg_node = "TG-" + std::to_string(tg_id);
+            
+            // Determine status and color based on voice/data counts
+            // Look up the TxCount for this unit-tg pair
+            std::string status = "affil";  // Default to affiliation
+            std::string color = GEPHI_COLOR_BLUE;  // Default to blue
             bool edge_encrypted = it.value().value("encrypted", false);
-            std::string color = edge_encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_BLACK;
+            
+            // Check if this edge has any voice transmissions
+            double voice_weight = it.value().value("unit_weight", 0.0);
+            if (voice_weight > 0.0)
+            {
+                // Grant-based edge: check encryption
+                if (edge_encrypted)
+                {
+                    status = "e_grant";
+                    color = GEPHI_COLOR_RED;
+                }
+                else
+                {
+                    status = "grant";
+                    color = GEPHI_COLOR_BLACK;
+                }
+            }
+            // Otherwise it's affiliation-only (data), status="affil", color=blue (already set)
+            
             json edge_data = {
                 {"source", unit_node},
                 {"target", tg_node},
                 {"directed", false},
                 {"color", color},
+                {"status", status},
                 {"encryption", edge_encrypted},
-                // {"unit_weight", it.value().value("unit_weight", 0.0)},
-                // {"tg_weight", it.value().value("tg_weight", 0.0)},
-                // {"weight", it.value().value("unit_weight", 0.0)}
                 {"weight", (it.value().value("unit_weight", 0.0) + it.value().value("tg_weight", 0.0)) / 2.0}};
 
             all_edges[edge_id] = edge_data;
@@ -621,7 +660,7 @@ class Tr_Web : public Plugin_Api
         return change_node.dump(-1) + "\r\n";
     }
 
-    std::string create_gephi_add_edge(long unit_id, long tg_id, bool encrypted)
+    std::string create_gephi_add_edge(long unit_id, long tg_id, const std::string &status, const std::string &color)
     {
         std::string unit_node = std::to_string(unit_id);
         std::string tg_node = "TG-" + std::to_string(tg_id);
@@ -631,14 +670,14 @@ class Tr_Web : public Plugin_Api
             {"source", unit_node},
             {"target", tg_node},
             {"directed", false},
-            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
-            {"encryption", encrypted}};
+            {"color", color},
+            {"status", status}};
 
         json add_edge = {{"ae", {{edge_id, edge_data}}}};
         return add_edge.dump(-1) + "\r\n";
     }
 
-    std::string create_gephi_change_edge(long unit_id, long tg_id, bool encrypted)
+    std::string create_gephi_change_edge(long unit_id, long tg_id, const std::string &status, const std::string &color)
     {
         std::string unit_node = std::to_string(unit_id);
         std::string tg_node = "TG-" + std::to_string(tg_id);
@@ -648,8 +687,8 @@ class Tr_Web : public Plugin_Api
             {"source", unit_node},
             {"target", tg_node},
             {"directed", false},
-            {"color", encrypted ? GEPHI_COLOR_RED : GEPHI_COLOR_GREEN},
-            {"encryption", encrypted}};
+            {"color", color},
+            {"status", status}};
 
         json change_edge = {{"ce", {{edge_id, edge_data}}}};
         return change_edge.dump(-1) + "\r\n";
@@ -674,20 +713,23 @@ class Tr_Web : public Plugin_Api
             tg_alpha = tg->alpha_tag;
         }
 
+        // Determine edge status and color based on voice/data transmission counts
+        auto [edge_status, edge_color] = get_edge_status_and_color(sys, unit_id, tg_id);
+
         // Always send both "add" and "change" events (no state tracking)
         // - "add" events set initial color based on current state
-        // - "change" events update color dynamically (grey/blue/red)
+        // - "change" events update color dynamically
         std::stringstream events;
 
         // Send add events (establish nodes/edges with correct initial colors)
         events << create_gephi_add_unit_node(sys, unit_id, unit_alpha, encrypted);
         events << create_gephi_add_talkgroup_node(sys, tg_id, tg_alpha, encrypted);
-        events << create_gephi_add_edge(unit_id, tg_id, encrypted);
+        events << create_gephi_add_edge(unit_id, tg_id, edge_status, edge_color);
 
         // Send change events (update labels and colors based on current state)
         events << create_gephi_change_unit_node(sys, unit_id, unit_alpha, encrypted);
         events << create_gephi_change_talkgroup_node(sys, tg_id, tg_alpha, encrypted);
-        events << create_gephi_change_edge(unit_id, tg_id, encrypted);
+        events << create_gephi_change_edge(unit_id, tg_id, edge_status, edge_color);
 
         // Queue all events together
         enqueue_graph_event(events.str());
@@ -709,6 +751,52 @@ class Tr_Web : public Plugin_Api
         events << create_gephi_change_unit_node(sys, unit_id, unit_alpha, encrypted);
 
         enqueue_graph_event(events.str());
+    }
+
+    // Helper function to determine edge status and color based on unit-tg relationship
+    // Returns: {status, color} where status is "grant", "e_grant", or "affil"
+    std::pair<std::string, std::string> get_edge_status_and_color(System *sys, long unit_id, long tg_id) const
+    {
+        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        
+        int wacn = sys->get_wacn();
+        int sysid = sys->get_sys_id();
+        std::string tg_key = make_tg_key(wacn, sysid, tg_id);
+        
+        // Look up this unit-tg relationship in talkgroup state
+        auto tg_it = talkgroup_states_.find(tg_key);
+        if (tg_it != talkgroup_states_.end())
+        {
+            const auto &tg = tg_it->second;
+            auto unit_it = tg.unit_activity.find(unit_id);
+            if (unit_it != tg.unit_activity.end())
+            {
+                const TxCount &tx = unit_it->second;
+                
+                // If any voice transmissions (grants) exist
+                if (tx.voice > 0)
+                {
+                    // Grant-based edge: check encryption
+                    bool encrypted = tg.encr_seen;
+                    if (encrypted)
+                    {
+                        return {"e_grant", GEPHI_COLOR_RED};
+                    }
+                    else
+                    {
+                        return {"grant", GEPHI_COLOR_BLACK};
+                    }
+                }
+                // Only data transmissions (affiliations/locations)
+                else if (tx.data > 0)
+                {
+                    return {"affil", GEPHI_COLOR_BLUE};
+                }
+            }
+        }
+        
+        // Default: assume affiliation (data-only) with blue color
+        return {"affil", GEPHI_COLOR_BLUE};
     }
 
     // Gephi streaming constants
@@ -1401,9 +1489,27 @@ public:
     // Get affiliation data for API
     json get_affiliation_data(int limit = 0, bool units_only = false, bool talkgroups_only = false) const
     {
-        std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        // Copy data while holding lock, build JSON after releasing
+        std::map<std::string, UnitState> units_copy;
+        std::map<std::string, TalkgroupState> talkgroups_copy;
+        size_t total_units, total_talkgroups;
+        int timeout_hours;
+        
+        {
+            std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+            if (!talkgroups_only) {
+                units_copy = unit_states_;
+            }
+            if (!units_only) {
+                talkgroups_copy = talkgroup_states_;
+            }
+            total_units = unit_states_.size();
+            total_talkgroups = talkgroup_states_.size();
+            timeout_hours = affiliation_timeout_;
+        }
+        
         time_t now = time(NULL);
-        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
+        time_t idle_threshold = now - (timeout_hours * 3600);
 
         // Compact array-based format to reduce payload size
         // Schema: [id, wacn, sysid, alias, encr_seen, last_active, registered, is_idle, tx_count, activity_map]
@@ -1412,14 +1518,14 @@ public:
                                      {"talkgroups", json::array({"id", "wacn", "sysid", "alias", "encr_seen", "last_active", "is_idle", "tx_count", "unit_activity"})}})},
             {"units", json::array()},
             {"talkgroups", json::array()},
-            {"config", {{"timeout_hours", affiliation_timeout_}}},
-            {"total_units", unit_states_.size()},
-            {"total_talkgroups", talkgroup_states_.size()}};
+            {"config", {{"timeout_hours", timeout_hours}}},
+            {"total_units", total_units},
+            {"total_talkgroups", total_talkgroups}};
 
         if (!talkgroups_only)
         {
             int count = 0;
-            for (const auto &pair : unit_states_)
+            for (const auto &pair : units_copy)
             {
                 if (limit > 0 && count >= limit)
                     break;
@@ -1459,7 +1565,7 @@ public:
         if (!units_only)
         {
             int count = 0;
-            for (const auto &pair : talkgroup_states_)
+            for (const auto &pair : talkgroups_copy)
             {
                 if (limit > 0 && count >= limit)
                     break;
@@ -1787,10 +1893,15 @@ public:
 
     json get_rate_history() const
     {
-        std::lock_guard<std::mutex> lock(data_mutex_);
+        // Copy data while holding lock, build JSON after releasing
+        std::map<std::string, std::deque<RatePoint>> history_copy;
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            history_copy = rate_history_;
+        }
+        
         json history;
-
-        for (const auto &[sys_name, points] : rate_history_)
+        for (const auto &[sys_name, points] : history_copy)
         {
             json sys_history = json::array();
             for (const auto &point : points)
@@ -1806,10 +1917,15 @@ public:
 
     json get_call_rate_history() const
     {
-        std::lock_guard<std::mutex> lock(data_mutex_);
+        // Copy data while holding lock, build JSON after releasing
+        std::map<std::string, std::deque<RatePoint>> history_copy;
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            history_copy = call_rate_history_;
+        }
+        
         json history;
-
-        for (const auto &[sys_name, points] : call_rate_history_)
+        for (const auto &[sys_name, points] : history_copy)
         {
             json sys_history = json::array();
             for (const auto &point : points)

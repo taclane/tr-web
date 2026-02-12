@@ -109,6 +109,15 @@ namespace httplib
     {
     public:
         explicit PlainSocket(int fd) : fd_(fd), valid_(fd >= 0) {}
+        
+        // Set socket write timeout to prevent blocking on slow clients
+        void set_write_timeout(int seconds) {
+            if (fd_ < 0) return;
+            struct timeval tv;
+            tv.tv_sec = seconds;
+            tv.tv_usec = 0;
+            setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
 
         ssize_t read(void *buf, size_t len) override
         {
@@ -267,7 +276,12 @@ namespace httplib
         std::string path; // Track which path this client is connected to
 
         explicit SSEClient(std::shared_ptr<SocketWrapper> sock, const std::string &ip = "", const std::string &user = "", const std::string &p = "")
-            : socket(sock), connected(true), client_ip(ip), username(user), path(p) {}
+            : socket(sock), connected(true), client_ip(ip), username(user), path(p) {
+            // Set 2-second write timeout to prevent blocking on slow clients
+            if (auto *plain = dynamic_cast<PlainSocket*>(sock.get())) {
+                plain->set_write_timeout(2);
+            }
+        }
 
         bool send_event(const std::string &event, const std::string &data)
         {
@@ -291,6 +305,8 @@ namespace httplib
             message += "\n";
 
             ssize_t sent = socket->write(message.c_str(), message.length());
+            // If write fails or times out (sent <= 0), mark client as disconnected
+            // This prevents slow/stalled clients from blocking broadcasts
             if (sent <= 0)
             {
                 connected = false;

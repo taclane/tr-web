@@ -488,6 +488,12 @@ namespace httplib
             sse_auth_callback_ = callback;
         }
 
+        // Set username extraction callback for SSE logging
+        void set_sse_username_callback(std::function<std::string(const Request&)> callback)
+        {
+            sse_username_callback_ = callback;
+        }
+
         // Send SSE event to all connected clients (except raw stream clients)
         void broadcast_sse(const std::string &event, const std::string &data)
         {
@@ -1051,16 +1057,24 @@ namespace httplib
 
         void handle_sse_client(std::shared_ptr<SocketWrapper> socket, const Request &req, const std::string &client_ip)
         {
-            // Extract username from Basic Auth if present
+            // Extract username using callback if available, otherwise try Basic Auth
             std::string username = "anonymous";
-            std::string auth = get_header_ci(req, "Authorization");
-            if (!auth.empty() && auth.substr(0, 6) == "Basic ")
+            if (sse_username_callback_)
             {
-                std::string decoded = base64_decode(auth.substr(6));
-                size_t colon = decoded.find(':');
-                if (colon != std::string::npos)
+                username = sse_username_callback_(req);
+            }
+            else
+            {
+                // Fallback to Basic Auth parsing
+                std::string auth = get_header_ci(req, "Authorization");
+                if (!auth.empty() && auth.substr(0, 6) == "Basic ")
                 {
-                    username = decoded.substr(0, colon);
+                    std::string decoded = base64_decode(auth.substr(6));
+                    size_t colon = decoded.find(':');
+                    if (colon != std::string::npos)
+                    {
+                        username = decoded.substr(0, colon);
+                    }
                 }
             }
 
@@ -1333,6 +1347,7 @@ namespace httplib
         std::vector<std::shared_ptr<SSEClient>> raw_stream_clients_;
         std::function<void()> raw_stream_connect_notify_;
         std::function<bool(const Request&)> sse_auth_callback_;
+        std::function<std::string(const Request&)> sse_username_callback_;
 
     public:
         // Return the number of connected raw stream (graphstream) clients

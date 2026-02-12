@@ -1295,6 +1295,53 @@ public:
         }
     }
 
+    /// Get username from request (for logging SSE connections)
+    /// Checks session cookies, then Basic Auth
+    std::string get_username_from_request(const httplib::Request &req) const
+    {
+        // First check for session token in cookie
+        std::string cookie_header = req.get_header("Cookie");
+        if (!cookie_header.empty())
+        {
+            // Simple cookie parsing: look for session=TOKEN
+            size_t pos = cookie_header.find("session=");
+            if (pos != std::string::npos)
+            {
+                size_t start = pos + 8; // Length of "session="
+                size_t end = cookie_header.find(";", start);
+                std::string token = cookie_header.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                
+                // Look up session and get username
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                auto it = sessions_.find(token);
+                if (it != sessions_.end())
+                {
+                    time_t now = time(NULL);
+                    // Check if session is still valid
+                    if (now - it->second.last_access <= SESSION_TIMEOUT_SECONDS)
+                    {
+                        return it->second.username;
+                    }
+                }
+            }
+        }
+        
+        // Fall back to Basic Auth
+        std::string auth_header = req.get_header("Authorization");
+        if (!auth_header.empty() && auth_header.find("Basic ") == 0)
+        {
+            std::string encoded = auth_header.substr(6);
+            std::string decoded = httplib::base64_decode(encoded);
+            size_t colon_pos = decoded.find(':');
+            if (colon_pos != std::string::npos)
+            {
+                return decoded.substr(0, colon_pos);
+            }
+        }
+        
+        return "anonymous";
+    }
+
     /// Check authentication: session token OR Basic Auth
     /// This allows both web interface (session) and external tools (Basic Auth) to work
     bool check_auth_hybrid(const httplib::Request &req, bool require_admin = false) const
@@ -2040,6 +2087,12 @@ public:
             return this->check_auth_hybrid(req, false);
         });
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Configured SSE authentication callback";
+
+        // Enable SSE username extraction callback for logging
+        server_.set_sse_username_callback([this](const httplib::Request &req) -> std::string {
+            return this->get_username_from_request(req);
+        });
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Configured SSE username callback";
 
         // Note: We use session-based auth for web interface and Basic Auth for SSE/external tools
         // Authentication is checked manually in each endpoint via require_auth() / require_admin_auth()

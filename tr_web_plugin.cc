@@ -827,12 +827,11 @@ class Tr_Web : public Plugin_Api
 
     // Gephi streaming constants
     static constexpr const char *GEPHI_COLOR_BLUE = "#0099CC";
-    // static constexpr const char *GEPHI_COLOR_LT_BLUE = "#80d5f6";
     static constexpr const char *GEPHI_COLOR_LT_BLUE = "#b8edff";
-    // static constexpr const char *GEPHI_COLOR_RED = "#a83232";
+    static constexpr const char *GEPHI_COLOR_XLT_BLUE = "#e0f7ff";  // Extra light blue for 12hr+ idle
     static constexpr const char *GEPHI_COLOR_RED = "#cc0035";
-    // static constexpr const char *GEPHI_COLOR_LT_RED = "#e57373";
     static constexpr const char *GEPHI_COLOR_LT_RED = "#ffb8cb";
+    static constexpr const char *GEPHI_COLOR_XLT_RED = "#ffe0e8";  // Extra light red for 12hr+ idle
     static constexpr const char *GEPHI_COLOR_GREEN = "#32a852";
     static constexpr const char *GEPHI_COLOR_LT_GREEN = "#81c784";
     static constexpr const char *GEPHI_COLOR_GREY = "#808080";
@@ -1468,16 +1467,29 @@ public:
     std::string get_unit_color(const UnitState &unit) const
     {
         time_t now = time(NULL);
-        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
+        time_t idle_threshold_6hr = now - (6 * 3600);   // 6 hours
+        time_t idle_threshold_12hr = now - (12 * 3600); // 12 hours
 
-        // Grey if deregistered OR idle
-        if (!unit.registered || unit.last_active < idle_threshold)
+        // Grey if deregistered
+        if (!unit.registered)
         {
-            //return GEPHI_COLOR_GREY;
+            return GEPHI_COLOR_GREY;
+        }
+        // Extra light color if idle > 12 hours
+        else if (unit.last_active < idle_threshold_12hr)
+        {
+            return unit.encr_seen ? GEPHI_COLOR_XLT_RED : GEPHI_COLOR_XLT_BLUE;
+        }
+        // Light color if idle 6-12 hours
+        else if (unit.last_active < idle_threshold_6hr)
+        {
             return unit.encr_seen ? GEPHI_COLOR_LT_RED : GEPHI_COLOR_LT_BLUE;
         }
-
-        return unit.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
+        // Regular color if active < 6 hours
+        else
+        {
+            return unit.encr_seen ? GEPHI_COLOR_RED : GEPHI_COLOR_BLUE;
+        }
     }
     
     std::string get_talkgroup_color(const TalkgroupState &tg) const
@@ -1495,7 +1507,8 @@ public:
     }
 
     /// Get status string for a unit based on its state
-    /// Returns: "active" (recently active), "idle" (inactive but registered), or "off" (deregistered)
+    /// Returns: "u_active" (<6hr), "u_idle6" (6-12hr), "u_idle12" (>12hr), "u_off" (deregistered)
+    /// Encrypted variants: "u_enc_active", "u_enc_idle6", "u_enc_idle12", "u_enc_off"
     std::string get_unit_status(System *sys, long unit_id) const
     {
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
@@ -1515,7 +1528,8 @@ public:
 
         const UnitState &unit = it->second;
         time_t now = time(NULL);
-        time_t idle_threshold = now - (affiliation_timeout_ * 3600);
+        time_t idle_threshold_6hr = now - (6 * 3600);   // 6 hours
+        time_t idle_threshold_12hr = now - (12 * 3600); // 12 hours
         bool encrypted = unit.encr_seen;
 
         // Off: deregistered units
@@ -1523,12 +1537,17 @@ public:
         {
             return encrypted ? "u_enc_off" : "u_off";
         }
-        // Idle: registered but no recent activity
-        else if (unit.last_active < idle_threshold)
+        // Idle 12+: registered but no activity for 12+ hours
+        else if (unit.last_active < idle_threshold_12hr)
         {
-            return encrypted ? "u_enc_idle" : "u_idle";
+            return encrypted ? "u_enc_idle12" : "u_idle12";
         }
-        // Active: recent activity within timeout window
+        // Idle 6-12: registered but no activity for 6-12 hours
+        else if (unit.last_active < idle_threshold_6hr)
+        {
+            return encrypted ? "u_enc_idle6" : "u_idle6";
+        }
+        // Active: recent activity within 6 hours
         else
         {
             return encrypted ? "u_enc_active" : "u_active";

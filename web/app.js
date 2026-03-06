@@ -170,6 +170,9 @@ async function getCurrentAuthLevel() {
             } else if (data.auth_level === 'info') {
                 // Legacy compatibility
                 return { level: 'info', label: 'Read-Only', username: data.username };
+            } else if (data.auth_level === 'anonymous') {
+                // Open access - no credentials configured, no logout needed
+                return { level: 'anonymous', label: 'Anonymous', username: '' };
             }
         }
     } catch (err) {
@@ -227,7 +230,13 @@ async function updateAuthDisplay() {
     const authLevelEl = document.getElementById('authLevel');
     const logoutBtn = document.getElementById('logoutBtn');
     
-    if (authInfo.level !== 'none') {
+    if (authInfo.level === 'anonymous') {
+        // Open access — no credentials configured, no badge or logout button needed
+        authLevelEl.innerHTML = '';
+        authLevelEl.style.display = 'none';
+        logoutBtn.style.display = 'none';
+        return true; // Can access site, no login required
+    } else if (authInfo.level !== 'none') {
         const displayLabel = authInfo.username ? `${authInfo.label} (${authInfo.username})` : authInfo.label;
         authLevelEl.innerHTML = `<span class="badge badge-${authInfo.level}">${displayLabel}</span>`;
         authLevelEl.style.display = 'inline';
@@ -265,6 +274,10 @@ async function handleLogin(event) {
             if (data.token) {
                 localStorage.setItem('session_token', data.token);
             }
+            // If login was triggered by admin tab gate, navigate there after reload
+            if (pendingAdminAccess) {
+                localStorage.setItem('postLoginTab', 'admin');
+            }
             // Hide modal and reload to initialize authenticated state
             document.getElementById('loginModal').style.display = 'none';
             window.location.reload();
@@ -280,13 +293,32 @@ async function handleLogin(event) {
     }
 }
 
-function showLoginModal() {
+function showLoginModal(fromAdminGate = false) {
+    pendingAdminAccess = fromAdminGate;
     const modal = document.getElementById('loginModal');
     modal.style.display = 'flex';
+    // Update title and cancel button visibility
+    const title = document.getElementById('loginModalTitle');
+    if (title) title.textContent = fromAdminGate ? 'Admin Login Required' : 'Login Required';
+    const dismissBtn = document.getElementById('loginDismissBtn');
+    if (dismissBtn) dismissBtn.style.display = fromAdminGate ? 'block' : 'none';
+    const cancelBtn = document.getElementById('loginCancelBtn');
+    if (cancelBtn) cancelBtn.style.display = fromAdminGate ? 'block' : 'none';
     // Clear previous error
     document.getElementById('loginError').style.display = 'none';
     // Focus username field
     setTimeout(() => document.getElementById('loginUsername').focus(), 100);
+}
+
+function dismissLoginModal() {
+    document.getElementById('loginModal').style.display = 'none';
+    document.getElementById('loginError').style.display = 'none';
+    document.getElementById('loginUsername').value = '';
+    document.getElementById('loginPassword').value = '';
+    if (pendingAdminAccess) {
+        pendingAdminAccess = false;
+        _activateMainTab(previousTab);
+    }
 }
 
 async function checkAuthAndShowLogin() {
@@ -316,6 +348,10 @@ function getChartPalette() {
         cssVar('--accent-pink', '#e94560')
     ];
 }
+
+// Login modal context
+let previousTab = 'status';       // Tab to return to when login modal is cancelled
+let pendingAdminAccess = false;   // Login was triggered by admin tab gate
 
 // SSE connection
 let eventSource = null;
@@ -401,6 +437,7 @@ function connect() {
             const authInfo = await getCurrentAuthLevel();
             if (authInfo.level === 'none') {
                 // Not authenticated anymore - show login modal instead of reconnecting
+                // (anonymous access is level 'anonymous', not 'none', so it won't trigger this)
                 console.log('SSE disconnected: not authenticated');
                 await updateAuthDisplay();
                 showLoginModal();
@@ -1439,14 +1476,38 @@ function loadSystemData(index, type) {
 }
 
 // Main tab navigation
+// Public entry point - gates admin tab with auth check
 function showMainTab(tabName) {
+    if (tabName === 'admin') {
+        // Track current tab so we can return on cancel
+        const curActive = document.querySelector('.main-tab.active');
+        previousTab = curActive ? curActive.dataset.tab : 'status';
+        _checkAdminAndActivate();
+        return;
+    }
+    _activateMainTab(tabName);
+}
+
+// Gate: check admin auth before activating admin tab
+async function _checkAdminAndActivate() {
+    const authInfo = await getCurrentAuthLevel();
+    if (authInfo.level === 'admin') {
+        _activateMainTab('admin');
+    } else {
+        // Not admin - show login modal with cancel button
+        showLoginModal(true);
+    }
+}
+
+// Internal: actually switch the tab without auth gating
+function _activateMainTab(tabName) {
     document.querySelectorAll('.main-tab').forEach(t => {
         t.classList.toggle('active', t.dataset.tab === tabName);
     });
     document.querySelectorAll('.main-panel').forEach(p => {
         p.classList.toggle('active', p.id === 'panel-' + tabName);
     });
-    
+
     if (tabName === 'status') {
         updateChart();
         updateCallRateChart();
@@ -2580,7 +2641,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     
     connect();
-    
+
+    // If login was triggered by admin tab access, navigate there after reload
+    const postLoginTab = localStorage.getItem('postLoginTab');
+    if (postLoginTab) {
+        localStorage.removeItem('postLoginTab');
+        setTimeout(() => showMainTab(postLoginTab), 600);
+    }
+
+    // Allow ESC to dismiss cancellable login modal
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && pendingAdminAccess) {
+            dismissLoginModal();
+        }
+    });
+
     // Fetch initial data
     authenticatedFetch(`${BASE_PATH}api/status`)
         .then(r => r.json())
@@ -2710,8 +2785,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }, 15000);
     
-    // Load admin data when admin tab is shown
+    // Expose tab functions globally
     window.showMainTab = showMainTab;
+    window.dismissLoginModal = dismissLoginModal;
 });
 
 // Omnitrunker Functions

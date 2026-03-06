@@ -11,8 +11,9 @@
 <body>
     <!-- Login Modal -->
     <div id="loginModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 9999; align-items: center; justify-content: center;">
-        <div style="background: var(--bg-secondary, #2a2a2a); padding: 30px; border-radius: 8px; max-width: 400px; width: 90%; box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
-            <h2 style="margin-top: 0; color: var(--text-primary, #fff);">Login Required</h2>
+        <div style="background: var(--bg-secondary, #2a2a2a); padding: 30px; border-radius: 8px; max-width: 400px; width: 90%; box-shadow: 0 4px 20px rgba(0,0,0,0.5); position: relative;">
+            <button id="loginDismissBtn" onclick="dismissLoginModal()" style="display: none; position: absolute; top: 12px; right: 14px; background: none; border: none; color: var(--text-secondary, #aaa); font-size: 20px; cursor: pointer; line-height: 1;" title="Cancel">&times;</button>
+            <h2 id="loginModalTitle" style="margin-top: 0; color: var(--text-primary, #fff);">Login Required</h2>
             <form id="loginForm" onsubmit="handleLogin(event)">
                 <div style="margin-bottom: 15px;">
                     <label for="loginUsername" style="display: block; margin-bottom: 5px; color: var(--text-primary, #fff);">Username:</label>
@@ -27,6 +28,9 @@
                 <div id="loginError" style="display: none; color: #ff4444; margin-bottom: 15px; padding: 8px; background: rgba(255,68,68,0.1); border-radius: 4px;"></div>
                 <button type="submit" style="width: 100%; padding: 10px; background: var(--accent, #00b4d8); color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: bold;">
                     Login
+                </button>
+                <button id="loginCancelBtn" type="button" onclick="dismissLoginModal()" style="display: none; width: 100%; margin-top: 10px; padding: 8px; background: none; border: 1px solid var(--border-color, #444); color: var(--text-secondary, #aaa); border-radius: 4px; cursor: pointer; font-size: 13px;">
+                    Cancel
                 </button>
             </form>
         </div>

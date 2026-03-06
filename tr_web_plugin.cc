@@ -3488,9 +3488,11 @@ private:
       }
 
       bool is_admin = false;
+      bool identity_resolved = false;
       if (!token.empty() && get_session_info(token, username, is_admin)) {
         // Got session info
         auth_level = is_admin ? "admin" : "user";
+        identity_resolved = true;
       } else {
         // Fall back to Basic Auth parsing
         auth_header = req.get_header("Authorization");
@@ -3499,12 +3501,19 @@ private:
           if (!expected_admin_creds_.empty() && constant_time_compare(provided_creds, expected_admin_creds_)) {
             auth_level = "admin";
             username = admin_username_.empty() ? "admin" : admin_username_;
+            identity_resolved = true;
           } else if (!expected_user_creds_.empty() && constant_time_compare(provided_creds, expected_user_creds_)) {
             // No admin creds configured: user credentials are de-facto admin
             auth_level = expected_admin_creds_.empty() ? "admin" : "user";
             username = username_.empty() ? "user" : username_;
+            identity_resolved = true;
           }
         }
+      }
+
+      // No identity resolved → open/anonymous access (no credentials configured)
+      if (!identity_resolved) {
+        auth_level = "anonymous";
       }
 
       json response = {

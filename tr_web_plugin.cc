@@ -3594,49 +3594,8 @@ private:
     {
         json devices_json = json::array();
 
-        const json *cfg_sources = nullptr;
-        if (tr_config_json_.is_object() && tr_config_json_.contains("sources") && tr_config_json_["sources"].is_array())
-        {
-            cfg_sources = &tr_config_json_["sources"];
-        }
-
         for (auto *source : tr_sources_)
         {
-            const int src_num = source->get_num();
-            const json *cfg = nullptr;
-            if (cfg_sources && src_num >= 0 && static_cast<size_t>(src_num) < cfg_sources->size())
-            {
-                const json &maybe = (*cfg_sources)[static_cast<size_t>(src_num)];
-                if (maybe.is_object())
-                    cfg = &maybe;
-            }
-
-            auto cfg_str = [&](const char *key, const std::string &fallback) -> std::string
-            {
-                try
-                {
-                    if (cfg && cfg->contains(key) && (*cfg)[key].is_string())
-                        return (*cfg)[key].get<std::string>();
-                }
-                catch (...)
-                {
-                }
-                return fallback;
-            };
-
-            auto cfg_dbl = [&](const char *key, double fallback) -> double
-            {
-                try
-                {
-                    if (cfg && cfg->contains(key) && (*cfg)[key].is_number())
-                        return (*cfg)[key].get<double>();
-                }
-                catch (...)
-                {
-                }
-                return fallback;
-            };
-
             json gain_stages = json::array();
             for (const auto &stage : source->get_gain_stages())
             {
@@ -3646,13 +3605,13 @@ private:
                                        {"value", stage.value}});
             }
 
-            devices_json.push_back({{"src_num", src_num},
-                                    {"driver", cfg_str("driver", source->get_driver())},
-                                    {"device", cfg_str("device", source->get_device())},
-                                    {"center", cfg_dbl("center", source->get_center())},
-                                    {"rate", cfg_dbl("rate", source->get_rate())},
-                                    {"error", cfg_dbl("error", source->get_error())},
-                                    {"gain", cfg_dbl("gain", source->get_gain())},
+            devices_json.push_back({{"src_num", source->get_num()},
+                                    {"driver", source->get_driver()},
+                                    {"device", source->get_device()},
+                                    {"center", source->get_center()},
+                                    {"rate", source->get_rate()},
+                                    {"error", source->get_error()},
+                                    {"gain", source->get_gain()},
                                     {"digital_recorders", source->digital_recorder_count()},
                                     {"analog_recorders", source->analog_recorder_count()},
                                     {"autotune_enabled", source->get_autotune_source()},

@@ -1143,10 +1143,26 @@ public:
     // Helper: Check if request has valid authentication
     bool check_auth(const httplib::Request &req, bool require_admin = false) const
     {
-        // If no auth configured, allow access
-        if (username_.empty() || password_.empty())
+        // Auth bypass rules:
+        // - Read-only endpoints: bypass only if no user credentials are set
+        //   (admin-only config → read-only is anonymous)
+        // - Admin endpoints: bypass only if neither admin nor user credentials are set
+        //   (user-only config → admin gates on user credentials as fallback)
+        if (require_admin)
         {
-            return true;
+            // No credentials at all → fully open
+            if (expected_admin_creds_.empty() && expected_user_creds_.empty())
+            {
+                return true;
+            }
+        }
+        else
+        {
+            // No user creds set → read-only is open to anonymous
+            if (expected_user_creds_.empty())
+            {
+                return true;
+            }
         }
 
         // Extract client IP for rate limiting and logging
@@ -1206,14 +1222,23 @@ public:
         bool auth_success = false;
         if (require_admin)
         {
-            // Admin endpoints require admin credentials
-            auth_success = !expected_admin_creds_.empty() &&
-                           constant_time_compare(provided_creds, expected_admin_creds_);
+            if (!expected_admin_creds_.empty())
+            {
+                // Admin creds configured: require them
+                auth_success = constant_time_compare(provided_creds, expected_admin_creds_);
+            }
+            else
+            {
+                // No admin creds: fall back to user credentials
+                auth_success = !expected_user_creds_.empty() &&
+                               constant_time_compare(provided_creds, expected_user_creds_);
+            }
         }
         else
         {
             // Regular endpoints accept either user or admin credentials
-            auth_success = constant_time_compare(provided_creds, expected_user_creds_) ||
+            auth_success = (!expected_user_creds_.empty() &&
+                            constant_time_compare(provided_creds, expected_user_creds_)) ||
                            (!expected_admin_creds_.empty() &&
                             constant_time_compare(provided_creds, expected_admin_creds_));
         }
@@ -2996,12 +3021,13 @@ private:
         bool is_admin = false;
         bool auth_success = false;
 
-        if (constant_time_compare(provided_creds, expected_admin_creds_)) {
+        if (!expected_admin_creds_.empty() && constant_time_compare(provided_creds, expected_admin_creds_)) {
           auth_success = true;
           is_admin = true;
-        } else if (constant_time_compare(provided_creds, expected_user_creds_)) {
+        } else if (!expected_user_creds_.empty() && constant_time_compare(provided_creds, expected_user_creds_)) {
           auth_success = true;
-          is_admin = false;
+          // No admin creds configured: user credentials are de-facto admin
+          is_admin = expected_admin_creds_.empty();
         }
 
         if (!auth_success) {
@@ -3474,7 +3500,8 @@ private:
             auth_level = "admin";
             username = admin_username_.empty() ? "admin" : admin_username_;
           } else if (!expected_user_creds_.empty() && constant_time_compare(provided_creds, expected_user_creds_)) {
-            auth_level = "user";
+            // No admin creds configured: user credentials are de-facto admin
+            auth_level = expected_admin_creds_.empty() ? "admin" : "user";
             username = username_.empty() ? "user" : username_;
           }
         }

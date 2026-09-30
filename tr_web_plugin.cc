@@ -29,6 +29,7 @@
 #include <boost/log/sinks/sync_frontend.hpp>
 #include <boost/log/sinks/text_ostream_backend.hpp>
 #include <boost/log/trivial.hpp>
+#include <openssl/rand.h>
 
 // Plugin headers
 #include "httplib.h"
@@ -51,18 +52,28 @@ class Tr_Web : public Plugin_Api
     std::thread server_thread_;
     std::thread broadcast_thread_;
     std::atomic<bool> running_;
+    bool started_ = false;
+    std::atomic<bool> stopped_{false};
+    boost::shared_ptr<logging::sinks::sink> web_sink_;
 
     // ============================================================================
     // WEB-RELATED CODE
     // ============================================================================
 
-    // Console log buffer
+    // Console log buffer. Every line carries a sequence number so a client that loaded the
+    // history from /api/status can skip streamed lines it already has.
+    struct ConsoleLine
+    {
+        uint64_t seq;
+        std::string text;
+    };
     mutable std::mutex console_mutex_;
-    std::deque<std::string> console_logs_;
+    std::deque<ConsoleLine> console_logs_;
+    uint64_t console_seq_ = 0;
 
     // Pending console lines for SSE (bounded, flushed from broadcast thread)
     mutable std::mutex console_pending_mutex_;
-    std::deque<std::string> console_pending_;
+    std::deque<ConsoleLine> console_pending_;
     size_t console_pending_dropped_ = 0;
 
     // Discrete SSE events that should be delivered even if the periodic snapshots miss them
@@ -93,22 +104,22 @@ class Tr_Web : public Plugin_Api
         static constexpr size_t MAX_CONSOLE_LINE_BYTES = 4096;
         if (timestamped_line.size() > MAX_CONSOLE_LINE_BYTES)
         {
-            timestamped_line.resize(MAX_CONSOLE_LINE_BYTES);
+            // Back up to a UTF-8 character boundary so the cut never leaves a partial sequence
+            size_t cut = MAX_CONSOLE_LINE_BYTES;
+            while (cut > 0 && (static_cast<unsigned char>(timestamped_line[cut]) & 0xC0) == 0x80)
+            {
+                --cut;
+            }
+            timestamped_line.resize(cut);
             timestamped_line += "…(truncated)";
         }
 
+        // Lock order: console_mutex_ then console_pending_mutex_, so pending lines stay in
+        // sequence order. Queued for the broadcast thread; never write sockets from here.
+        std::lock_guard<std::mutex> lock(console_mutex_);
+        ConsoleLine entry{++console_seq_, std::move(timestamped_line)};
         {
-            std::lock_guard<std::mutex> lock(console_mutex_);
-            console_logs_.push_back(timestamped_line);
-            while (console_logs_.size() > console_max_lines_)
-            {
-                console_logs_.pop_front();
-            }
-        }
-
-        // Queue for SSE broadcast (do not write sockets from trunk-recorder threads)
-        {
-            std::lock_guard<std::mutex> lock(console_pending_mutex_);
+            std::lock_guard<std::mutex> pending_lock(console_pending_mutex_);
             static constexpr size_t MAX_PENDING = 2000;
             if (console_pending_.size() >= MAX_PENDING)
             {
@@ -116,24 +127,34 @@ class Tr_Web : public Plugin_Api
             }
             else
             {
-                console_pending_.push_back(timestamped_line);
+                console_pending_.push_back(entry);
             }
+        }
+        console_logs_.push_back(std::move(entry));
+        while (console_logs_.size() > console_max_lines_)
+        {
+            console_logs_.pop_front();
         }
     }
 
-    json get_console_logs() const
+    // Returns the buffered console lines; *last_seq receives the sequence number of the newest
+    json get_console_logs(uint64_t *last_seq = nullptr) const
     {
         // Copy data while holding lock, build JSON after releasing
-        std::deque<std::string> logs_copy;
+        std::deque<ConsoleLine> logs_copy;
         {
             std::lock_guard<std::mutex> lock(console_mutex_);
             logs_copy = console_logs_;
+            if (last_seq)
+            {
+                *last_seq = console_seq_;
+            }
         }
         
         json logs = json::array();
         for (const auto &line : logs_copy)
         {
-            logs.push_back(line);
+            logs.push_back(line.text);
         }
         return logs;
     }
@@ -219,6 +240,11 @@ class Tr_Web : public Plugin_Api
     std::string theme_ = "nostromo";
     std::string log_prefix_;
     size_t console_max_lines_ = 5000;
+    int max_connections_ = 64;
+
+    // Reverse proxies whose X-Forwarded-For / X-Real-IP headers are believed.
+    // From any other peer these headers are client-controlled and ignored.
+    std::vector<std::string> trusted_proxies_ = {"127.0.0.1"};
 
     // Pre-computed credentials for constant-time comparison
     std::string expected_user_creds_;
@@ -267,6 +293,13 @@ class Tr_Web : public Plugin_Api
 
     // Parsed trunk-recorder config.json (best-effort)
     json tr_config_json_;
+
+    // Serialized /api/system/* responses per sys_num (see snapshot_system_data())
+    mutable std::mutex system_data_mutex_;
+    std::map<int, std::string> talkgroups_json_;
+    std::map<int, std::string> unit_tags_json_;
+    std::map<int, std::string> ota_json_;
+    time_t last_ota_snapshot_ = 0;
 
     // Rate history per system (keeps 60 minutes of data)
     std::map<std::string, std::deque<RatePoint>> rate_history_;
@@ -365,10 +398,12 @@ class Tr_Web : public Plugin_Api
         DIRTY_CALLS = 1u << 2,
         DIRTY_RATES = 1u << 3,
         DIRTY_TRUNK_MESSAGES = 1u << 4,
-        DIRTY_DEVICES = 1u << 4
+        DIRTY_DEVICES = 1u << 5
     };
 
-    void enqueue_sse_event(const std::string &event, std::string data)
+    // Takes the payload unserialized so the no-clients case costs nothing: these calls run on
+    // trunk-recorder's thread for every grant, affiliation and registration
+    void enqueue_sse_event(const std::string &event, const json &payload)
     {
         // Only enqueue if there are connected SSE clients
         if (server_.sse_client_count() == 0)
@@ -376,6 +411,7 @@ class Tr_Web : public Plugin_Api
             return;
         }
 
+        std::string data = payload.dump(-1, ' ', false, json::error_handler_t::replace);
         std::lock_guard<std::mutex> lock(event_queue_mutex_);
         static constexpr size_t MAX_EVENTS = 2000;
         if (event_queue_.size() >= MAX_EVENTS)
@@ -414,10 +450,13 @@ class Tr_Web : public Plugin_Api
         gephi_initial_dump_pending_.store(true, std::memory_order_release);
     }
 
-    // Send current affiliation state to newly connected Gephi clients
-    void send_gephi_initial_state()
+    // Build the current affiliation graph for newly connected Gephi clients. The caller sends
+    // it after this returns, so no socket write happens while affiliation_state_mutex_ (which
+    // trunk-recorder's threads take on every grant) is held.
+    std::string build_gephi_initial_state()
     {
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+        std::string out;
 
         int node_count = 0;
         int edge_count = 0;
@@ -554,7 +593,7 @@ class Tr_Web : public Plugin_Api
         if (!all_nodes.empty())
         {
             json an_msg = {{"an", all_nodes}};
-            server_.broadcast_raw_to_path("/graph-stream", an_msg.dump(-1) + "\r\n");
+            out += an_msg.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n";
         }
 
         // Gather all edges with status-based coloring
@@ -605,10 +644,11 @@ class Tr_Web : public Plugin_Api
         if (!all_edges.empty())
         {
             json ae_msg = {{"ae", all_edges}};
-            server_.broadcast_raw_to_path("/graph-stream", ae_msg.dump(-1) + "\r\n");
+            out += ae_msg.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n";
         }
 
-        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Sent " << node_count << " nodes and " << edge_count << " edges to new Gephi connection";
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Sending " << node_count << " nodes and " << edge_count << " edges to new Gephi connection";
+        return out;
     }
 
     // Gephi streaming helper functions
@@ -627,7 +667,7 @@ class Tr_Web : public Plugin_Api
             {"size", 15}};
 
         json add_node = {{"an", {{node_id, node_data}}}};
-        return add_node.dump(-1) + "\r\n";
+        return add_node.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n";
     }
 
     std::string create_gephi_change_unit_node(System *sys, long unit_id, const std::string &unit_alpha, bool encrypted)
@@ -645,7 +685,7 @@ class Tr_Web : public Plugin_Api
             {"size", 15}};
 
         json change_node = {{"cn", {{node_id, node_data}}}};
-        return change_node.dump(-1) + "\r\n";
+        return change_node.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n";
     }
 
     std::string create_gephi_add_talkgroup_node(System *sys, long tg_id, const std::string &tg_alpha, bool encrypted)
@@ -664,7 +704,7 @@ class Tr_Web : public Plugin_Api
             {"size", 30}};
 
         json add_node = {{"an", {{node_id, node_data}}}};
-        return add_node.dump(-1) + "\r\n";
+        return add_node.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n";
     }
 
     std::string create_gephi_change_talkgroup_node(System *sys, long tg_id, const std::string &tg_alpha, bool encrypted)
@@ -683,7 +723,7 @@ class Tr_Web : public Plugin_Api
             {"size", 30}};
 
         json change_node = {{"cn", {{node_id, node_data}}}};
-        return change_node.dump(-1) + "\r\n";
+        return change_node.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n";
     }
 
     std::string create_gephi_add_edge(long unit_id, long tg_id, const std::string &status, const std::string &color)
@@ -700,7 +740,7 @@ class Tr_Web : public Plugin_Api
             {"status", status}};
 
         json add_edge = {{"ae", {{edge_id, edge_data}}}};
-        return add_edge.dump(-1) + "\r\n";
+        return add_edge.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n";
     }
 
     std::string create_gephi_change_edge(long unit_id, long tg_id, const std::string &status, const std::string &color)
@@ -717,7 +757,7 @@ class Tr_Web : public Plugin_Api
             {"status", status}};
 
         json change_edge = {{"ce", {{edge_id, edge_data}}}};
-        return change_edge.dump(-1) + "\r\n";
+        return change_edge.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n";
     }
 
     void send_gephi_unit_tg_event(System *sys, long unit_id, long tg_id, bool encrypted = false)
@@ -726,6 +766,13 @@ class Tr_Web : public Plugin_Api
         // -1 indicates unknown/invalid radio ID
         // 0 indicates uninitialized or missing unit/talkgroup ID
         if (unit_id == -1 || unit_id == 0 || tg_id == 0 || tg_id == -1)
+        {
+            return;
+        }
+
+        // Nothing to do without a /graph-stream client (a client that connects later gets the
+        // full initial state). Checked first: this runs on trunk-recorder's thread per event.
+        if (server_.raw_stream_client_count() == 0)
         {
             return;
         }
@@ -766,6 +813,13 @@ class Tr_Web : public Plugin_Api
     {
         // Filter out anomalous IDs that are not valid for graph theory
         if (unit_id == -1 || unit_id == 0)
+        {
+            return;
+        }
+
+        // Nothing to do without a /graph-stream client (a client that connects later gets the
+        // full initial state). Checked first: this runs on trunk-recorder's thread per event.
+        if (server_.raw_stream_client_count() == 0)
         {
             return;
         }
@@ -847,6 +901,13 @@ class Tr_Web : public Plugin_Api
         {6, "STOPPED"},
         {7, "AVAILABLE"},
         {8, "IGNORE"}};
+
+    // Lookup without inserting (operator[] would add an empty entry for every unknown state)
+    std::string state_name(int state) const
+    {
+        auto it = tr_state_.find(state);
+        return it != tr_state_.end() ? it->second : "";
+    }
 
     // Message type mappings for trunk messages
     std::map<short, std::string> message_type_ = {
@@ -1093,16 +1154,38 @@ public:
         return result == 0;
     }
 
+    // Helper: Resolve the client address used for rate limiting and login history.
+    // Uses the TCP peer address; proxy headers are honoured only when the peer is a trusted proxy.
+    std::string get_client_ip(const httplib::Request &req) const
+    {
+        const std::string &peer = req.remote_addr;
+        if (std::find(trusted_proxies_.begin(), trusted_proxies_.end(), peer) == trusted_proxies_.end())
+        {
+            return peer;
+        }
+
+        // X-Forwarded-For is "client, proxy1, proxy2"; the right-most entry was appended by
+        // the trusted proxy itself, so it is the only one the client cannot forge.
+        std::string xff = req.get_header("X-Forwarded-For");
+        if (!xff.empty())
+        {
+            size_t comma = xff.rfind(',');
+            std::string last = (comma == std::string::npos) ? xff : xff.substr(comma + 1);
+            size_t first = last.find_first_not_of(" \t");
+            size_t end = last.find_last_not_of(" \t");
+            if (first != std::string::npos)
+            {
+                return last.substr(first, end - first + 1);
+            }
+        }
+
+        std::string real_ip = req.get_header("X-Real-IP");
+        return real_ip.empty() ? peer : real_ip;
+    }
+
     // Helper: Check if IP is rate limited
     bool is_rate_limited(const std::string &client_ip) const
     {
-        // Don't rate limit "unknown" IPs (typically localhost without proxy headers)
-        // This allows local testing and direct connections to work
-        if (client_ip == "unknown")
-        {
-            return false;
-        }
-        
         std::lock_guard<std::mutex> lock(auth_rate_limit_mutex_);
         auto it = auth_attempts_.find(client_ip);
         if (it == auth_attempts_.end())
@@ -1140,6 +1223,24 @@ public:
         attempts.push_back(now);
     }
 
+    // Helper: Drop rate-limit entries with no attempts inside the window (bounds memory)
+    void prune_auth_attempts()
+    {
+        std::lock_guard<std::mutex> lock(auth_rate_limit_mutex_);
+        time_t now = time(NULL);
+        for (auto it = auth_attempts_.begin(); it != auth_attempts_.end();)
+        {
+            if (it->second.empty() || now - it->second.back() >= AUTH_WINDOW_SECONDS)
+            {
+                it = auth_attempts_.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
     // Helper: Check if request has valid authentication
     bool check_auth(const httplib::Request &req, bool require_admin = false) const
     {
@@ -1166,20 +1267,7 @@ public:
         }
 
         // Extract client IP for rate limiting and logging
-        std::string client_ip = "unknown";
-        auto remote_addr = req.headers.find("X-Forwarded-For");
-        if (remote_addr != req.headers.end())
-        {
-            client_ip = remote_addr->second;
-        }
-        else
-        {
-            remote_addr = req.headers.find("X-Real-IP");
-            if (remote_addr != req.headers.end())
-            {
-                client_ip = remote_addr->second;
-            }
-        }
+        std::string client_ip = get_client_ip(req);
 
         // Check rate limiting
         if (is_rate_limited(client_ip))
@@ -1258,12 +1346,21 @@ public:
     // SESSION MANAGEMENT
     // ============================================================================
 
-    /// Generate a random session token
+    /// Generate a random session token (256 bits from the OpenSSL CSPRNG, hex encoded)
     std::string generate_session_token() const
     {
-        std::stringstream ss;
-        ss << std::hex << time(NULL) << "-" << rand() << "-" << rand();
-        return httplib::base64_encode(ss.str());
+        unsigned char bytes[32];
+        if (RAND_bytes(bytes, sizeof(bytes)) != 1)
+        {
+            throw std::runtime_error("RAND_bytes failed");
+        }
+        std::ostringstream ss;
+        ss << std::hex << std::setfill('0');
+        for (unsigned char b : bytes)
+        {
+            ss << std::setw(2) << static_cast<int>(b);
+        }
+        return ss.str();
     }
 
     /// Create a new session for a user
@@ -1656,28 +1753,46 @@ public:
     }
 
     // Get affiliation data for API
-    json get_affiliation_data(int limit = 0, bool units_only = false, bool talkgroups_only = false) const
+    // since > 0 returns only units/talkgroups whose last_active is at or after `since` (every
+    // state change updates last_active). Clients pass back `server_time` from the previous
+    // response, so their own clock never matters; records touched in that same second are
+    // simply sent again.
+    json get_affiliation_data(int limit = 0, bool units_only = false, bool talkgroups_only = false, time_t since = 0) const
     {
-        // Copy data while holding lock, build JSON after releasing
+        // Copy data while holding lock, build JSON after releasing. The lock is shared with
+        // trunk-recorder's thread, so a delta request copies only the changed entries.
         std::map<std::string, UnitState> units_copy;
         std::map<std::string, TalkgroupState> talkgroups_copy;
         size_t total_units, total_talkgroups;
         int timeout_hours;
+        time_t now;
         
         {
             std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
+            now = time(NULL);
             if (!talkgroups_only) {
-                units_copy = unit_states_;
+                if (since > 0) {
+                    for (const auto &entry : unit_states_)
+                        if (entry.second.last_active >= since)
+                            units_copy.insert(entry);
+                } else {
+                    units_copy = unit_states_;
+                }
             }
             if (!units_only) {
-                talkgroups_copy = talkgroup_states_;
+                if (since > 0) {
+                    for (const auto &entry : talkgroup_states_)
+                        if (entry.second.last_active >= since)
+                            talkgroups_copy.insert(entry);
+                } else {
+                    talkgroups_copy = talkgroup_states_;
+                }
             }
             total_units = unit_states_.size();
             total_talkgroups = talkgroup_states_.size();
             timeout_hours = affiliation_timeout_;
         }
         
-        time_t now = time(NULL);
         time_t idle_threshold = now - (timeout_hours * 3600);
 
         // Compact array-based format to reduce payload size
@@ -1689,7 +1804,9 @@ public:
             {"talkgroups", json::array()},
             {"config", {{"timeout_hours", timeout_hours}}},
             {"total_units", total_units},
-            {"total_talkgroups", total_talkgroups}};
+            {"total_talkgroups", total_talkgroups},
+            {"server_time", now},
+            {"delta", since > 0}};
 
         if (!talkgroups_only)
         {
@@ -1836,7 +1953,7 @@ public:
                 BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Failed to open " << temp_file << " for writing";
                 return;
             }
-            out << persist_data.dump(2); // Pretty print with 2-space indent
+            out << persist_data.dump(2, ' ', false, json::error_handler_t::replace); // Pretty print with 2-space indent
             out.close();
 
             // Atomic rename
@@ -2144,6 +2261,18 @@ public:
         ssl_key_ = config_data.value("ssl_key", "");
         console_max_lines_ = config_data.value("console_lines", 5000);
         theme_ = config_data.value("theme", "nostromo");
+        max_connections_ = config_data.value("max_connections", 64);
+        if (config_data.contains("trusted_proxies") && config_data["trusted_proxies"].is_array())
+        {
+            trusted_proxies_.clear();
+            for (const auto &proxy : config_data["trusted_proxies"])
+            {
+                if (proxy.is_string())
+                {
+                    trusted_proxies_.push_back(proxy.get<std::string>());
+                }
+            }
+        }
 
         // Pre-compute credentials for constant-time comparison
         if (!username_.empty() && !password_.empty())
@@ -2166,10 +2295,23 @@ public:
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Admin Auth:     " << (admin_username_.empty() ? "[disabled]" : "[enabled]");
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "HTTPS:          " << (ssl_cert_.empty() ? "[disabled]" : "[enabled]");
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Console Lines:  " << console_max_lines_;
+        BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Connections:    " << max_connections_;
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Theme:          " << theme_;
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Cache:    " << (affiliation_cache_.empty() ? "[disabled]" : affiliation_cache_);
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Timeout:  " << affiliation_timeout_ << "h";
         BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Affil Autosave: " << affiliation_autosave_ << "s";
+
+        if (expected_admin_creds_.empty())
+        {
+            if (expected_user_creds_.empty())
+            {
+                BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "No credentials configured: admin functions (config editor) are open to anyone who can reach " << bind_address_ << ":" << port_;
+            }
+            else
+            {
+                BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "No admin credentials configured: the info-level login also grants admin access (config editor)";
+            }
+        }
 
         return 0;
     }
@@ -2214,13 +2356,7 @@ public:
         // Setup routes first
         setup_routes();
 
-        // Configure httplib authentication (used as backup / for SSE endpoints)
-        // Admin credentials protect admin endpoints if plugin auth fails
-        if (!admin_username_.empty() && !admin_password_.empty())
-        {
-            server_.set_admin_auth(admin_username_, admin_password_);
-            BOOST_LOG_TRIVIAL(info) << log_prefix_ << "Configured httplib admin auth";
-        }
+        server_.set_max_connections(max_connections_);
 
         // Enable SSE authentication callback for /events and /graph-stream
         server_.set_sse_auth_callback([this](const httplib::Request &req) -> bool {
@@ -2251,11 +2387,15 @@ public:
 
         // Start server in background
         running_ = true;
+        started_ = true;
 
         // Broadcast thread (flushes SSE without blocking trunk-recorder)
         broadcast_thread_ = std::thread([this]()
                                         {
+      // Writes to TLS clients happen on this thread too
+      httplib::block_sigpipe_in_this_thread();
       auto last_console_flush = std::chrono::steady_clock::now();
+      size_t graph_dropped_unreported = 0;
 
       while (running_) {
         // Avoid work if nobody is connected.
@@ -2263,10 +2403,15 @@ public:
 
         // Flush console lines at ~5Hz, batched.
         const auto now = std::chrono::steady_clock::now();
-        if (has_clients && (now - last_console_flush) >= std::chrono::milliseconds(200)) {
+        if (!has_clients) {
+          // Nobody to deliver to; a new client loads the history from /api/status instead
+          std::lock_guard<std::mutex> lock(console_pending_mutex_);
+          console_pending_.clear();
+          console_pending_dropped_ = 0;
+        } else if ((now - last_console_flush) >= std::chrono::milliseconds(200)) {
           last_console_flush = now;
 
-          std::deque<std::string> lines;
+          std::deque<ConsoleLine> lines;
           size_t dropped = 0;
           {
             std::lock_guard<std::mutex> lock(console_pending_mutex_);
@@ -2279,10 +2424,13 @@ public:
             json payload;
             payload["type"] = "console_batch";
             payload["lines"] = json::array();
-            for (const auto &l : lines)
-              payload["lines"].push_back(l);
+            payload["seqs"] = json::array();
+            for (const auto &l : lines) {
+              payload["lines"].push_back(l.text);
+              payload["seqs"].push_back(l.seq);
+            }
             payload["dropped"] = dropped;
-            server_.broadcast_sse("console_batch", payload.dump(-1));
+            server_.broadcast_sse("console_batch", payload.dump(-1, ' ', false, json::error_handler_t::replace));
           }
         }
 
@@ -2307,23 +2455,23 @@ public:
 
             if (flags & DIRTY_SYSTEMS) {
               json payload = {{"type", "systems"}, {"systems", systems}};
-              server_.broadcast_sse("systems", payload.dump(-1));
+              server_.broadcast_sse("systems", payload.dump(-1, ' ', false, json::error_handler_t::replace));
             }
             if (flags & DIRTY_RECORDERS) {
               json payload = {{"type", "recorders"}, {"recorders", recorders}};
-              server_.broadcast_sse("recorders", payload.dump(-1));
+              server_.broadcast_sse("recorders", payload.dump(-1, ' ', false, json::error_handler_t::replace));
             }
             if (flags & DIRTY_CALLS) {
               json payload = {{"type", "calls"}, {"calls_active", calls}};
-              server_.broadcast_sse("calls", payload.dump(-1));
+              server_.broadcast_sse("calls", payload.dump(-1, ' ', false, json::error_handler_t::replace));
             }
             if (flags & DIRTY_RATES) {
               json payload = {{"type", "rates"}, {"rates", rates}};
-              server_.broadcast_sse("rates", payload.dump(-1));
+              server_.broadcast_sse("rates", payload.dump(-1, ' ', false, json::error_handler_t::replace));
             }
             if (flags & DIRTY_DEVICES) {
               json payload = {{"type", "devices"}, {"devices", devices}};
-              server_.broadcast_sse("devices", payload.dump(-1));
+              server_.broadcast_sse("devices", payload.dump(-1, ' ', false, json::error_handler_t::replace));
             }
           }
 
@@ -2348,7 +2496,7 @@ public:
           }
           if (dropped) {
             json payload = {{"type", "event_drop"}, {"dropped", dropped}};
-            server_.broadcast_sse("event_drop", payload.dump(-1));
+            server_.broadcast_sse("event_drop", payload.dump(-1, ' ', false, json::error_handler_t::replace));
           }
         }
 
@@ -2361,17 +2509,17 @@ public:
             graph_events.push_back(std::move(graph_event_queue_.front()));
             graph_event_queue_.pop_front();
           }
+          graph_dropped_unreported += graph_event_queue_dropped_;
           graph_event_queue_dropped_ = 0;
         }
 
-        // Send initial state to new Gephi connections
+        // Send initial state to new Gephi connections only (built under the state lock,
+        // written after releasing it)
         if (gephi_initial_dump_pending_.exchange(false, std::memory_order_acquire)) {
-          send_gephi_initial_state();
+          server_.send_raw_initial_state("/graph-stream", build_gephi_initial_state());
         }
 
         // Flush graph events to /graph-stream clients
-        if (!graph_events.empty()) {
-        }
         for (const auto &graph_event : graph_events) {
           server_.broadcast_raw_to_path("/graph-stream", graph_event);
         }
@@ -2390,7 +2538,12 @@ public:
         time_t session_check_time = time(NULL);
         if (session_check_time - last_session_cleanup >= 60) {
           cleanup_expired_sessions();
+          prune_auth_attempts();
           last_session_cleanup = session_check_time;
+          if (graph_dropped_unreported) {
+            BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Graph stream queue full: dropped " << graph_dropped_unreported << " events in the last minute";
+            graph_dropped_unreported = 0;
+          }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -2419,15 +2572,18 @@ public:
         return 0;
     }
 
+    // Safe to call more than once (trunk-recorder calls it, then the destructor does).
+    // Must not depend on running_: that is also cleared when listen() fails, and the threads
+    // still have to be joined or their destructors call std::terminate.
     int stop() override
     {
-        if (!running_)
+        if (!started_ || stopped_.exchange(true))
         {
-            return 0; // Already stopped, don't touch server or threads
+            return 0;
         }
         running_ = false;
 
-        // Stop the server first
+        // Stop the server first (also waits, bounded, for connection threads to finish)
         server_.stop();
 
         // Join threads
@@ -2440,6 +2596,13 @@ public:
             broadcast_thread_.join();
         }
 
+        // Detach the console capture: the sink refers to this object
+        if (web_sink_)
+        {
+            logging::core::get()->remove_sink(web_sink_);
+            web_sink_.reset();
+        }
+
         // Save affiliation state on shutdown
         save_affiliation_state();
 
@@ -2449,6 +2612,8 @@ public:
 
     int setup_systems(std::vector<System *> systems) override
     {
+        snapshot_system_data(true);
+
         json systems_json = json::array();
         for (auto *sys : systems)
         {
@@ -2462,6 +2627,23 @@ public:
 
         dirty_flags_.fetch_or(DIRTY_SYSTEMS);
 
+        return 0;
+    }
+
+    // Called continuously from trunk-recorder's main loop: keep it cheap
+    int poll_one() override
+    {
+        time_t now = time(NULL);
+        bool stale;
+        {
+            std::lock_guard<std::mutex> lock(system_data_mutex_);
+            stale = (now - last_ota_snapshot_ >= 10);
+        }
+        // OTA aliases only matter to someone looking at the dashboard
+        if (stale && server_.sse_client_count() > 0)
+        {
+            snapshot_system_data(false);
+        }
         return 0;
     }
 
@@ -2548,7 +2730,7 @@ public:
 
                         // Send synthetic call_end event to frontend
                         json payload = {{"type", "call_end"}, {"call", prev_call_json}};
-                        enqueue_sse_event("call_end", payload.dump(-1));
+                        enqueue_sse_event("call_end", payload);
                     }
                 }
             }
@@ -2577,10 +2759,12 @@ public:
 
     int call_start(Call *call) override
     {
-        // Best-effort discrete call_start (cheap), queued for broadcast thread.
-        json call_json = get_call_json(call);
-        json payload = {{"type", "call_start"}, {"call", call_json}};
-        enqueue_sse_event("call_start", payload.dump(-1));
+        // Best-effort discrete call_start, queued for broadcast thread (skipped with no clients)
+        if (server_.sse_client_count() > 0)
+        {
+            json payload = {{"type", "call_start"}, {"call", get_call_json(call)}};
+            enqueue_sse_event("call_start", payload);
+        }
 
         // Also log as a GRANT event for Omnitrunker
         System *sys = call->get_system();
@@ -2610,7 +2794,7 @@ public:
         cache_trunk_message(event_json);
 
         json grant_payload = {{"type", "unit_event"}, {"event", event_json}};
-        enqueue_sse_event("unit_event", grant_payload.dump(-1));
+        enqueue_sse_event("unit_event", grant_payload);
 
         // Update affiliation state for proper Gephi coloring
         bool encrypted = call->get_encrypted();
@@ -2651,7 +2835,7 @@ public:
         cache_trunk_message(event_json);
 
         json payload = {{"type", "unit_event"}, {"event", event_json}};
-        enqueue_sse_event("unit_event", payload.dump(-1));
+        enqueue_sse_event("unit_event", payload);
 
         // Update affiliation tracking for data event (not voice grant)
         update_affiliation_state_data(sys, source_id, talkgroup_num);
@@ -2682,7 +2866,7 @@ public:
         cache_trunk_message(event_json);
 
         json payload = {{"type", "unit_event"}, {"event", event_json}};
-        enqueue_sse_event("unit_event", payload.dump(-1));
+        enqueue_sse_event("unit_event", payload);
 
         set_unit_registration(sys, source_id, true);
 
@@ -2711,7 +2895,7 @@ public:
         cache_trunk_message(event_json);
 
         json payload = {{"type", "unit_event"}, {"event", event_json}};
-        enqueue_sse_event("unit_event", payload.dump(-1));
+        enqueue_sse_event("unit_event", payload);
 
         // Update state: unit is now deregistered
         set_unit_registration(sys, source_id, false);
@@ -2737,7 +2921,7 @@ public:
             {"tg_alpha", ""}};
 
         cache_trunk_message(event_json);
-        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump(-1));
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}});
 
         // Update unit state to track activity
         update_unit_state(sys, source_id, false);
@@ -2761,7 +2945,7 @@ public:
             {"tg_alpha", ""}};
 
         cache_trunk_message(event_json);
-        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump(-1));
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}});
 
         // Update unit state to track activity
         update_unit_state(sys, source_id, false);
@@ -2787,7 +2971,7 @@ public:
             {"tg_alpha", tg ? tg->alpha_tag : ""}};
 
         cache_trunk_message(event_json);
-        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump(-1));
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}});
 
         // Update unit state to track activity
         update_unit_state(sys, source_id, false);
@@ -2813,7 +2997,7 @@ public:
             {"tg_alpha", tg ? tg->alpha_tag : ""}};
 
         cache_trunk_message(event_json);
-        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}}.dump(-1));
+        enqueue_sse_event("unit_event", json{{"type", "unit_event"}, {"event", event_json}});
 
         // Update affiliation tracking for data event
         update_affiliation_state_data(sys, source_id, talkgroup_num);
@@ -2900,7 +3084,7 @@ public:
 
         // Queue the rich end-event for the broadcast thread.
         json payload = {{"type", "call_end"}, {"call", call_json}};
-        enqueue_sse_event("call_end", payload.dump(-1));
+        enqueue_sse_event("call_end", payload);
         return 0;
     }
 
@@ -2948,6 +3132,121 @@ public:
     // ============================================================================
 
 private:
+    /// Resolve the ?sys_num= query parameter to a System, writing a 400/404 response if it can't
+    System *find_system_param(const httplib::Request &req, httplib::Response &res)
+    {
+        auto it = req.params.find("sys_num");
+        int sys_num = -1;
+        try
+        {
+            if (it == req.params.end())
+                throw std::invalid_argument("missing");
+            size_t consumed = 0;
+            sys_num = std::stoi(it->second, &consumed);
+            if (consumed != it->second.size())
+                throw std::invalid_argument("trailing characters");
+        }
+        catch (const std::exception &)
+        {
+            res.status = 400;
+            res.set_content("{\"error\": \"missing or invalid sys_num parameter\"}", "application/json");
+            return nullptr;
+        }
+
+        for (auto *s : tr_systems_)
+        {
+            if (s->get_sys_num() == sys_num)
+            {
+                return s;
+            }
+        }
+        res.status = 404;
+        res.set_content("{\"error\": \"system not found\"}", "application/json");
+        return nullptr;
+    }
+
+    // Build the /api/system/* responses. Runs on trunk-recorder's thread only (the talkgroup,
+    // unit tag and OTA lists belong to it). Talkgroups and unit tags are fixed after config
+    // load; OTA aliases are added while running, so those are rebuilt periodically.
+    void snapshot_system_data(bool include_static)
+    {
+        std::map<int, std::string> talkgroups, unit_tags, ota;
+        for (auto *sys : tr_systems_)
+        {
+            int sys_num = sys->get_sys_num();
+            if (include_static)
+            {
+                json tgs = json::array();
+                for (auto *tg : sys->get_talkgroups())
+                {
+                    tgs.push_back({{"number", tg->number},
+                                   {"alpha_tag", tg->alpha_tag},
+                                   {"description", tg->description},
+                                   {"tag", tg->tag},
+                                   {"group", tg->group},
+                                   {"priority", tg->priority}});
+                }
+                talkgroups[sys_num] = tgs.dump(-1, ' ', false, json::error_handler_t::replace);
+
+                json tags = json::array();
+                for (auto *tag : sys->get_unit_tags())
+                {
+                    tags.push_back({{"pattern", tag->pattern.str()}, {"tag", tag->tag}});
+                }
+                json unit_tags_response = {
+                    {"file", sys->get_unit_tags_file()},
+                    {"mode", sys->get_unit_tags_mode()},
+                    {"count", tags.size()},
+                    {"tags", tags}};
+                unit_tags[sys_num] = unit_tags_response.dump(-1, ' ', false, json::error_handler_t::replace);
+            }
+
+            json aliases = json::array();
+            for (auto *alias : sys->get_unit_tags_ota())
+            {
+                aliases.push_back({{"unit", alias->unit_id}, {"alias", alias->alias}});
+            }
+            json ota_response = {
+                {"file", sys->get_unit_tags_ota_file()},
+                {"count", aliases.size()},
+                {"aliases", aliases}};
+            ota[sys_num] = ota_response.dump(-1, ' ', false, json::error_handler_t::replace);
+        }
+
+        std::lock_guard<std::mutex> lock(system_data_mutex_);
+        if (include_static)
+        {
+            talkgroups_json_.swap(talkgroups);
+            unit_tags_json_.swap(unit_tags);
+        }
+        ota_json_.swap(ota);
+        last_ota_snapshot_ = time(NULL);
+    }
+
+    void serve_system_snapshot(const httplib::Request &req, httplib::Response &res, const std::map<int, std::string> &snapshot)
+    {
+        if (!require_auth(req, res))
+            return;
+        System *sys = find_system_param(req, res);
+        if (!sys)
+            return;
+
+        std::string body;
+        {
+            std::lock_guard<std::mutex> lock(system_data_mutex_);
+            auto it = snapshot.find(sys->get_sys_num());
+            if (it != snapshot.end())
+                body = it->second;
+        }
+        if (body.empty())
+        {
+            res.status = 503;
+            res.set_content("{\"error\": \"system data not loaded yet\"}", "application/json");
+            return;
+        }
+        res.set_content(body, "application/json");
+    }
+
     void setup_log_capture()
     {
         // Setup custom logging sink to capture console output
@@ -2956,6 +3255,7 @@ private:
         boost::shared_ptr<web_sink_t> web_sink =
             boost::make_shared<web_sink_t>(boost::make_shared<WebLogBackend>(*this));
         logging::core::get()->add_sink(web_sink);
+        web_sink_ = web_sink; // removed again in stop()
     }
 
     void setup_routes()
@@ -2974,8 +3274,9 @@ private:
         server_.Get("/favicon.ico", [](const httplib::Request &req, httplib::Response &res)
                     { 
                         // Redirect to SVG version
+                        // Relative, so it also works under a reverse-proxy subpath
                         res.status = 302;
-                        res.set_header("Location", "/favicon.svg"); });
+                        res.set_header("Location", "favicon.svg"); });
 
         // SSE endpoint for live updates
         server_.SSE("/events");
@@ -2987,11 +3288,8 @@ private:
         server_.set_raw_stream_connect_notify([this]()
                                               { this->request_gephi_initial_dump(); });
 
-        // NOTE: We do NOT use set_sse_auth_callback() because httplib adds WWW-Authenticate
-        // headers that trigger browser auth dialogs. Instead, SSE connects and auth is
-        // checked via session cookies. If the session expires, frontend will detect
-        // 401 responses on API calls and show the login modal.
-        // For Gephi/external tools, they can still use HTTP Basic Auth on /graph-stream
+        // /events and /graph-stream authenticate through set_sse_auth_callback() (see start()):
+        // session cookie for the web UI, HTTP Basic Auth for Gephi and other external tools.
 
         // Login endpoint - validates credentials and returns session token
         server_.Post("/api/login", [this](const httplib::Request &req, httplib::Response &res)
@@ -3001,13 +3299,14 @@ private:
         std::string username = request_data.value("username", "");
         std::string password = request_data.value("password", "");
         
-        // Get client IP for logging
-        std::string client_ip = req.get_header("X-Forwarded-For");
-        if (client_ip.empty()) {
-          client_ip = req.get_header("X-Real-IP");
-        }
-        if (client_ip.empty()) {
-          client_ip = "unknown";
+        // Get client IP for rate limiting and logging
+        std::string client_ip = get_client_ip(req);
+
+        if (is_rate_limited(client_ip)) {
+          BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Login rate limit exceeded for " << client_ip;
+          res.status = 429;
+          res.set_content("{\"error\": \"Too many failed attempts, try again later\"}", "application/json");
+          return;
         }
 
         if (username.empty() || password.empty()) {
@@ -3031,8 +3330,9 @@ private:
         }
 
         if (!auth_success) {
-          // Track failed login attempt
-          server_.track_login_attempt(username, client_ip, false, "failed");
+          // Track failed login attempt (username is attacker-supplied: keep the stored copy short)
+          record_auth_attempt(client_ip);
+          server_.track_login_attempt(username.substr(0, 64), client_ip, false, "failed");
           res.status = 401;
           res.set_content("{\"error\": \"Invalid credentials\"}", "application/json");
           return;
@@ -3045,17 +3345,18 @@ private:
         std::string token = create_session(username, is_admin);
         
         // Set cookie so EventSource (SSE) can authenticate automatically
-        res.set_header("Set-Cookie", "session=" + token + "; Path=/; HttpOnly; SameSite=Strict");
-        
+        res.set_header("Set-Cookie", "session=" + token + "; Path=/; HttpOnly; SameSite=Strict" +
+                                         (server_.is_https() ? "; Secure" : ""));
+
         json response = {
             {"token", token},
             {"auth_level", is_admin ? "admin" : "user"}};
-        res.set_content(response.dump(-1), "application/json");
+        res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
 
       } catch (const std::exception &e) {
         res.status = 400;
         json error = {{"error", std::string("Invalid request: ") + e.what()}};
-        res.set_content(error.dump(-1), "application/json");
+        res.set_content(error.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
       } });
 
         // Logout endpoint - deletes session token
@@ -3086,7 +3387,7 @@ private:
       res.set_header("Set-Cookie", "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
 
       json response = {{"message", "Logged out successfully"}};
-      res.set_content(response.dump(-1), "application/json"); });
+      res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json"); });
 
         // REST API endpoint for initial state
         server_.Get("/api/status", [this](const httplib::Request &req, httplib::Response &res)
@@ -3111,18 +3412,14 @@ private:
       response["trunkMessages"] = get_trunk_messages();
       // COMMENTED OUT: unitAffiliations not currently displayed in UI
       // response["unitAffiliations"] = get_unit_affiliations();
-      response["consoleLogs"] = get_console_logs();
+      // consoleSeq lets the client skip streamed console lines already in this history
+      uint64_t console_seq = 0;
+      response["consoleLogs"] = get_console_logs(&console_seq);
+      response["consoleSeq"] = console_seq;
       response["timestamp"] = time(NULL);
       response["sse_clients"] = server_.sse_client_count();
 
-      // Clear pending console queue after initial inload
-      {
-        std::lock_guard<std::mutex> lock(console_pending_mutex_);
-        console_pending_.clear();
-        console_pending_dropped_ = 0;
-      }
-
-      res.set_content(response.dump(-1), "application/json"); });
+      res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json"); });
 
         // Rate history endpoint
         server_.Get("/api/rates/history", [this](const httplib::Request &req, httplib::Response &res)
@@ -3130,7 +3427,7 @@ private:
       if (!require_auth(req, res)) return;
       
       json response = get_rate_history();
-      res.set_content(response.dump(-1), "application/json"); });
+      res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json"); });
 
         // Call rate history endpoint
         server_.Get("/api/calls/rate-history", [this](const httplib::Request &req, httplib::Response &res)
@@ -3138,7 +3435,7 @@ private:
       if (!require_auth(req, res)) return;
       
       json response = get_call_rate_history();
-      res.set_content(response.dump(-1), "application/json"); });
+      res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json"); });
 
         // Console logs endpoint
         server_.Get("/api/console", [this](const httplib::Request &req, httplib::Response &res)
@@ -3146,7 +3443,7 @@ private:
       if (!require_auth(req, res)) return;
       
       json response = {{"lines", get_console_logs()}};
-      res.set_content(response.dump(-1), "application/json"); });
+      res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json"); });
 
         // Affiliations data endpoint (with optional pagination)
         server_.Get("/api/affiliations", [this](const httplib::Request &req, httplib::Response &res)
@@ -3165,132 +3462,31 @@ private:
           } catch(...) {}
       }
       
+      time_t since = 0;
+      auto since_it = req.params.find("since");
+      if (since_it != req.params.end()) {
+          try {
+              since = static_cast<time_t>(std::stoll(since_it->second));
+          } catch(...) {}
+      }
+
       auto view_it = req.params.find("view");
       if (view_it != req.params.end()) {
           if (view_it->second == "units") units_only = true;
           else if (view_it->second == "talkgroups") talkgroups_only = true;
       }
 
-      json response = get_affiliation_data(limit, units_only, talkgroups_only);
-      res.set_content(response.dump(-1), "application/json"); });
+      json response = get_affiliation_data(limit, units_only, talkgroups_only, since);
+      res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json"); });
 
-        // System data endpoints - parse sys_num from path
+        // System data endpoints (?sys_num=N). Served from snapshots built on trunk-recorder's
+        // thread: the live talkgroup / unit tag / OTA lists are modified there without locking.
         server_.Get("/api/system/talkgroups", [this](const httplib::Request &req, httplib::Response &res)
-                    {
-      if (!require_auth(req, res)) return;
-      
-      // Parse sys_num from query parameter
-      auto it = req.params.find("sys_num");
-      if (it == req.params.end()) {
-        res.status = 400;
-        res.set_content("{\"error\": \"missing sys_num parameter\"}", "application/json");
-        return;
-      }
-      int sys_num = std::stoi(it->second);
-
-      System *sys = nullptr;
-      for (auto *s : tr_systems_) {
-        if (s->get_sys_num() == sys_num) {
-          sys = s;
-          break;
-        }
-      }
-      if (!sys) {
-        res.status = 404;
-        res.set_content("{\"error\": \"system not found\"}", "application/json");
-        return;
-      }
-
-      json tgs = json::array();
-      for (auto *tg : sys->get_talkgroups()) {
-        tgs.push_back({{"number", tg->number},
-                       {"alpha_tag", tg->alpha_tag},
-                       {"description", tg->description},
-                       {"tag", tg->tag},
-                       {"group", tg->group},
-                       {"priority", tg->priority}});
-      }
-      res.set_content(tgs.dump(-1), "application/json"); });
-
+                    { serve_system_snapshot(req, res, talkgroups_json_); });
         server_.Get("/api/system/unit_tags", [this](const httplib::Request &req, httplib::Response &res)
-                    {
-      if (!require_auth(req, res)) return;
-      
-      auto it = req.params.find("sys_num");
-      if (it == req.params.end()) {
-        res.status = 400;
-        res.set_content("{\"error\": \"missing sys_num parameter\"}", "application/json");
-        return;
-      }
-      int sys_num = std::stoi(it->second);
-
-      System *sys = nullptr;
-      for (auto *s : tr_systems_) {
-        if (s->get_sys_num() == sys_num) {
-          sys = s;
-          break;
-        }
-      }
-      if (!sys) {
-        res.status = 404;
-        res.set_content("{\"error\": \"system not found\"}", "application/json");
-        return;
-      }
-
-      json tags = json::array();
-      for (auto *tag : sys->get_unit_tags()) {
-        std::string pattern_str = tag->pattern.str();
-        json tag_obj;
-        tag_obj["pattern"] = pattern_str;
-        tag_obj["tag"] = tag->tag;
-        tags.push_back(tag_obj);
-      }
-
-      json response = {
-          {"file", sys->get_unit_tags_file()},
-          {"mode", sys->get_unit_tags_mode()},
-          {"count", tags.size()},
-          {"tags", tags}};
-      res.set_content(response.dump(-1), "application/json"); });
-
+                    { serve_system_snapshot(req, res, unit_tags_json_); });
         server_.Get("/api/system/unit_tags_ota", [this](const httplib::Request &req, httplib::Response &res)
-                    {
-      if (!require_auth(req, res)) return;
-      
-      auto it = req.params.find("sys_num");
-      if (it == req.params.end()) {
-        res.status = 400;
-        res.set_content("{\"error\": \"missing sys_num parameter\"}", "application/json");
-        return;
-      }
-      int sys_num = std::stoi(it->second);
-
-      System *sys = nullptr;
-      for (auto *s : tr_systems_) {
-        if (s->get_sys_num() == sys_num) {
-          sys = s;
-          break;
-        }
-      }
-      if (!sys) {
-        res.status = 404;
-        res.set_content("{\"error\": \"system not found\"}", "application/json");
-        return;
-      }
-
-      json aliases = json::array();
-      for (auto *ota : sys->get_unit_tags_ota()) {
-        json ota_obj;
-        ota_obj["unit"] = ota->unit_id;
-        ota_obj["alias"] = ota->alias;
-        aliases.push_back(ota_obj);
-      }
-
-      json response = {
-          {"file", sys->get_unit_tags_ota_file()},
-          {"count", aliases.size()},
-          {"aliases", aliases}};
-      res.set_content(response.dump(-1), "application/json"); });
+                    { serve_system_snapshot(req, res, ota_json_); });
 
         // Admin: Get login history
         server_.Get("/api/admin/login-history", [this](const httplib::Request &req, httplib::Response &res)
@@ -3310,7 +3506,7 @@ private:
         response.push_back(entry);
       }
 
-      res.set_content(response.dump(-1), "application/json"); });
+      res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json"); });
 
         // Admin: Get trunk-recorder config
         server_.Get("/api/admin/config", [this](const httplib::Request &req, httplib::Response &res)
@@ -3323,7 +3519,7 @@ private:
         if (!config_file.good()) {
           res.status = 404;
           json error = {{"error", "Config file not found: " + config_path}};
-          res.set_content(error.dump(-1), "application/json");
+          res.set_content(error.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
           return;
         }
 
@@ -3332,11 +3528,11 @@ private:
         json response = {
             {"content", config_content},
             {"path", config_path}};
-        res.set_content(response.dump(-1), "application/json");
+        res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
       } catch (const std::exception &e) {
         res.status = 500;
         json error = {{"error", std::string("Failed to read config: ") + e.what()}};
-        res.set_content(error.dump(-1), "application/json");
+        res.set_content(error.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
       } });
 
         // Admin: Save config (atomic with backup)
@@ -3353,12 +3549,14 @@ private:
           BOOST_LOG_TRIVIAL(error) << log_prefix_ << "Request body length: " << req.body.size();
           res.status = 400;
           json error = {{"error", std::string("Invalid request: ") + e.what()}};
-          res.set_content(error.dump(-1), "application/json");
+          res.set_content(error.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
           return;
         }
 
         std::string new_content = request_data.value("content", "");
-        std::string config_path = request_data.value("path", tr_config_->config_file);
+        // Always the file trunk-recorder was started with. A client-supplied path would turn
+        // this endpoint into an arbitrary file write as the trunk-recorder user.
+        const std::string config_path = tr_config_->config_file;
 
         if (new_content.empty()) {
           res.status = 400;
@@ -3373,7 +3571,7 @@ private:
         } catch (const std::exception &e) {
           res.status = 400;
           json error = {{"error", std::string("Invalid JSON: ") + e.what()}};
-          res.set_content(error.dump(-1), "application/json");
+          res.set_content(error.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
           return;
         }
 
@@ -3424,16 +3622,16 @@ private:
             {"success", true},
             {"backup", backup_path},
             {"message", "Configuration saved successfully"}};
-        res.set_content(response.dump(-1), "application/json");
+        res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
 
       } catch (const json::exception &e) {
         res.status = 400;
         json error = {{"error", std::string("Invalid request: ") + e.what()}};
-        res.set_content(error.dump(-1), "application/json");
+        res.set_content(error.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
       } catch (const std::exception &e) {
         res.status = 500;
         json error = {{"error", std::string("Failed to save config: ") + e.what()}};
-        res.set_content(error.dump(-1), "application/json");
+        res.set_content(error.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
       } });
 
         // Admin: Restart trunk-recorder
@@ -3447,15 +3645,17 @@ private:
           {"status", "ok"},
           {"message", "Restart initiated"},
           {"timestamp", time(NULL)}};
-      res.set_content(response.dump(-1), "application/json");
+      res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
 
-      // Schedule restart in a separate thread to allow response to complete
-      std::thread([this]() {
+      // Schedule the shutdown in a separate thread so the response is sent first.
+      // SIGINT is trunk-recorder's graceful exit (concludes calls, stops plugins, exits 0);
+      // coming back up is the supervisor's job (systemd Restart=always, a Docker restart
+      // policy, ...). SIGHUP used to be used here, but trunk-recorder now uses it to rotate logs.
+      std::string prefix = log_prefix_;
+      std::thread([prefix]() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        BOOST_LOG_TRIVIAL(warning) << log_prefix_ << "Executing restart...";
-
-        // Send SIGHUP to self to trigger graceful restart
-        kill(getpid(), SIGHUP);
+        BOOST_LOG_TRIVIAL(warning) << prefix << "Executing restart: requesting graceful shutdown (SIGINT)";
+        kill(getpid(), SIGINT);
       }).detach(); });
 
         // Whoami - returns current user's auth level and username
@@ -3520,7 +3720,7 @@ private:
           {"auth_level", auth_level},
           {"username", username},
           {"timestamp", time(NULL)}};
-      res.set_content(response.dump(-1), "application/json"); });
+      res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json"); });
 
         // Health check
         server_.Get("/health", [this](const httplib::Request &req, httplib::Response &res)
@@ -3529,7 +3729,7 @@ private:
           {"status", "ok"},
           {"timestamp", time(NULL)},
           {"https", server_.is_https()}};
-      res.set_content(health.dump(-1), "application/json"); });
+      res.set_content(health.dump(-1, ' ', false, json::error_handler_t::replace), "application/json"); });
     }
 
     void resend_recorders()
@@ -3649,7 +3849,7 @@ private:
             {"freq", recorder->get_freq()},
             {"count", stat_node.get<int>("count")},
             {"rec_state", stat_node.get<int>("state")},
-            {"rec_state_type", tr_state_[stat_node.get<int>("state")]},
+            {"rec_state_type", state_name(stat_node.get<int>("state"))},
             {"squelched", recorder->is_squelched()}};
     }
 
@@ -3674,7 +3874,7 @@ private:
             {"elapsed", stat_node.get<long>("elapsed")},
             {"length", stat_node.get<double>("length")},
             {"call_state", stat_node.get<int>("state")},
-            {"call_state_type", tr_state_[stat_node.get<int>("state")]},
+            {"call_state_type", state_name(stat_node.get<int>("state"))},
             {"phase2_tdma", stat_node.get<bool>("phase2")},
             {"tdma_slot", call->get_tdma_slot()},
             {"analog", stat_node.get<bool>("analog", false)},
@@ -3685,7 +3885,7 @@ private:
             {"rec_num", stat_node.get<int>("recNum", -1)},
             {"src_num", stat_node.get<int>("srcNum", -1)},
             {"rec_state", stat_node.get<int>("recState", -1)},
-            {"rec_state_type", tr_state_[stat_node.get<int>("recState", -1)]}};
+            {"rec_state_type", state_name(stat_node.get<int>("recState", -1))}};
 
         if (tg != nullptr)
         {

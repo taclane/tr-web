@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstring>
+#include <cerrno>
 #include <ctime>
 #include <deque>
 #include <functional>
@@ -15,6 +17,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -25,6 +28,8 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -103,21 +108,61 @@ namespace httplib
         virtual void close() = 0;
         virtual int fd() const = 0;
         virtual bool is_valid() const = 0;
+
+        // Wake any thread blocked on this socket (its read returns 0) without releasing the fd.
+        // Only the thread that owns the connection calls close(), so the fd number can't be
+        // reused underneath it.
+        void shutdown_io()
+        {
+            if (fd() >= 0)
+                ::shutdown(fd(), SHUT_RDWR);
+        }
+
+        // Applies to plain and TLS sockets alike (OpenSSL writes through the same fd)
+        void set_timeouts(int recv_seconds, int send_seconds)
+        {
+            if (fd() < 0)
+                return;
+            struct timeval tv;
+            tv.tv_usec = 0;
+            tv.tv_sec = recv_seconds;
+            setsockopt(fd(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            tv.tv_sec = send_seconds;
+            setsockopt(fd(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
     };
+
+    // Write the whole buffer. A plain socket returns a partial count when SO_SNDTIMEO expires
+    // mid-buffer; <= 0 means error or timeout.
+    inline bool write_all(SocketWrapper &socket, const char *data, size_t len)
+    {
+        while (len > 0)
+        {
+            ssize_t n = socket.write(data, len);
+            if (n <= 0)
+                return false;
+            data += n;
+            len -= static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    // OpenSSL writes with plain write(), so a peer that has gone away raises SIGPIPE, whose
+    // default action kills the whole trunk-recorder process. Block it in every thread that
+    // writes to clients (threads started afterwards inherit the mask); the write then fails
+    // with EPIPE instead.
+    inline void block_sigpipe_in_this_thread()
+    {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGPIPE);
+        pthread_sigmask(SIG_BLOCK, &set, nullptr);
+    }
 
     class PlainSocket : public SocketWrapper
     {
     public:
         explicit PlainSocket(int fd) : fd_(fd), valid_(fd >= 0) {}
-        
-        // Set socket write timeout to prevent blocking on slow clients
-        void set_write_timeout(int seconds) {
-            if (fd_ < 0) return;
-            struct timeval tv;
-            tv.tv_sec = seconds;
-            tv.tv_usec = 0;
-            setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        }
 
         ssize_t read(void *buf, size_t len) override
         {
@@ -220,13 +265,25 @@ namespace httplib
     // HTTP Request
     // ============================================================
 
+    // Header names are case-insensitive (RFC 9110); proxies and HTTP/2 gateways often lowercase them
+    struct CaseInsensitiveLess
+    {
+        bool operator()(const std::string &a, const std::string &b) const
+        {
+            return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(),
+                                                [](unsigned char x, unsigned char y)
+                                                { return std::tolower(x) < std::tolower(y); });
+        }
+    };
+
     struct Request
     {
         std::string method;
         std::string path;
-        std::map<std::string, std::string> headers;
+        std::map<std::string, std::string, CaseInsensitiveLess> headers;
         std::string body;
         std::map<std::string, std::string> params;
+        std::string remote_addr; // Peer address of the TCP connection (not proxy headers)
 
         bool has_header(const std::string &key) const
         {
@@ -274,13 +331,28 @@ namespace httplib
         std::string client_ip;
         std::string username;
         std::string path; // Track which path this client is connected to
+        bool is_raw_stream = false;
+        // Raw stream clients start out waiting for the plugin's initial graph dump
+        std::atomic<bool> needs_initial_state{false};
 
         explicit SSEClient(std::shared_ptr<SocketWrapper> sock, const std::string &ip = "", const std::string &user = "", const std::string &p = "")
             : socket(sock), connected(true), client_ip(ip), username(user), path(p) {
-            // Set 2-second write timeout to prevent blocking on slow clients
-            if (auto *plain = dynamic_cast<PlainSocket*>(sock.get())) {
-                plain->set_write_timeout(2);
+            // Short send timeout so a stalled client is dropped instead of stalling broadcasts
+            socket->set_timeouts(5, 2);
+        }
+
+        // Send raw bytes (no SSE framing), serialized with send_event()
+        bool send_raw(const std::string &data)
+        {
+            if (!connected || !socket->is_valid())
+                return false;
+            std::lock_guard<std::mutex> lock(write_mutex);
+            if (!write_all(*socket, data.data(), data.size()))
+            {
+                connected = false;
+                return false;
             }
+            return true;
         }
 
         bool send_event(const std::string &event, const std::string &data)
@@ -304,10 +376,9 @@ namespace httplib
             }
             message += "\n";
 
-            ssize_t sent = socket->write(message.c_str(), message.length());
-            // If write fails or times out (sent <= 0), mark client as disconnected
-            // This prevents slow/stalled clients from blocking broadcasts
-            if (sent <= 0)
+            // A failed, timed-out or partial write marks the client dead: a stalled client must
+            // not hold up broadcasts, and a partial SSE frame would corrupt the stream
+            if (!write_all(*socket, message.data(), message.size()))
             {
                 connected = false;
                 return false;
@@ -315,6 +386,14 @@ namespace httplib
             return true;
         }
 
+        // Called from other threads: mark dead and wake the owning handler thread, which closes
+        void mark_dead()
+        {
+            connected = false;
+            socket->shutdown_io();
+        }
+
+        // Called only by the connection's own handler thread
         void close()
         {
             connected = false;
@@ -404,27 +483,10 @@ namespace httplib
 
         bool is_https() const { return use_https_; }
 
-        // Set authentication credentials (empty = disabled)
-        void set_auth(const std::string &username, const std::string &password)
+        // Cap on simultaneous connections (each one holds a thread, streams included)
+        void set_max_connections(int max_connections)
         {
-            if (!username.empty() && !password.empty())
-            {
-                auth_enabled_ = true;
-                auth_credentials_ = base64_encode(username + ":" + password);
-            }
-            else
-            {
-                auth_enabled_ = false;
-            }
-        }
-
-        // Set admin authentication credentials
-        void set_admin_auth(const std::string &username, const std::string &password)
-        {
-            if (!username.empty() && !password.empty())
-            {
-                admin_credentials_ = base64_encode(username + ":" + password);
-            }
+            max_connections_ = max_connections > 0 ? max_connections : 1;
         }
 
         // Get login history (thread-safe)
@@ -494,124 +556,104 @@ namespace httplib
             sse_username_callback_ = callback;
         }
 
-        // Send SSE event to all connected clients (except raw stream clients)
+        // Send SSE event to all connected clients (except raw stream clients).
+        // Writes happen outside sse_mutex_ on a snapshot of the client list, so one slow
+        // client delays only this broadcast, never connection setup or the client counts.
         void broadcast_sse(const std::string &event, const std::string &data)
         {
-            std::lock_guard<std::mutex> lock(sse_mutex_);
-            for (auto it = sse_clients_.begin(); it != sse_clients_.end();)
+            std::vector<std::shared_ptr<SSEClient>> failed;
+            for (auto &client : snapshot_clients([](const SSEClient &c)
+                                                 { return !c.is_raw_stream; }))
             {
-                // Skip raw stream clients - they only receive raw data
-                bool is_raw_stream_client = false;
-                for (const auto &raw_path : raw_stream_paths_)
-                {
-                    if ((*it)->path == raw_path)
-                    {
-                        is_raw_stream_client = true;
-                        break;
-                    }
-                }
-
-                if (!is_raw_stream_client)
-                {
-                    if (!(*it)->connected || !(*it)->send_event(event, data))
-                    {
-                        (*it)->close();
-                        it = sse_clients_.erase(it);
-                        continue;
-                    }
-                }
-                ++it;
+                if (!client->send_event(event, data))
+                    failed.push_back(client);
             }
+            drop_clients(failed);
         }
 
         // Send raw data to clients on a specific path (for raw streaming like Gephi)
         void broadcast_raw_to_path(const std::string &path, const std::string &data)
         {
-            std::lock_guard<std::mutex> lock(sse_mutex_);
-            int sent_count = 0;
-            int total_clients = 0;
-            for (auto it = sse_clients_.begin(); it != sse_clients_.end();)
+            std::vector<std::shared_ptr<SSEClient>> failed;
+            for (auto &client : snapshot_clients([&path](const SSEClient &c)
+                                                 { return c.path == path; }))
             {
-                // Only send to clients on the specified path
-                if ((*it)->path == path)
-                {
-                    total_clients++;
-                    if (!(*it)->connected)
-                    {
-                        (*it)->close();
-                        it = sse_clients_.erase(it);
-                        continue;
-                    }
-
-                    // Send raw data without SSE formatting
-                    std::lock_guard<std::mutex> write_lock((*it)->write_mutex);
-                    ssize_t written = (*it)->socket->write(data.c_str(), data.size());
-                    if (written < 0 || static_cast<size_t>(written) != data.size())
-                    {
-                        BOOST_LOG_TRIVIAL(warning) << "[Web Plugin]\tFailed to send raw data to client on " << path << ": written=" << written << " expected=" << data.size();
-                        (*it)->close();
-                        it = sse_clients_.erase(it);
-                        continue;
-                    }
-                    else
-                    {
-                        sent_count++;
-                    }
-                }
-                ++it;
+                if (!client->send_raw(data))
+                    failed.push_back(client);
             }
-            // if (total_clients > 0) {
-            //     BOOST_LOG_TRIVIAL(info) << "[Web Plugin]\tSent " << data.size() << " bytes to " << sent_count << "/" << total_clients << " clients on " << path;
-            // }
+            drop_clients(failed);
         }
 
-        size_t sse_client_count()
+        // Send raw data only to clients on `path` still waiting for their initial state,
+        // so existing clients are not sent the full dump again
+        void send_raw_initial_state(const std::string &path, const std::string &data)
         {
-            std::lock_guard<std::mutex> lock(sse_mutex_);
-            return sse_clients_.size();
+            std::vector<std::shared_ptr<SSEClient>> failed;
+            for (auto &client : snapshot_clients([&path](const SSEClient &c)
+                                                 { return c.path == path && c.needs_initial_state; }))
+            {
+                client->needs_initial_state = false;
+                if (!client->send_raw(data))
+                    failed.push_back(client);
+            }
+            drop_clients(failed);
+        }
+
+        bool raw_clients_awaiting_initial_state()
+        {
+            return !snapshot_clients([](const SSEClient &c)
+                                     { return c.is_raw_stream && c.needs_initial_state; })
+                        .empty();
+        }
+
+        // Lock-free: called from trunk-recorder's own threads on every plugin callback
+        size_t sse_client_count() const
+        {
+            return sse_client_count_.load();
         }
 
         // Start server (blocking)
         bool listen(const std::string &host, int port)
         {
-            server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-            if (server_fd_ < 0)
-                return false;
-
-            int opt = 1;
-            setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            // Connection threads are started from this thread and inherit its signal mask
+            block_sigpipe_in_this_thread();
 
             struct sockaddr_in addr;
+            std::memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
             addr.sin_port = htons(port);
-
             if (host == "0.0.0.0" || host.empty())
             {
                 addr.sin_addr.s_addr = INADDR_ANY;
             }
-            else
+            else if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
             {
-                inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-            }
-
-            if (bind(server_fd_, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-            {
-                ::close(server_fd_);
+                BOOST_LOG_TRIVIAL(error) << "[Web Plugin]\tInvalid bind address: " << host << " (IPv4 address expected)";
                 return false;
             }
 
-            if (::listen(server_fd_, 10) < 0)
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0)
+                return false;
+
+            int opt = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+            if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || ::listen(fd, 16) < 0)
             {
-                ::close(server_fd_);
+                BOOST_LOG_TRIVIAL(error) << "[Web Plugin]\tCannot listen on " << host << ":" << port << ": " << strerror(errno);
+                ::close(fd);
                 return false;
             }
 
+            server_fd_ = fd;
             running_ = true;
+            time_t last_reject_log = 0;
 
             while (running_)
             {
                 struct pollfd pfd;
-                pfd.fd = server_fd_;
+                pfd.fd = fd;
                 pfd.events = POLLIN;
 
                 int ret = poll(&pfd, 1, 100); // 100ms timeout for checking running_
@@ -619,16 +661,39 @@ namespace httplib
                 {
                     struct sockaddr_in client_addr;
                     socklen_t client_len = sizeof(client_addr);
-                    int client_fd = accept(server_fd_, (struct sockaddr *)&client_addr, &client_len);
+                    int client_fd = accept(fd, (struct sockaddr *)&client_addr, &client_len);
+                    if (client_fd < 0)
+                        continue;
 
-                    if (client_fd >= 0)
+                    if (active_connections_.load() >= max_connections_)
+                    {
+                        ::close(client_fd);
+                        time_t now = time(nullptr);
+                        if (now - last_reject_log >= 60)
+                        {
+                            last_reject_log = now;
+                            BOOST_LOG_TRIVIAL(warning) << "[Web Plugin]\tConnection limit (" << max_connections_ << ") reached; refusing new connections";
+                        }
+                        continue;
+                    }
+
+                    ++active_connections_;
+                    try
                     {
                         std::thread(&Server::handle_client, this, client_fd).detach();
+                    }
+                    catch (const std::system_error &e)
+                    {
+                        --active_connections_;
+                        ::close(client_fd);
+                        BOOST_LOG_TRIVIAL(error) << "[Web Plugin]\tCannot start connection thread: " << e.what();
                     }
                 }
             }
 
-            ::close(server_fd_);
+            // Only this thread closes the listening socket
+            server_fd_ = -1;
+            ::close(fd);
             return true;
         }
 
@@ -642,29 +707,35 @@ namespace httplib
             return running_;
         }
 
+        // Stop accepting, disconnect stream clients and wait (bounded) for connection threads
+        // to finish, since they call back into this object and into the plugin.
         void stop()
         {
             running_ = false;
 
-            // Close all SSE clients
             {
                 std::lock_guard<std::mutex> lock(sse_mutex_);
                 for (auto &client : sse_clients_)
                 {
-                    client->close();
+                    client->mark_dead();
                 }
-                sse_clients_.clear();
-            }
-
-            if (server_fd_ >= 0)
-            {
-                ::close(server_fd_);
-                server_fd_ = -1;
             }
 
             if (server_thread_.joinable())
             {
                 server_thread_.join();
+            }
+
+            // Handler threads exit within one poll interval (streams) or one receive
+            // timeout (requests); allow a little longer than the 5 s receive timeout
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
+            while (active_connections_.load() > 0 && std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (active_connections_.load() > 0)
+            {
+                BOOST_LOG_TRIVIAL(warning) << "[Web Plugin]\t" << active_connections_.load() << " connection thread(s) still running at shutdown";
             }
         }
 
@@ -685,6 +756,40 @@ namespace httplib
         }
 
     private:
+        template <typename Pred>
+        std::vector<std::shared_ptr<SSEClient>> snapshot_clients(Pred pred)
+        {
+            std::vector<std::shared_ptr<SSEClient>> out;
+            std::lock_guard<std::mutex> lock(sse_mutex_);
+            for (auto &client : sse_clients_)
+            {
+                if (client->connected && pred(*client))
+                    out.push_back(client);
+            }
+            return out;
+        }
+
+        // Unregister failed clients and wake their handler threads (which close the sockets)
+        void drop_clients(const std::vector<std::shared_ptr<SSEClient>> &failed)
+        {
+            if (failed.empty())
+                return;
+            std::lock_guard<std::mutex> lock(sse_mutex_);
+            for (auto &client : failed)
+            {
+                client->mark_dead();
+                remove_client_locked(client);
+            }
+        }
+
+        void remove_client_locked(const std::shared_ptr<SSEClient> &client)
+        {
+            sse_clients_.erase(std::remove(sse_clients_.begin(), sse_clients_.end(), client), sse_clients_.end());
+            raw_stream_clients_.erase(std::remove(raw_stream_clients_.begin(), raw_stream_clients_.end(), client), raw_stream_clients_.end());
+            sse_client_count_ = sse_clients_.size();
+            raw_stream_client_count_ = raw_stream_clients_.size();
+        }
+
         static std::string to_lower_ascii(std::string s)
         {
             std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
@@ -723,13 +828,48 @@ namespace httplib
 
         static std::string get_header_ci(const Request &req, const std::string &key)
         {
-            const std::string k = to_lower_ascii(key);
-            for (const auto &kv : req.headers)
+            return req.get_header(key);
+        }
+
+        // Parse Content-Length from the raw header block. Returns false if the header is
+        // present but not a plain non-negative integer.
+        static bool parse_content_length(const std::string &header_block, size_t &out)
+        {
+            out = 0;
+            std::istringstream stream(header_block);
+            std::string line;
+            while (std::getline(stream, line))
             {
-                if (to_lower_ascii(kv.first) == k)
-                    return kv.second;
+                size_t colon = line.find(':');
+                if (colon == std::string::npos || to_lower_ascii(line.substr(0, colon)) != "content-length")
+                    continue;
+                std::string value = line.substr(colon + 1);
+                size_t first = value.find_first_not_of(" \t");
+                size_t last = value.find_last_not_of(" \t\r\n");
+                if (first == std::string::npos)
+                    return false;
+                value = value.substr(first, last - first + 1);
+                if (value.empty() || value.size() > 18 || value.find_first_not_of("0123456789") != std::string::npos)
+                    return false;
+                out = static_cast<size_t>(std::stoull(value));
+                return true;
             }
-            return "";
+            return true;
+        }
+
+        static bool is_json_content_type(const Request &req)
+        {
+            const std::string ct = to_lower_ascii(req.get_header("Content-Type"));
+            return ct.compare(0, 16, "application/json") == 0;
+        }
+
+        void send_error(std::shared_ptr<SocketWrapper> socket, const Request &req, int status, const std::string &msg)
+        {
+            Response res;
+            res.status = status;
+            res.set_content(msg, "text/plain");
+            send_response(socket, req, res);
+            socket->close();
         }
 
         static bool request_accepts_gzip(const Request &req)
@@ -791,6 +931,14 @@ namespace httplib
 
         std::shared_ptr<SocketWrapper> wrap_socket(int client_fd)
         {
+            // Receive timeout must be set before the TLS handshake, or a client that
+            // connects and never sends a ClientHello holds this thread forever
+            struct timeval tv;
+            tv.tv_sec = 5;
+            tv.tv_usec = 0;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
             if (use_https_ && ssl_ctx_)
             {
                 SSL *ssl = SSL_new(ssl_ctx_);
@@ -811,38 +959,65 @@ namespace httplib
             }
         }
 
+        // Runs on a detached thread inside the trunk-recorder process: an escaping exception
+        // would call std::terminate and stop all recording, so nothing may leave this function.
         void handle_client(int client_fd)
         {
-            auto socket = wrap_socket(client_fd);
-            if (!socket)
-                return;
+            // listen() counted this connection before starting the thread
+            struct ConnectionGuard
+            {
+                std::atomic<int> &count;
+                ~ConnectionGuard() { --count; }
+            } guard{active_connections_};
 
-            // Set socket timeout
-            struct timeval tv;
-            tv.tv_sec = 5;
-            tv.tv_usec = 0;
-            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            std::shared_ptr<SocketWrapper> socket;
+            try
+            {
+                socket = wrap_socket(client_fd);
+                if (!socket)
+                    return;
+                handle_request(socket);
+            }
+            catch (const std::exception &e)
+            {
+                BOOST_LOG_TRIVIAL(error) << "[Web Plugin]\tUnhandled exception while serving request: " << e.what();
+                if (socket)
+                {
+                    try
+                    {
+                        send_error(socket, Request(), 500, "Internal Server Error");
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+            }
+            catch (...)
+            {
+                BOOST_LOG_TRIVIAL(error) << "[Web Plugin]\tUnknown exception while serving request";
+                if (socket)
+                    socket->close();
+            }
+        }
 
+        void handle_request(std::shared_ptr<SocketWrapper> socket)
+        {
             // Read request with size limit to prevent DoS
             char buffer[8192];
             std::string request_data;
             ssize_t bytes_read;
             const size_t MAX_REQUEST_SIZE = 10 * 1024 * 1024; // 10MB limit (generous for config files)
+            bool headers_complete = false;
 
             // Read until we have complete headers
-            while ((bytes_read = socket->read(buffer, sizeof(buffer) - 1)) > 0)
+            while ((bytes_read = socket->read(buffer, sizeof(buffer))) > 0)
             {
-                buffer[bytes_read] = '\0';
-                request_data += buffer;
+                request_data.append(buffer, static_cast<size_t>(bytes_read));
 
                 // Enforce size limit
                 if (request_data.size() > MAX_REQUEST_SIZE)
                 {
-                    Response res;
-                    res.status = 413;
-                    res.set_content("Request Entity Too Large", "text/plain");
-                    send_response(socket, Request(), res);
-                    socket->close();
+                    send_error(socket, Request(), 413, "Request Entity Too Large");
                     return;
                 }
 
@@ -850,144 +1025,64 @@ namespace httplib
                 size_t header_end = request_data.find("\r\n\r\n");
                 if (header_end != std::string::npos)
                 {
+                    headers_complete = true;
+
                     // Parse Content-Length to see if we need to read more body data
-                    size_t cl_pos = request_data.find("Content-Length:");
-                    if (cl_pos != std::string::npos && cl_pos < header_end)
+                    size_t content_length = 0;
+                    if (!parse_content_length(request_data.substr(0, header_end), content_length))
                     {
-                        size_t cl_end = request_data.find("\r\n", cl_pos);
-                        std::string cl_str = request_data.substr(cl_pos + 15, cl_end - cl_pos - 15);
-                        // Trim whitespace
-                        while (!cl_str.empty() && (cl_str[0] == ' ' || cl_str[0] == '\t'))
-                            cl_str.erase(0, 1);
+                        send_error(socket, Request(), 400, "Bad Request");
+                        return;
+                    }
+                    if (content_length > MAX_REQUEST_SIZE)
+                    {
+                        send_error(socket, Request(), 413, "Request Entity Too Large");
+                        return;
+                    }
 
-                        size_t content_length = std::stoull(cl_str);
-                        size_t body_start = header_end + 4;
-                        size_t body_received = (request_data.size() > body_start) ? (request_data.size() - body_start) : 0;
+                    size_t body_start = header_end + 4;
+                    size_t body_received = request_data.size() - body_start;
 
-                        // Continue reading until we have the complete body
-                        while (body_received < content_length)
+                    // Continue reading until we have the complete body
+                    while (body_received < content_length)
+                    {
+                        bytes_read = socket->read(buffer, sizeof(buffer));
+                        if (bytes_read <= 0)
                         {
-                            bytes_read = socket->read(buffer, sizeof(buffer) - 1);
-                            if (bytes_read <= 0)
-                                break;
-                            buffer[bytes_read] = '\0';
-                            request_data += buffer;
-                            body_received += bytes_read;
+                            // Timed out or closed before the declared body arrived
+                            send_error(socket, Request(), 400, "Bad Request (incomplete body)");
+                            return;
+                        }
+                        request_data.append(buffer, static_cast<size_t>(bytes_read));
+                        body_received += static_cast<size_t>(bytes_read);
 
-                            if (request_data.size() > MAX_REQUEST_SIZE)
-                            {
-                                Response res;
-                                res.status = 413;
-                                res.set_content("Request Entity Too Large", "text/plain");
-                                send_response(socket, Request(), res);
-                                socket->close();
-                                return;
-                            }
+                        if (request_data.size() > MAX_REQUEST_SIZE)
+                        {
+                            send_error(socket, Request(), 413, "Request Entity Too Large");
+                            return;
                         }
                     }
                     break;
                 }
             }
 
-            if (request_data.empty())
+            if (!headers_complete)
             {
                 socket->close();
                 return;
             }
 
             Request req = parse_request(request_data);
+            req.remote_addr = get_client_ip(socket->fd());
             Response res;
 
-            // Allow /health without authentication
-            bool skip_auth = (req.path == "/health");
-
-            // Determine required access level and check authentication
-            bool requires_admin = (req.path.find("/api/admin/") == 0);
-            std::string client_ip = get_client_ip(socket->fd());
-
-            // Only check httplib auth if explicitly enabled (plugin handles auth via require_auth/require_admin_auth)
-            // Changed: Removed || requires_admin so plugin auth can handle admin endpoints
-            bool needs_auth_check = (auth_enabled_ && !skip_auth);
-
-            if (needs_auth_check)
+            // All POST endpoints take JSON. Requiring the JSON content type forces a CORS
+            // preflight for cross-origin requests (which this server never approves), so a
+            // third-party page cannot drive POST endpoints with a "simple" form/text request.
+            if (req.method == "POST" && !is_json_content_type(req))
             {
-                std::string auth = get_header_ci(req, "Authorization");
-                std::string decoded_creds = "";
-                std::string attempted_user = "none";
-
-                if (!auth.empty() && auth.substr(0, 6) == "Basic ")
-                {
-                    decoded_creds = auth.substr(6);
-                    std::string decoded = base64_decode(decoded_creds);
-                    size_t colon = decoded.find(':');
-                    if (colon != std::string::npos)
-                    {
-                        attempted_user = decoded.substr(0, colon);
-                    }
-                }
-
-                bool is_admin = (!admin_credentials_.empty() && !decoded_creds.empty() && decoded_creds == admin_credentials_);
-                bool is_info = (auth_enabled_ && !auth_credentials_.empty() && !decoded_creds.empty() && decoded_creds == auth_credentials_);
-                bool authenticated = is_admin || (is_info && !requires_admin) || (!auth_enabled_ && !requires_admin);
-
-                // Track login attempt - only log FIRST authentication per session (not every request)
-                // Skip logging if credentials are empty (e.g., logout)
-                if (!decoded_creds.empty() && !attempted_user.empty())
-                {
-                    std::string session_key = client_ip + ":" + attempted_user;
-                    static std::unordered_set<std::string> logged_sessions;
-                    static std::mutex session_mutex;
-
-                    bool should_log = false;
-                    {
-                        std::lock_guard<std::mutex> session_lock(session_mutex);
-                        if (logged_sessions.find(session_key) == logged_sessions.end())
-                        {
-                            logged_sessions.insert(session_key);
-                            should_log = true;
-
-                            // Prevent unbounded growth - clear old sessions periodically
-                            if (logged_sessions.size() > 1000)
-                            {
-                                logged_sessions.clear();
-                            }
-                        }
-                    }
-
-                    if (should_log)
-                    {
-                        std::lock_guard<std::mutex> lock(login_history_mutex_);
-                        LoginAttempt attempt;
-                        attempt.timestamp = time(nullptr);
-                        attempt.username = attempted_user;
-                        attempt.client_ip = client_ip;
-                        attempt.success = authenticated;
-                        attempt.access_level = authenticated ? (is_admin ? "admin" : "info") : "failed";
-
-                        login_history_.push_back(attempt);
-                        if (login_history_.size() > MAX_LOGIN_HISTORY)
-                        {
-                            login_history_.pop_front();
-                        }
-
-                        // Only log to console if authentication actually failed with provided credentials
-                        if (!authenticated)
-                        {
-                            BOOST_LOG_TRIVIAL(error) << "[Web Plugin]\tAuthentication failed - user: " << attempted_user << " from " << client_ip;
-                        }
-                    }
-                }
-
-                if (!authenticated)
-                {
-
-                    res.status = 401;
-                    res.set_header("WWW-Authenticate", "Basic realm=\"Trunk-Recorder\"");
-                    res.set_content("Unauthorized", "text/plain");
-                    send_response(socket, req, res);
-                    socket->close();
-                    return;
-                }
+                send_error(socket, req, 415, "Unsupported Media Type (expected application/json)");
+                return;
             }
 
             // Check if this is an SSE request
@@ -1025,8 +1120,7 @@ namespace httplib
                     }
                 }
 
-                std::string client_ip = get_client_ip(socket->fd());
-                handle_sse_client(socket, req, client_ip);
+                handle_sse_client(socket, req);
                 return;
             }
 
@@ -1055,8 +1149,10 @@ namespace httplib
             socket->close();
         }
 
-        void handle_sse_client(std::shared_ptr<SocketWrapper> socket, const Request &req, const std::string &client_ip)
+        void handle_sse_client(std::shared_ptr<SocketWrapper> socket, const Request &req)
         {
+            const std::string &client_ip = req.remote_addr;
+
             // Extract username using callback if available, otherwise try Basic Auth
             std::string username = "anonymous";
             if (sse_username_callback_)
@@ -1079,49 +1175,47 @@ namespace httplib
             }
 
             // Check if this is a raw stream (like Gephi)
-            bool is_raw_stream = false;
-            for (const auto &path : raw_stream_paths_)
-            {
-                if (req.path == path)
-                {
-                    is_raw_stream = true;
-                    break;
-                }
-            }
+            bool is_raw_stream = std::find(raw_stream_paths_.begin(), raw_stream_paths_.end(), req.path) != raw_stream_paths_.end();
 
-            // Send appropriate headers
-            std::string response;
-            if (is_raw_stream)
-            {
-                // Raw stream - just HTTP 200 with chunked encoding
-                response =
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Cache-Control: no-cache\r\n"
-                    "Connection: keep-alive\r\n"
-                    "Access-Control-Allow-Origin: *\r\n"
-                    "\r\n";
-            }
-            else
-            {
-                // SSE - needs text/event-stream
-                response =
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/event-stream\r\n"
-                    "Cache-Control: no-cache\r\n"
-                    "Connection: keep-alive\r\n"
-                    "Access-Control-Allow-Origin: *\r\n"
-                    "\r\n";
-            }
+            // Same-origin only: no Access-Control-Allow-Origin, so other websites can't read the
+            // streams through a visitor's browser (Gephi and other non-browser clients don't care)
+            const std::string response = is_raw_stream
+                                             ? "HTTP/1.1 200 OK\r\n"
+                                               "Content-Type: application/json\r\n"
+                                               "Cache-Control: no-cache\r\n"
+                                               "Connection: keep-alive\r\n"
+                                               "\r\n"
+                                             : "HTTP/1.1 200 OK\r\n"
+                                               "Content-Type: text/event-stream\r\n"
+                                               "Cache-Control: no-cache\r\n"
+                                               "Connection: keep-alive\r\n"
+                                               "\r\n";
 
-            if (socket->write(response.c_str(), response.length()) <= 0)
+            if (!write_all(*socket, response.data(), response.size()))
             {
                 socket->close();
                 return;
             }
 
-            // Add to SSE clients (and raw stream clients if applicable)
             auto client = std::make_shared<SSEClient>(socket, client_ip, username, req.path);
+            client->is_raw_stream = is_raw_stream;
+            client->needs_initial_state = is_raw_stream;
+
+            // Unregister and close on every exit path, including exceptions
+            struct Registration
+            {
+                Server &server;
+                std::shared_ptr<SSEClient> client;
+                ~Registration()
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(server.sse_mutex_);
+                        server.remove_client_locked(client);
+                    }
+                    BOOST_LOG_TRIVIAL(info) << "[Web Plugin]\t" << (client->is_raw_stream ? "Raw stream" : "SSE") << " session ended - user: " << client->username << " from " << client->client_ip;
+                    client->close();
+                }
+            };
             {
                 std::lock_guard<std::mutex> lock(sse_mutex_);
                 sse_clients_.push_back(client);
@@ -1129,9 +1223,11 @@ namespace httplib
                 {
                     raw_stream_clients_.push_back(client);
                 }
+                sse_client_count_ = sse_clients_.size();
+                raw_stream_client_count_ = raw_stream_clients_.size();
             }
+            Registration registration{*this, client};
 
-            // Log connection
             BOOST_LOG_TRIVIAL(info) << "[Web Plugin]\t" << (is_raw_stream ? "Raw stream" : "SSE") << " session started - user: " << username << " from " << client_ip << " path: " << req.path;
 
             // Send initial keepalive (only for SSE, not raw streams)
@@ -1145,7 +1241,8 @@ namespace httplib
                 raw_stream_connect_notify_();
             }
 
-            // Keep connection alive until client disconnects
+            // Keep connection alive until the client disconnects or is dropped (mark_dead()
+            // shuts the socket down, which makes poll/read return immediately)
             char dummy[1];
             while (running_ && client->connected)
             {
@@ -1164,29 +1261,6 @@ namespace httplib
                     }
                 }
             }
-
-            // Remove from SSE clients and raw stream clients (if applicable)
-            {
-                std::lock_guard<std::mutex> lock(sse_mutex_);
-                sse_clients_.erase(
-                    std::remove_if(sse_clients_.begin(), sse_clients_.end(),
-                                   [&client](const std::shared_ptr<SSEClient> &c)
-                                   { return c.get() == client.get(); }),
-                    sse_clients_.end());
-                if (is_raw_stream)
-                {
-                    raw_stream_clients_.erase(
-                        std::remove_if(raw_stream_clients_.begin(), raw_stream_clients_.end(),
-                                       [&client](const std::shared_ptr<SSEClient> &c)
-                                       { return c.get() == client.get(); }),
-                        raw_stream_clients_.end());
-                }
-            }
-
-            // Log disconnection
-            BOOST_LOG_TRIVIAL(info) << "[Web Plugin]\tSSE session ended - user: " << client->username << " from " << client->client_ip;
-
-            client->close();
         }
 
         Request parse_request(const std::string &data)
@@ -1301,7 +1375,7 @@ namespace httplib
             stream << final_res.body;
 
             std::string response = stream.str();
-            socket->write(response.c_str(), response.length());
+            write_all(*socket, response.data(), response.size());
         }
 
         static std::string status_text(int status)
@@ -1326,6 +1400,12 @@ namespace httplib
                 return "Not Found";
             case 405:
                 return "Method Not Allowed";
+            case 413:
+                return "Payload Too Large";
+            case 415:
+                return "Unsupported Media Type";
+            case 429:
+                return "Too Many Requests";
             case 500:
                 return "Internal Server Error";
             default:
@@ -1349,29 +1429,21 @@ namespace httplib
         std::function<bool(const Request&)> sse_auth_callback_;
         std::function<std::string(const Request&)> sse_username_callback_;
 
+        // Mirrors of the list sizes, readable without sse_mutex_
+        std::atomic<size_t> sse_client_count_{0};
+        std::atomic<size_t> raw_stream_client_count_{0};
+
+        std::atomic<int> active_connections_{0};
+        int max_connections_ = 64;
+
     public:
-        // Return the number of connected raw stream (graphstream) clients
-        size_t raw_stream_client_count()
+        // Return the number of connected raw stream (graphstream) clients (lock-free)
+        size_t raw_stream_client_count() const
         {
-            std::lock_guard<std::mutex> lock(sse_mutex_);
-            return raw_stream_clients_.size();
+            return raw_stream_client_count_.load();
         }
 
-        // Remove a raw stream client from the list
-        void remove_raw_stream_client(const std::shared_ptr<SSEClient> &client)
-        {
-            std::lock_guard<std::mutex> lock(sse_mutex_);
-            raw_stream_clients_.erase(
-                std::remove_if(raw_stream_clients_.begin(), raw_stream_clients_.end(),
-                               [&client](const std::shared_ptr<SSEClient> &c)
-                               { return c.get() == client.get(); }),
-                raw_stream_clients_.end());
-        }
-
-        bool auth_enabled_ = false;
-        std::string auth_credentials_;
-        std::string admin_credentials_;
-
+    private:
         // Login history tracking
         std::mutex login_history_mutex_;
         std::deque<LoginAttempt> login_history_;

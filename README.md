@@ -81,10 +81,12 @@ Add the plugin to your trunk-recorder `config.json` to get started:
 | ssl_cert                        |          | `""`          | string     | Path to SSL certificate PEM                                                       |
 | ssl_key                         |          | `""`          | string     | Path to SSL private key PEM                                                       |
 | console_lines                   |          | 5000          | integer    | Console log buffer size                                                           |
+| max_connections                 |          | 64            | integer    | Maximum simultaneous connections (page loads, API calls and open live streams); extra connections are refused |
 | theme                           |          | `"nostromo"`  | string     | Default UI theme (`nostromo`, `classic`, `hotdog`)                                |
 | affiliation_timeout             |          | 12            | integer    | Hours of inactivity before unit/TG marked idle                                    |
 | affiliation_cache               |          | `"affiliations.json"`   | string     | Path to save/load affiliation state ("" = disabled)                            |
 | affiliation_autosave            |          | 300           | integer    | Seconds between automatic saves of affiliation state                              |
+| trusted_proxies                 |          | `["127.0.0.1"]` | array    | Reverse-proxy addresses whose `X-Forwarded-For`/`X-Real-IP` headers are trusted for client IPs (rate limiting, login history) |
 
 ### Authentication
 
@@ -93,7 +95,26 @@ The plugin supports two-tier authentication:
 - **Info-level** (`username`/`password`): Read-only access to status, calls, and console
 - **Admin-level** (`admin_username`/`admin_password`): Full access including config editor and restart
 
-If only info-level credentials are set, all authenticated users have read-only access. If admin credentials are also set, admin features require the admin credentials. The `/health` endpoint always bypasses authentication for monitoring.
+Access depends on which credentials are configured:
+
+| Configured            | Read-only pages          | Admin features (config editor)   |
+| --------------------- | ------------------------ | -------------------------------- |
+| nothing               | open                     | **open to anyone who can connect** |
+| info-level only       | info login               | **info login**                   |
+| admin only            | open                     | admin login                      |
+| info + admin          | info or admin login      | admin login                      |
+
+If the dashboard is reachable by anyone you don't fully trust, set `admin_username`/`admin_password`. The plugin logs a warning at startup when admin features are not protected by admin credentials. The `/health` endpoint always bypasses authentication for monitoring.
+
+Failed logins are rate limited per client IP (10 per minute). The client IP is the TCP peer address; `X-Forwarded-For` is only honoured when the connection comes from an address in `trusted_proxies`.
+
+### Restart Button
+
+The admin **Restart** button asks trunk-recorder to shut down gracefully (SIGINT, the same as Ctrl+C): active calls are concluded and plugins are stopped before it exits. Something else has to start it again:
+
+- **systemd:** `Restart=always` in the service unit (`Restart=on-failure` will not restart after a clean exit)
+- **Docker:** a `restart: always` or `restart: unless-stopped` policy
+- **Run by hand:** trunk-recorder simply exits
 
 ### HTTPS Setup
 
@@ -152,7 +173,7 @@ Access the dashboard at `http://your-server:8080` (or `https://` if configured).
 | -------------------------- | ------ | -------------------------------- |
 | `/api/admin/config`        | GET    | Current config.json content      |
 | `/api/admin/save-config`   | POST   | Save config (creates backup)     |
-| `/api/admin/restart`       | POST   | Restart trunk-recorder via SIGHUP|
+| `/api/admin/restart`       | POST   | Graceful shutdown via SIGINT; restarting it requires a supervisor (see below) |
 | `/api/admin/login-history` | GET    | Recent login attempts            |
 
 ### Server-Sent Events

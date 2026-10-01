@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Trunk-Recorder Status</title>
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-    <link rel="alternate icon" href="/favicon.ico">
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="alternate icon" href="favicon.ico">
     <style>/* INJECT_CSS */</style>
 </head>
 <body>
@@ -109,7 +109,7 @@
                         <button class="chart-tab" data-period="60m" data-chart="rate" onclick="setChartPeriod('60m')">60 min</button>
                     </div>
                     <div class="chart-canvas-container chart-compact">
-                        <canvas id="rateChart" class="chart-canvas"></canvas>
+                        <div id="rateChart" class="chart-canvas"></div>
                     </div>
                     <div class="chart-legend" id="chartLegend"></div>
                 </div>
@@ -125,7 +125,7 @@
                         <button class="chart-tab" data-period="60m" data-chart="calls" onclick="setCallChartPeriod('60m')">60 min</button>
                     </div>
                     <div class="chart-canvas-container chart-compact">
-                        <canvas id="callRateChart" class="chart-canvas"></canvas>
+                        <div id="callRateChart" class="chart-canvas"></div>
                     </div>
                     <div class="chart-legend" id="callChartLegend"></div>
                 </div>
@@ -228,8 +228,7 @@
                 <div class="card-header">
                     <span class="card-title">Systems</span>
                 </div>
-                <div class="tabs" id="systemTabs"></div>
-                <div id="systemPanels"></div>
+                <div id="systemsRoot"></div>
             </div>
         </div>
         

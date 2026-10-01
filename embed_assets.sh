@@ -17,6 +17,7 @@ OUTPUT_FILE="$2"
 HTML_FILE="${WEB_DIR}/index.html"
 CSS_FILE="${WEB_DIR}/style.css"
 JS_FILE="${WEB_DIR}/app.js"
+SYSTEMS_JS_FILE="${WEB_DIR}/systems.js"
 
 # Check if input files exist
 if [ ! -f "$HTML_FILE" ]; then
@@ -31,19 +32,57 @@ if [ ! -f "$JS_FILE" ]; then
     echo "Error: $JS_FILE not found" >&2
     exit 1
 fi
+if [ ! -f "$SYSTEMS_JS_FILE" ]; then
+    echo "Error: $SYSTEMS_JS_FILE not found" >&2
+    exit 1
+fi
 
-# Create temporary file for processing HTML
+# Vendored libraries (web/vendor/README.md), in load order: hooks need preact
+VENDOR_DIR="${WEB_DIR}/vendor"
+VENDOR_JS="preact.min.umd.js preact-hooks.umd.js htm.umd.js uPlot.iife.min.js"
+VENDOR_CSS="uPlot.min.css"
+for f in $VENDOR_JS $VENDOR_CSS; do
+    if [ ! -f "${VENDOR_DIR}/$f" ]; then
+        echo "Error: ${VENDOR_DIR}/$f not found" >&2
+        exit 1
+    fi
+done
+
+# Create temporary files for processing
 TEMP_HTML=$(mktemp)
-trap "rm -f '$TEMP_HTML'" EXIT
+TEMP_CSS=$(mktemp)
+TEMP_JS=$(mktemp)
+trap "rm -f '$TEMP_HTML' '$TEMP_CSS' '$TEMP_JS'" EXIT
+
+# CSS: vendor styles first so style.css can override them
+for f in $VENDOR_CSS; do
+    cat "${VENDOR_DIR}/$f"
+    echo
+done > "$TEMP_CSS"
+cat "$CSS_FILE" >> "$TEMP_CSS"
+
+# JS: each vendor library in its own <script> element (the marker's <script> opens the
+# first one), then charts.js, app.js, and systems.js in the last one (closed by the marker's </script>)
+for f in $VENDOR_JS; do
+    cat "${VENDOR_DIR}/$f"
+    echo
+    echo '</script>'
+    echo '<script>'
+done > "$TEMP_JS"
+cat "${WEB_DIR}/charts.js" >> "$TEMP_JS"
+printf '\n</script>\n<script>\n' >> "$TEMP_JS"
+cat "$JS_FILE" >> "$TEMP_JS"
+printf '\n</script>\n<script>\n' >> "$TEMP_JS"
+cat "$SYSTEMS_JS_FILE" >> "$TEMP_JS"
 
 sed '/<style>\/\* INJECT_CSS \*\/<\/style>/ {
     s|<style>.*</style>|<style>|
-    r '"$CSS_FILE"'
+    r '"$TEMP_CSS"'
     a </style>
 }' "$HTML_FILE" | \
 sed '/<script>\/\* INJECT_JS \*\/<\/script>/ {
     s|<script>.*</script>|<script>|
-    r '"$JS_FILE"'
+    r '"$TEMP_JS"'
     a </script>
 }' > "$TEMP_HTML"
 

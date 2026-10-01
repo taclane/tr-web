@@ -31,6 +31,8 @@ const state = {
     callRateHistory: {},  // Per-system call count history
     config: null,
     consoleLogs: [],
+    consoleSeq: 0,       // newest console line sequence number already shown
+    callsReceivedAt: 0,  // Date.now() when the last `calls` snapshot arrived
     consoleMaxLines: 5000,  // Default, overridden by backend config
     trunkMessages: [],  // Omnitrunker: control channel messages
     unitAffiliations: {},  // Omnitrunker: unit -> talkgroup map
@@ -114,14 +116,10 @@ function pruneCallCaches() {
     capMap(state.missingSince, 5000);
 }
 
-// Helper to add auth headers to fetch requests
+// Requests authenticate with the HttpOnly session cookie; the token is never stored in page script
+try { localStorage.removeItem('session_token'); } catch (e) { /* storage unavailable */ }
 function getAuthHeaders() {
-    const headers = {};
-    const token = localStorage.getItem('session_token');
-    if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-    }
-    return headers;
+    return {};
 }
 
 // Wrapper around fetch that handles 401 responses by showing login modal
@@ -152,15 +150,18 @@ async function authenticatedFetch(url, options = {}) {
     return response;
 }
 
-// Authentication utilities  
+// 'unreachable' means the server didn't answer (restart, network, proxy 5xx): not a logout
 async function getCurrentAuthLevel() {
     try {
-        const response = await fetch(`${BASE_PATH}/api/whoami`, {
+        const response = await fetch(`${BASE_PATH}api/whoami`, {
             credentials: 'include',
             headers: getAuthHeaders(),
             cache: 'no-store'
         });
         
+        if (!response.ok && response.status !== 401 && response.status !== 403) {
+            return { level: 'unreachable', label: 'Server unreachable', username: '' };
+        }
         if (response.ok) {
             const data = await response.json();
             if (data.auth_level === 'admin') {
@@ -176,14 +177,57 @@ async function getCurrentAuthLevel() {
             }
         }
     } catch (err) {
-        console.error('Error detecting auth level:', err);
+        return { level: 'unreachable', label: 'Server unreachable', username: '' };
     }
     return { level: 'none', label: 'Unauthenticated', username: '' };
 }
 
+// ---------------------------------------------------------------- server restarts
+// When the server goes away (restart, reboot, network), show a banner and poll until it answers
+// again, then reload the page on the same tab: the server's state started over, and sessions
+// survive restarts, so no login is needed.
+let serverWaitTimer = null;
+let serverRestarting = false;
+
+function showServerBanner(text) {
+    let banner = document.getElementById('serverBanner');
+    if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'serverBanner';
+        banner.className = 'server-banner';
+        document.body.appendChild(banner);
+    }
+    banner.textContent = text;
+}
+
+function waitForServerAndReload() {
+    if (serverWaitTimer) return;
+    const started = Date.now();
+    const update = () => {
+        const secs = Math.round((Date.now() - started) / 1000);
+        showServerBanner(`${serverRestarting ? 'trunk-recorder is restarting' : 'Connection to trunk-recorder lost'}. Reconnecting… (${secs}s)`);
+    };
+    update();
+    const poll = async () => {
+        const authInfo = await getCurrentAuthLevel();
+        if (authInfo.level === 'unreachable') {
+            update();
+            serverWaitTimer = setTimeout(poll, 3000);
+            return;
+        }
+        showServerBanner('Reconnected. Reloading…');
+        const tab = document.querySelector('.main-tab.active');
+        if (tab && tab.dataset.tab) {
+            try { localStorage.setItem('postLoginTab', tab.dataset.tab); } catch (e) { /* storage unavailable */ }
+        }
+        window.location.reload();
+    };
+    serverWaitTimer = setTimeout(poll, 3000);
+}
+
 async function detectAuthLevelFromAdminAccess() {
     try {
-        const response = await fetch(`${BASE_PATH}/api/admin/login-history`, {
+        const response = await fetch(`${BASE_PATH}api/admin/login-history`, {
             credentials: 'include',
             cache: 'no-store'
         });
@@ -205,7 +249,7 @@ function logout() {
     }
     
     // Call the logout endpoint to delete session
-    fetch(`${BASE_PATH}/api/logout`, {
+    fetch(`${BASE_PATH}api/logout`, {
         method: 'POST',
         credentials: 'include',
         headers: {
@@ -238,7 +282,7 @@ async function updateAuthDisplay() {
         return true; // Can access site, no login required
     } else if (authInfo.level !== 'none') {
         const displayLabel = authInfo.username ? `${authInfo.label} (${authInfo.username})` : authInfo.label;
-        authLevelEl.innerHTML = `<span class="badge badge-${authInfo.level}">${displayLabel}</span>`;
+        authLevelEl.innerHTML = `<span class="badge badge-${escapeHtml(authInfo.level)}">${escapeHtml(displayLabel)}</span>`;
         authLevelEl.style.display = 'inline';
         logoutBtn.style.display = 'inline-block';
         return true; // Authenticated
@@ -259,7 +303,7 @@ async function handleLogin(event) {
     const errorEl = document.getElementById('loginError');
     
     try {
-        const response = await fetch(`${BASE_PATH}/api/login`, {
+        const response = await fetch(`${BASE_PATH}api/login`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -269,11 +313,7 @@ async function handleLogin(event) {
         });
         
         if (response.ok) {
-            const data = await response.json();
-            // Store token in localStorage as backup
-            if (data.token) {
-                localStorage.setItem('session_token', data.token);
-            }
+            // Session cookie was set by the response; nothing to store client-side
             // If login was triggered by admin tab gate, navigate there after reload
             if (pendingAdminAccess) {
                 localStorage.setItem('postLoginTab', 'admin');
@@ -322,6 +362,11 @@ function dismissLoginModal() {
 }
 
 async function checkAuthAndShowLogin() {
+    // Opened while the server is down: wait for it rather than asking for a login
+    if ((await getCurrentAuthLevel()).level === 'unreachable') {
+        waitForServerAndReload();
+        return false;
+    }
     const isAuthenticated = await updateAuthDisplay();
     if (!isAuthenticated) {
         showLoginModal();
@@ -435,6 +480,11 @@ function connect() {
         // Check if we're still authenticated before reconnecting
         try {
             const authInfo = await getCurrentAuthLevel();
+            if (serverRestarting || authInfo.level === 'unreachable') {
+                // Server restarting or unreachable: not a logout. Wait for it, then reload.
+                waitForServerAndReload();
+                return;
+            }
             if (authInfo.level === 'none') {
                 // Not authenticated anymore - show login modal instead of reconnecting
                 // (anonymous access is level 'anonymous', not 'none', so it won't trigger this)
@@ -462,6 +512,7 @@ function connect() {
     
     eventSource.addEventListener('calls', (e) => {
         lastSseDataTime = Date.now(); // Track data reception
+        state.callsReceivedAt = Date.now();
         const data = JSON.parse(e.data);
         const nextCalls = data.calls_active || [];
 
@@ -573,23 +624,12 @@ function connect() {
         pruneCallCaches();
     });
     
-    // Periodic refresh for elapsed time display (every second)
-    setInterval(() => {
-        if (state.calls.length > 0 || state.stoppedCalls.size > 0) {
-            updateCallsTable();
-        }
-    }, 1000);
     
     eventSource.addEventListener('systems', (e) => {
         lastSseDataTime = Date.now(); // Track data reception
         const data = JSON.parse(e.data);
         state.systems = data.systems || [];
-        // Preserve active system index when updating
-        const activeIdx = Array.from(document.querySelectorAll('#systemTabs .tab')).findIndex(t => t.classList.contains('active'));
         updateSystemTabs();
-        if (activeIdx >= 0 && activeIdx < state.systems.length) {
-            showSystem(activeIdx);
-        }
     });
 
     eventSource.addEventListener('devices', (e) => {
@@ -639,10 +679,23 @@ function connect() {
         }
     });
 
+    eventSource.addEventListener('server_shutdown', () => {
+        serverRestarting = true;
+        showServerBanner('trunk-recorder is restarting. Reconnecting…');
+    });
+
     eventSource.addEventListener('console_batch', (e) => {
         const data = JSON.parse(e.data);
-        if (Array.isArray(data.lines) && data.lines.length) {
-            addConsoleLines(data.lines);
+        let lines = Array.isArray(data.lines) ? data.lines : [];
+        // Skip lines already included in the history loaded from /api/status
+        if (Array.isArray(data.seqs) && data.seqs.length === lines.length) {
+            lines = lines.filter((_, i) => data.seqs[i] > state.consoleSeq);
+            for (const seq of data.seqs) {
+                if (seq > state.consoleSeq) state.consoleSeq = seq;
+            }
+        }
+        if (lines.length) {
+            addConsoleLines(lines);
         }
         if (data.dropped) {
             addConsoleLine(`[console] dropped ${data.dropped} lines`);
@@ -810,7 +863,7 @@ function updateRecordersTable() {
             html += `
                 <tr>
                     <td style="padding-left: 20px;">${srcNum}-${recNum}</td>
-                    <td>${r.type || '-'}</td>
+                    <td>${escapeHtml(r.type || '-')}</td>
                     <td class="freq">${formatFreq(r.freq)}</td>
                     <td>${getStateBadge(r.rec_state_type)}</td>
                     <td>${(r.duration || 0).toFixed(1)}s</td>
@@ -824,7 +877,33 @@ function updateRecordersTable() {
     updateLastUpdate();
 }
 
+// Rebuilds the table at most every 250 ms, and not while the page is hidden
+let callsTableRenderPending = false;
+let lastCallsTableRender = 0;
 function updateCallsTable() {
+    if (callsTableRenderPending) return;
+    callsTableRenderPending = true;
+    const wait = Math.max(0, 250 - (Date.now() - lastCallsTableRender));
+    setTimeout(() => requestAnimationFrame(() => {
+        callsTableRenderPending = false;
+        lastCallsTableRender = Date.now();
+        renderCallsTable();
+    }), wait);
+}
+
+// Live elapsed times tick locally between snapshots (see tickCallElapsed())
+function secondsSinceCallsSnapshot() {
+    return state.callsReceivedAt ? Math.floor((Date.now() - state.callsReceivedAt) / 1000) : 0;
+}
+
+function tickCallElapsed() {
+    const extra = secondsSinceCallsSnapshot();
+    document.querySelectorAll('#allCallsTable td[data-elapsed]').forEach(td => {
+        td.textContent = `${Number(td.dataset.elapsed) + extra}s`;
+    });
+}
+
+function renderCallsTable() {
     const tbody = document.querySelector('#allCallsTable tbody');
     const count = document.getElementById('activeCallCount');
 
@@ -832,6 +911,8 @@ function updateCallsTable() {
 
     const calls = getDisplayedCalls();
     const activeCalls = state.calls.length;
+    const liveKeys = new Set(state.calls.map(callKey).filter(Boolean));
+    const elapsedExtra = secondsSinceCallsSnapshot();
     
     // Combine active and recent calls, sorted by call number descending
     const allItems = [];
@@ -875,8 +956,14 @@ function updateCallsTable() {
         
         // Time/Length column: show elapsed for active, length for recent
         let timeLen;
+        let timeCell;
         if (item.isActive) {
             timeLen = `${c.elapsed || 0}s`;
+            if (liveKeys.has(item.key)) {
+                // Live call: tickCallElapsed() advances this cell once a second
+                const base = Number(c.elapsed) || 0;
+                timeCell = `<td data-elapsed="${base}">${base + elapsedExtra}s</td>`;
+            }
         } else {
             const len = (c.length !== undefined && c.length !== null) ? Number(c.length).toFixed(1) : '-';
             timeLen = `${len}s`;
@@ -900,13 +987,13 @@ function updateCallsTable() {
         
         return `
             <tr class="${rowClass} ${selected ? 'selected' : ''}" ${dataAttr}>
-                <td>${c.call_num || '-'}</td>
-                <td>${c.sys_name || c.short_name || '-'}</td>
-                <td class="tg-num">${c.talkgroup || '-'}</td>
-                <td>${c.talkgroup_alpha_tag || c.talkgroup_alpha || '-'}</td>
+                <td>${escapeHtml(c.call_num || '-')}</td>
+                <td>${escapeHtml(c.sys_name || c.short_name || '-')}</td>
+                <td class="tg-num">${escapeHtml(c.talkgroup || '-')}</td>
+                <td>${escapeHtml(c.talkgroup_alpha_tag || c.talkgroup_alpha || '-')}</td>
                 <td class="freq">${freqDisplay}</td>
-                <td>${c.unit || c.srcId || '-'}</td>
-                <td>${timeLen}</td>
+                <td>${escapeHtml(c.unit || c.srcId || '-')}</td>
+                ${timeCell || `<td>${timeLen}</td>`}
                 <td>${stateHtml}</td>
             </tr>
         `;
@@ -1198,68 +1285,9 @@ function updateStats() {
         state.recorders.filter(r => r.rec_state_type === 'RECORDING').length;
 }
 
+// The Systems tab is rendered by systems.js (Preact); these hooks just ask it to redraw
 function updateSystemTabs() {
-    const tabs = document.getElementById('systemTabs');
-    const panels = document.getElementById('systemPanels');
-    
-    tabs.innerHTML = state.systems.map((s, i) => `
-        <div class="tab ${i === 0 ? 'active' : ''}" 
-             onclick="showSystem(${i})">${s.sys_name}</div>
-    `).join('');
-    
-    panels.innerHTML = state.systems.map((s, i) => `
-        <div class="system-panel ${i === 0 ? 'active' : ''}" id="system-${i}">
-            <div class="system-split">
-                <div class="system-left">
-                    <div class="stats-row">
-                        <div class="stat-box">
-                            <div class="stat-value">${s.sysid || '-'}</div>
-                            <div class="stat-label">SysID</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value" id="rate-${s.sys_name}">-</div>
-                            <div class="stat-label">Decode Rate</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value">${s.wacn || '-'}</div>
-                            <div class="stat-label">WACN</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value">${s.nac || '-'}</div>
-                            <div class="stat-label">NAC</div>
-                        </div>
-                    </div>
-                    <table>
-                        <tr><th>Type</th><td>${s.type || '-'}</td></tr>
-                        <tr><th>RFSS</th><td>${s.rfss || '-'}</td></tr>
-                        <tr><th>Site ID</th><td>${s.site_id || '-'}</td></tr>
-                    </table>
-                    <h4>Control Channels</h4>
-                    <div class="control-channels">
-                        ${(Array.isArray(s.control_channels) && s.control_channels.length) ?
-                            s.control_channels.map(cc => `
-                                <div class="cc-item ${cc === s.control_channel ? 'active' : ''}">
-                                    ${formatFreq(cc)}
-                                </div>
-                            `).join('') :
-                            `<div class="cc-item active">${formatFreq(s.control_channel)}</div>`
-                        }
-                    </div>
-                    <h4>Data</h4>
-                    <div class="data-links">
-                        <button class="data-link" onclick="loadSystemData(${i}, 'talkgroups')">Talkgroups</button>
-                        <button class="data-link" onclick="loadSystemData(${i}, 'unit_tags')">Unit Tags</button>
-                        <button class="data-link" onclick="loadSystemData(${i}, 'unit_tags_ota')">OTA Aliases</button>
-                    </div>
-                </div>
-                <div class="system-right">
-                    <div class="system-display" id="system-display-${i}">Select a data type to display</div>
-                </div>
-            </div>
-        </div>
-    `).join('');
-    
-    updateStats();
+    if (typeof renderSystemsTab === 'function') renderSystemsTab();
 }
 
 function fmtNumber(v, digits) {
@@ -1292,7 +1320,7 @@ function updateDevicesTiles() {
             const val = (gs && gs.value !== undefined && gs.value !== null) ? fmtNumber(gs.value, 1) : '-';
             return `
                 <div class="device-line span-2">
-                    <span class="k">${name}:</span>
+                    <span class="k">${escapeHtml(name)}:</span>
                     <span class="v">${val}</span>
                 </div>
             `;
@@ -1302,7 +1330,7 @@ function updateDevicesTiles() {
             <div class="device-tile">
                 <div class="device-title">
                     <span class="device-title-main">Device ${deviceNum}</span>
-                    <span class="device-title-meta">[${driver}]</span>
+                    <span class="device-title-meta">[${escapeHtml(driver)}]</span>
                 </div>
 
                 <div class="device-lines">
@@ -1313,7 +1341,7 @@ function updateDevicesTiles() {
 
                     <div class="device-line span-2">
                         <span class="k">Device:</span>
-                        <span class="v v-wrap">${deviceStr}</span>
+                        <span class="v v-wrap">${escapeHtml(deviceStr)}</span>
                     </div>
 
                     <div class="device-line">
@@ -1351,128 +1379,7 @@ function updateDevicesTiles() {
 }
 
 function updateSystemRates() {
-    Object.keys(state.rates).forEach(sysName => {
-        const el = document.getElementById('rate-' + sysName);
-        if (el) {
-            el.textContent = (state.rates[sysName].decoderate || 0).toFixed(1);
-        }
-    });
-}
-
-function showSystem(index) {
-    document.querySelectorAll('#systemTabs .tab').forEach((t, i) => {
-        t.classList.toggle('active', i === index);
-    });
-    document.querySelectorAll('.system-panel').forEach((p, i) => {
-        p.classList.toggle('active', i === index);
-    });
-}
-
-function loadSystemData(index, type) {
-    const sys = state.systems[index];
-    if (!sys) return;
-
-    const display = document.getElementById(`system-display-${index}`);
-    if (!display) return;
-
-    display.innerHTML = '<div class="loading">Loading...</div>';
-
-    fetch(`${BASE_PATH}api/system/${type}?sys_num=${sys.sys_num}`, {
-        credentials: 'include'
-    })
-        .then(r => r.json())
-        .then(data => {
-            if (type === 'talkgroups') {
-                if (Array.isArray(data) && data.length) {
-                    display.innerHTML = `
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Number</th>
-                                    <th>Alpha Tag</th>
-                                    <th>Description</th>
-                                    <th>Tag</th>
-                                    <th>Group</th>
-                                    <th>Priority</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${data.map(tg => `
-                                    <tr>
-                                        <td class="tg-num">${tg.number}</td>
-                                        <td>${tg.alpha_tag || '-'}</td>
-                                        <td>${tg.description || '-'}</td>
-                                        <td>${tg.tag || '-'}</td>
-                                        <td>${tg.group || '-'}</td>
-                                        <td>${tg.priority}</td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                } else {
-                    display.innerHTML = '<p>No talkgroups configured</p>';
-                }
-            } else if (type === 'unit_tags') {
-                if (data.tags && Array.isArray(data.tags) && data.tags.length) {
-                    display.innerHTML = `
-                        <p><strong>File:</strong> ${data.file || 'None'}</p>
-                        <p><strong>Mode:</strong> ${data.mode || 'default'}</p>
-                        <p><strong>Count:</strong> ${data.count || 0}</p>
-                        <table style="margin-top: 1rem;">
-                            <thead>
-                                <tr>
-                                    <th>Pattern (Regex)</th>
-                                    <th>Tag</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${data.tags.map(t => `
-                                    <tr>
-                                        <td style="font-family: 'Courier New', monospace;">${t.pattern || ''}</td>
-                                        <td>${t.tag || ''}</td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                } else {
-                    display.innerHTML = `
-                        <p><strong>File:</strong> ${data.file || 'None'}</p>
-                        <p><strong>Mode:</strong> ${data.mode || 'default'}</p>
-                        <p style="margin-top: 1rem;">No manual unit tags defined.</p>
-                    `;
-                }
-            } else if (type === 'unit_tags_ota') {
-                if (Array.isArray(data.aliases) && data.aliases.length) {
-                    display.innerHTML = `
-                        <p><strong>OTA File:</strong> ${data.file || 'None'}</p>
-                        <p><strong>Count:</strong> ${data.count || 0}</p>
-                        <table style="margin-top: 1rem;">
-                            <thead>
-                                <tr>
-                                    <th>Unit ID</th>
-                                    <th>Alias</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${data.aliases.map(a => `
-                                    <tr>
-                                        <td>${a.unit}</td>
-                                        <td>${a.alias}</td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                } else {
-                    display.innerHTML = `<p><strong>OTA File:</strong> ${data.file || 'None'}</p><p>No OTA aliases available</p>`;
-                }
-            }
-        })
-        .catch(err => {
-            display.innerHTML = `<p class="error">Error loading data: ${err.message}</p>`;
-        });
+    if (typeof renderSystemsTab === 'function') renderSystemsTab();
 }
 
 // Main tab navigation
@@ -1501,6 +1408,7 @@ async function _checkAdminAndActivate() {
 
 // Internal: actually switch the tab without auth gating
 function _activateMainTab(tabName) {
+    affiliationState.tabActive = (tabName === 'affiliations');
     document.querySelectorAll('.main-tab').forEach(t => {
         t.classList.toggle('active', t.dataset.tab === tabName);
     });
@@ -1511,6 +1419,9 @@ function _activateMainTab(tabName) {
     if (tabName === 'status') {
         updateChart();
         updateCallRateChart();
+    } else if (tabName === 'systems') {
+        updateSystemTabs();
+        window.dispatchEvent(new Event('systems-tab-shown'));
     } else if (tabName === 'console') {
         // Scroll console to bottom when tab is opened
         setTimeout(() => {
@@ -1527,7 +1438,7 @@ function _activateMainTab(tabName) {
             updateOmniMessages();
         }, 0);
     } else if (tabName === 'affiliations') {
-        // Load affiliations when tab is opened
+        // Load affiliations when tab is opened (a delta if we already have data)
         setTimeout(() => {
             loadAffiliations();
         }, 0);
@@ -1823,20 +1734,20 @@ function formatConsoleLine(line) {
 // Chart functionality
 let currentChartPeriod = '5m';
 let currentCallChartPeriod = '5m';
-let chartCanvas = null;
-let chartCtx = null;
-let callRateChartCanvas = null;
-let callRateChartCtx = null;
+// Status tab charts. Created on first update while visible: they need the container's width.
+let rateChart = null;
+let callRateChart = null;
 
 function initChart() {
-    chartCanvas = document.getElementById('rateChart');
-    if (chartCanvas) {
-        chartCtx = chartCanvas.getContext('2d');
-    }
-    
-    callRateChartCanvas = document.getElementById('callRateChart');
-    if (callRateChartCanvas) {
-        callRateChartCtx = callRateChartCanvas.getContext('2d');
+    if (!state.hiddenRateSystems) state.hiddenRateSystems = new Set();
+    if (!state.hiddenCallRateSystems) state.hiddenCallRateSystems = new Set();
+}
+
+function chartPeriodSeconds(period) {
+    switch (period) {
+        case '15m': return 15 * 60;
+        case '60m': return 60 * 60;
+        default: return 5 * 60;
     }
 }
 
@@ -1856,372 +1767,60 @@ function setCallChartPeriod(period) {
     updateCallRateChart();
 }
 
-function updateChart() {
-    if (!chartCtx) return;
-    
-    const canvas = chartCanvas;
-    const ctx = chartCtx;
-    
-    // Set canvas size
-    const container = canvas.parentElement;
-    canvas.width = container.clientWidth;
-    canvas.height = container.clientHeight;
-    
-    const width = canvas.width;
-    const height = canvas.height;
-    const padding = { top: 20, right: 20, bottom: 40, left: 50 };
-    const chartWidth = width - padding.left - padding.right;
-    const chartHeight = height - padding.top - padding.bottom;
-    
-    // Clear canvas (theme-driven)
-    ctx.fillStyle = cssVar('--bg-secondary', '#16213e');
-    ctx.fillRect(0, 0, width, height);
-    
-    // Determine time range
-    const now = Date.now();
-    let timeRange;
-    switch (currentChartPeriod) {
-        case '5m': timeRange = 5 * 60 * 1000; break;
-        case '15m': timeRange = 15 * 60 * 1000; break;
-        case '60m': timeRange = 60 * 60 * 1000; break;
-        default: timeRange = 5 * 60 * 1000;
-    }
-    const startTime = now - timeRange;
-    
-    // Y-axis: 0-40 fixed
-    const yMin = 0;
-    const yMax = 40;
-    
-    // Draw grid
-    ctx.strokeStyle = cssVar('--border', '#2a2a4e');
-    ctx.lineWidth = 1;
-    
-    // Horizontal grid lines
-    for (let y = 0; y <= 40; y += 10) {
-        const yPos = padding.top + chartHeight - (y / yMax * chartHeight);
-        ctx.beginPath();
-        ctx.moveTo(padding.left, yPos);
-        ctx.lineTo(width - padding.right, yPos);
-        ctx.stroke();
-        
-        // Y-axis labels
-        ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-        ctx.font = '11px sans-serif';
-        ctx.textAlign = 'right';
-        ctx.fillText(y.toString(), padding.left - 5, yPos + 4);
-    }
-    
-    // Time labels
-    ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-    ctx.font = '11px sans-serif';
-    ctx.textAlign = 'center';
-    const timeLabels = currentChartPeriod === '5m' ? 5 : currentChartPeriod === '15m' ? 5 : 6;
-    for (let i = 0; i <= timeLabels; i++) {
-        const t = startTime + (timeRange * i / timeLabels);
-        const x = padding.left + (chartWidth * i / timeLabels);
-        const date = new Date(t);
-        ctx.fillText(date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}), x, height - 10);
-    }
-    
-    // Y-axis title
-    ctx.save();
-    ctx.translate(15, height / 2);
-    ctx.rotate(-Math.PI / 2);
-    ctx.textAlign = 'center';
-    ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-    ctx.fillText('Decode Rate (msg/sec)', 0, 0);
-    ctx.restore();
-    
-    // Draw data lines for each system
-    const systems = Object.keys(state.rateHistory);
-    const legendContainer = document.getElementById('chartLegend');
-    if (legendContainer) {
-        legendContainer.innerHTML = '';
-    }
-    
-    // Initialize hidden systems set if not exists
-    if (!state.hiddenRateSystems) state.hiddenRateSystems = new Set();
-    
-    const palette = getChartPalette();
+// [{time: ms, <key>: value}] -> [[seconds, value]] within the window
+function chartPoints(history, key, xMin) {
+    return (history || []).filter(p => p.time / 1000 >= xMin).map(p => [p.time / 1000, p[key]]);
+}
 
-    systems.forEach((sysName, idx) => {
-        const data = state.rateHistory[sysName].filter(p => p.time >= startTime);
-        const color = palette[idx % palette.length];
-        const isHidden = state.hiddenRateSystems.has(sysName);
-        
-        // Draw line if not hidden and has enough data
-        if (!isHidden && data.length >= 2) {
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            
-            data.forEach((point, i) => {
-                const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
-                const y = padding.top + chartHeight - (point.rate / yMax * chartHeight);
-                
-                if (i === 0) {
-                    ctx.moveTo(x, y);
-                } else {
-                    ctx.lineTo(x, y);
-                }
-            });
-            
-            ctx.stroke();
-        }
-        
-        // Add to legend (always show, even if hidden)
-        if (legendContainer) {
-            const item = document.createElement('div');
-            item.className = 'legend-item' + (isHidden ? ' legend-hidden' : '');
-            item.style.cursor = 'pointer';
-            item.style.opacity = isHidden ? '0.4' : '1';
-            item.innerHTML = `<div class="legend-color" style="background: ${color}"></div>${sysName}`;
-            item.onclick = () => {
-                if (state.hiddenRateSystems.has(sysName)) {
-                    state.hiddenRateSystems.delete(sysName);
-                } else {
-                    state.hiddenRateSystems.add(sysName);
-                }
-                updateChart();
-            };
-            legendContainer.appendChild(item);
-        }
-    });
+function validSystemName(name) {
+    return name && name !== 'undefined' && name !== 'Unknown' && name.trim() !== '';
+}
+
+function updateChart() {
+    const el = document.getElementById('rateChart');
+    if (!el || !el.offsetParent) return; // Status tab not showing
+    initChart();
+    if (!rateChart) {
+        rateChart = new TimeChart(el, {
+            height: el.clientHeight || 220,
+            yStep: 10, yMinMax: 40, decimals: 1,
+            yLabel: 'Decode rate (msg/s)',
+            legendEl: document.getElementById('chartLegend'),
+            hidden: state.hiddenRateSystems,
+        });
+    }
+    const now = Date.now() / 1000;
+    const xMin = now - chartPeriodSeconds(currentChartPeriod);
+    const palette = getChartPalette();
+    const series = Object.keys(state.rateHistory).filter(validSystemName).map((name, idx) => ({
+        key: name, label: name, color: palette[idx % palette.length],
+        points: chartPoints(state.rateHistory[name], 'rate', xMin),
+    }));
+    rateChart.setData({ series, xMin, xMax: now });
 }
 
 function updateCallRateChart() {
-    if (!callRateChartCtx) return;
-    
-    const canvas = callRateChartCanvas;
-    const ctx = callRateChartCtx;
-    
-    // Set canvas size
-    const container = canvas.parentElement;
-    canvas.width = container.clientWidth;
-    canvas.height = container.clientHeight;
-    
-    const width = canvas.width;
-    const height = canvas.height;
-    const padding = { top: 20, right: 20, bottom: 40, left: 50 };
-    const chartWidth = width - padding.left - padding.right;
-    const chartHeight = height - padding.top - padding.bottom;
-    
-    // Clear canvas (theme-driven)
-    ctx.fillStyle = cssVar('--bg-secondary', '#16213e');
-    ctx.fillRect(0, 0, width, height);
-    
-    // Determine time range
-    const now = Date.now();
-    let timeRange;
-    switch (currentCallChartPeriod) {
-        case '5m': timeRange = 5 * 60 * 1000; break;
-        case '15m': timeRange = 15 * 60 * 1000; break;
-        case '60m': timeRange = 60 * 60 * 1000; break;
-        default: timeRange = 5 * 60 * 1000;
-    }
-    const startTime = now - timeRange;
-    
-    // Initialize hidden systems set if not exists
-    if (!state.hiddenCallRateSystems) state.hiddenCallRateSystems = new Set();
-    if (state.hiddenCallRateTotal === undefined) state.hiddenCallRateTotal = false;
-    
-    // Calculate total line first (needed for yMax calculation)
-    const systems = Object.keys(state.callRateHistory).filter(
-        name => name && name !== 'undefined' && name !== 'Unknown' && name.trim() !== ''
-    );
-    const totalData = [];
-    const allTimes = new Set();
-    systems.forEach(sysName => {
-        state.callRateHistory[sysName].forEach(p => {
-            if (p.time >= startTime) allTimes.add(p.time);
+    const el = document.getElementById('callRateChart');
+    if (!el || !el.offsetParent) return; // Status tab not showing
+    initChart();
+    if (!callRateChart) {
+        callRateChart = new TimeChart(el, {
+            height: el.clientHeight || 220,
+            yStep: 5, yMinMax: 5, decimals: 0, stepped: true,
+            yLabel: 'Active calls',
+            legendEl: document.getElementById('callChartLegend'),
+            hidden: state.hiddenCallRateSystems,
+            total: { label: 'Total', color: 'rgba(255, 255, 255, 0.45)' },
         });
-    });
-    
-    Array.from(allTimes).sort((a, b) => a - b).forEach(time => {
-        let sum = 0;
-        systems.forEach(sysName => {
-            const point = state.callRateHistory[sysName].find(p => p.time === time);
-            if (point) sum += point.count;
-        });
-        totalData.push({ time, count: sum });
-    });
-    
-    // Calculate max Y value from data (include visible systems and total if shown)
-    const yMin = 0;
-    const yStep = 2;  // Always use intervals of 2
-    let yMax = 10;  // Minimum range
-    
-    const visibleSystems = Object.keys(state.callRateHistory).filter(s => !state.hiddenCallRateSystems.has(s));
-    const allData = visibleSystems.flatMap(s => state.callRateHistory[s] || []).filter(p => p.time >= startTime);
-    
-    // Also include total data if total line is visible
-    const dataForScaling = allData.length > 0 ? allData.map(p => p.count) : [];
-    if (!state.hiddenCallRateTotal && totalData.length > 0) {
-        dataForScaling.push(...totalData.map(p => p.count));
     }
-    
-    if (dataForScaling.length > 0) {
-        const maxCount = Math.max(...dataForScaling);
-        // Round up to next even number (multiple of 2) with headroom
-        const targetMax = maxCount + 1;
-        yMax = Math.max(10, Math.ceil(targetMax / yStep) * yStep);
-    }
-    
-    // Draw grid
-    ctx.strokeStyle = cssVar('--border', '#2a2a4e');
-    ctx.lineWidth = 1;
-    
-    // Horizontal grid lines
-    for (let y = 0; y <= yMax; y += yStep) {
-        const yPos = padding.top + chartHeight - (y / yMax * chartHeight);
-        ctx.beginPath();
-        ctx.moveTo(padding.left, yPos);
-        ctx.lineTo(width - padding.right, yPos);
-        ctx.stroke();
-        
-        // Y-axis labels
-        ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-        ctx.font = '11px sans-serif';
-        ctx.textAlign = 'right';
-        ctx.fillText(y.toString(), padding.left - 5, yPos + 4);
-    }
-    
-    // Time labels
-    ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-    ctx.font = '11px sans-serif';
-    ctx.textAlign = 'center';
-    const timeLabels = currentCallChartPeriod === '5m' ? 5 : currentCallChartPeriod === '15m' ? 5 : 6;
-    for (let i = 0; i <= timeLabels; i++) {
-        const t = startTime + (timeRange * i / timeLabels);
-        const x = padding.left + (chartWidth * i / timeLabels);
-        const date = new Date(t);
-        ctx.fillText(date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}), x, height - 10);
-    }
-    
-    // Y-axis title
-    ctx.save();
-    ctx.translate(15, height / 2);
-    ctx.rotate(-Math.PI / 2);
-    ctx.textAlign = 'center';
-    ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-    ctx.fillText('Active Calls', 0, 0);
-    ctx.restore();
-    
-    // Draw data lines for each system + total
-    // Filter out invalid system names (undefined, Unknown, empty)
-    const legendContainer = document.getElementById('callChartLegend');
-    if (legendContainer) {
-        legendContainer.innerHTML = '';
-    }
-    
+    const now = Date.now() / 1000;
+    const xMin = now - chartPeriodSeconds(currentCallChartPeriod);
     const palette = getChartPalette();
-
-    // Draw individual system lines as step charts (calls are discrete)
-    systems.forEach((sysName, idx) => {
-        const data = state.callRateHistory[sysName].filter(p => p.time >= startTime);
-        const color = palette[idx % palette.length];
-        const isHidden = state.hiddenCallRateSystems.has(sysName);
-        
-        // Draw line if not hidden and has data
-        if (!isHidden && data.length >= 1) {
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            
-            // Step-based rendering: calls remain constant until they change
-            data.forEach((point, i) => {
-                const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
-                const y = padding.top + chartHeight - (point.count / yMax * chartHeight);
-                
-                if (i === 0) {
-                    // Start at first point
-                    ctx.moveTo(x, y);
-                } else {
-                    // Draw horizontal line from previous point, then vertical step to new value
-                    const prevPoint = data[i - 1];
-                    const prevX = padding.left + ((prevPoint.time - startTime) / timeRange * chartWidth);
-                    const prevY = padding.top + chartHeight - (prevPoint.count / yMax * chartHeight);
-                    
-                    // Horizontal plateau at previous value
-                    ctx.lineTo(x, prevY);
-                    // Vertical step to new value
-                    ctx.lineTo(x, y);
-                }
-                
-                // Extend plateau to next point or end of chart
-                if (i === data.length - 1) {
-                    ctx.lineTo(width - padding.right, y);
-                }
-            });
-            
-            ctx.stroke();
-        }
-        
-        // Add to legend (always show, even if hidden)
-        if (legendContainer) {
-            const item = document.createElement('div');
-            item.className = 'legend-item' + (isHidden ? ' legend-hidden' : '');
-            item.style.cursor = 'pointer';
-            item.style.opacity = isHidden ? '0.4' : '1';
-            item.innerHTML = `<div class="legend-color" style="background: ${color}"></div>${sysName}`;
-            item.onclick = () => {
-                if (state.hiddenCallRateSystems.has(sysName)) {
-                    state.hiddenCallRateSystems.delete(sysName);
-                } else {
-                    state.hiddenCallRateSystems.add(sysName);
-                }
-                updateCallRateChart();
-            };
-            legendContainer.appendChild(item);
-        }
-    });
-    
-    // Draw total line as step chart (subtle, semi-transparent)
-    if (!state.hiddenCallRateTotal && totalData.length >= 1) {
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        
-        totalData.forEach((point, i) => {
-            const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
-            const y = padding.top + chartHeight - (point.count / yMax * chartHeight);
-            
-            if (i === 0) {
-                ctx.moveTo(x, y);
-            } else {
-                // Step-based: horizontal plateau then vertical step
-                const prevPoint = totalData[i - 1];
-                const prevX = padding.left + ((prevPoint.time - startTime) / timeRange * chartWidth);
-                const prevY = padding.top + chartHeight - (prevPoint.count / yMax * chartHeight);
-                
-                ctx.lineTo(x, prevY);
-                ctx.lineTo(x, y);
-            }
-            
-            // Extend to end of chart on last point
-            if (i === totalData.length - 1) {
-                ctx.lineTo(width - padding.right, y);
-            }
-        });
-        
-        ctx.stroke();
-        ctx.setLineDash([]);
-    }
-        
-    // Add total to legend (always show, with toggle)
-    if (legendContainer) {
-        const item = document.createElement('div');
-        item.className = 'legend-item' + (state.hiddenCallRateTotal ? ' legend-hidden' : '');
-        item.style.cursor = 'pointer';
-        item.style.opacity = state.hiddenCallRateTotal ? '0.4' : '1';
-        item.innerHTML = `<div class="legend-color" style="background: rgba(255,255,255,0.35); border: 1px dashed rgba(255,255,255,0.5)"></div>Total`;
-        item.onclick = () => {
-            state.hiddenCallRateTotal = !state.hiddenCallRateTotal;
-            updateCallRateChart();
-        };
-        legendContainer.appendChild(item);
-    }
+    const series = Object.keys(state.callRateHistory).filter(validSystemName).map((name, idx) => ({
+        key: name, label: name, color: palette[idx % palette.length],
+        points: chartPoints(state.callRateHistory[name], 'count', xMin),
+    }));
+    callRateChart.setData({ series, xMin, xMax: now });
 }
 
 // Admin functions
@@ -2258,8 +1857,8 @@ function refreshLoginHistory() {
             
             tr.innerHTML = `
                 <td>${timeStr}</td>
-                <td>${entry.username || 'none'}</td>
-                <td>${entry.client_ip}</td>
+                <td>${escapeHtml(entry.username || 'none')}</td>
+                <td>${escapeHtml(entry.client_ip)}</td>
                 <td>${levelBadge}</td>
                 <td>${successBadge}</td>
             `;
@@ -2459,8 +2058,7 @@ function saveConfig() {
             'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-            content: content,
-            path: configPath
+            content: content
         })
     })
     .then(response => {
@@ -2607,7 +2205,9 @@ function restartTrunkRecorder() {
     }
     
     authenticatedFetch(`${BASE_PATH}api/admin/restart`, {
-        method: 'POST'
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
     })
     .then(response => {
         if (!response.ok) throw new Error('Failed to initiate restart');
@@ -2672,6 +2272,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             if (data.consoleLogs) {
                 state.consoleLogs = data.consoleLogs;
+                if (typeof data.consoleSeq === 'number') state.consoleSeq = data.consoleSeq;
                 hasScrolledConsole = false;
                 renderConsole();
                 // Double-check scroll after a delay to ensure DOM is fully rendered
@@ -2750,16 +2351,20 @@ document.addEventListener('DOMContentLoaded', async () => {
                 state.selectedActiveCallKey = null;
             }
             
-            updateCallsTable();
+            renderCallsTable();
             updateDetailsPane();
         });
     }
 
-    // Periodically prune STOPPED calls into Recent
+    // Once a second: move expired STOPPED calls to Recent and advance elapsed times
     setInterval(() => {
+        const stoppedBefore = state.stoppedCalls.size;
         pruneStoppedCalls();
-        updateCallsTable();
-    }, 500);
+        if (state.stoppedCalls.size !== stoppedBefore) {
+            updateCallsTable();
+        }
+        tickCallElapsed();
+    }, 1000);
     
     // Update voice channels periodically
     setInterval(() => {
@@ -3007,8 +2612,42 @@ const affiliationState = {
     sortColumn: 'id',
     sortDirection: 'asc',
     searchTerm: '',
-    filterWacnSysid: 'all' // 'all' or 'wacn:sysid' format
+    filterWacnSysid: 'all', // 'all' or 'wacn:sysid' format
+
+    // Local copy keyed "wacn:sysid:id"; refreshed with deltas (?since=) after the first load
+    unitsByKey: new Map(),
+    talkgroupsByKey: new Map(),
+    serverTime: 0,          // server_time of the last response, sent back as ?since=
+    lastFullLoadAt: 0,      // Date.now() of the last full load
+    timeoutHours: 12,       // idle threshold, from the server's config
+    tabActive: false,       // refresh only while the Affiliations tab is showing
+    loading: false,
+
+    // Virtual list: only rows near the viewport are in the DOM; spacer rows hold the rest's height
+    filtered: [],           // current view after filter + sort
+    heights: new Map(),     // measured height of each item (main + details row), by view key
+    estimates: new Map(),   // cached estimates for items not yet measured
+    rendered: null,         // {start, end} item range currently in the DOM
+    ensureKey: null,        // row a jump link wants scrolled into view
+    collapsed: new Set()    // keys whose association row the user has hidden
 };
+
+const AFFILIATION_FULL_RELOAD_MS = 10 * 60 * 1000;
+
+// After a view, sort, filter or search change, scroll the table top back into view
+function scrollAffiliationsToTop() {
+    const table = document.querySelector('.affiliation-view.active .affiliation-table');
+    if (!table) return;
+    const top = table.getBoundingClientRect().top + window.scrollY - 80;
+    if (window.scrollY > top) window.scrollTo({ top: Math.max(0, top) });
+}
+const AFFILIATION_BUFFER_PX = 1500;   // rendered above and below the viewport
+
+// Computed here: with delta updates the server's is_idle goes stale on unchanged records
+function affiliationIsIdle(item) {
+    const now = Math.floor(Date.now() / 1000);
+    return (now - item.last_active) > affiliationState.timeoutHours * 3600;
+}
 
 function toggleApiInfo() {
         // Setup copy button with clipboard API and feedback
@@ -3066,6 +2705,7 @@ function showAffiliationView(view) {
         v.classList.toggle('active', v.id === `view-${view}`);
     });
     
+    scrollAffiliationsToTop();
     renderAffiliationTable();
 }
 
@@ -3084,67 +2724,92 @@ function parseCompactArray(dataArray, schema) {
     });
 }
 
-async function loadAffiliations() {
-    console.log('[Affiliations] loadAffiliations called');
-    
+async function loadAffiliations(forceFull = false) {
+    if (affiliationState.loading) return;
+    affiliationState.loading = true;
+
     // Show loading indicator
     const currentView = affiliationState.currentView;
     const tbody = document.getElementById(currentView === 'units' ? 'unitTableBody' : 'talkgroupTableBody');
     if (tbody && tbody.children.length === 0) {
         tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:20px; color:var(--text-secondary);">Loading...</td></tr>';
     }
-    
+
+    // Full load at first and every 10 minutes; otherwise only changes since the last response
+    const full = forceFull || !affiliationState.serverTime ||
+                 (Date.now() - affiliationState.lastFullLoadAt) > AFFILIATION_FULL_RELOAD_MS;
+    const url = full ? `${BASE_PATH}api/affiliations`
+                     : `${BASE_PATH}api/affiliations?since=${affiliationState.serverTime}`;
+
     try {
-        console.log('[Affiliations] Fetching data from /api/affiliations');
-        
-        // Fetch both units and talkgroups so detail rows can show status circles
-        const response = await fetch(`${BASE_PATH}api/affiliations`, {
+        const response = await fetch(url, {
             credentials: 'same-origin',
             headers: {
                 'Accept': 'application/json'
             }
         });
-        console.log('[Affiliations] Response status:', response.status, response.statusText);
-        
+
         if (!response.ok) {
             console.error('[Affiliations] Failed to fetch:', response.status, response.statusText);
-            const errorText = await response.text();
-            console.error('[Affiliations] Error body:', errorText);
-            if (tbody) {
+            if (tbody && full) {
                 tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:20px; color:var(--error);">Failed to load data</td></tr>';
             }
             return;
         }
-        
+
         const data = await response.json();
-        console.log('[Affiliations] Received data:', { 
-            units: data.units?.length || 0, 
-            talkgroups: data.talkgroups?.length || 0,
-            total_units: data.total_units || 0,
-            total_talkgroups: data.total_talkgroups || 0,
-            has_schema: !!data.schema
-        });
-        
+
         // Convert compact array format to object format if schema is present
+        let units, talkgroups;
         if (data.schema) {
-            affiliationState.units = parseCompactArray(data.units, data.schema.units);
-            affiliationState.talkgroups = parseCompactArray(data.talkgroups, data.schema.talkgroups);
+            units = parseCompactArray(data.units, data.schema.units);
+            talkgroups = parseCompactArray(data.talkgroups, data.schema.talkgroups);
         } else {
             // Fallback for old format
-            affiliationState.units = data.units || [];
-            affiliationState.talkgroups = data.talkgroups || [];
+            units = data.units || [];
+            talkgroups = data.talkgroups || [];
         }
-        
-        // Populate WACN:SYSID filter dropdown
-        populateWacnSysidFilter();
-        
+
+        // A server without delta support ignores ?since= and returns everything: treat as full
+        const isFull = full || !data.delta;
+        const prevUnits = affiliationState.unitsByKey;
+        const prevTalkgroups = affiliationState.talkgroupsByKey;
+        if (isFull) {
+            affiliationState.unitsByKey = new Map();
+            affiliationState.talkgroupsByKey = new Map();
+            affiliationState.lastFullLoadAt = Date.now();
+        }
+        // Keep measured heights of unchanged rows, so rows don't shift under the scroll position
+        const merge = (items, map, prevMap, isUnits) => items.forEach(item => {
+            const key = affiliationItemKey(item);
+            const prev = prevMap.get(key);
+            const activity = x => Object.keys((isUnits ? x.tg_activity : x.unit_activity) || {}).length;
+            if (!prev || prev.alias !== item.alias || activity(prev) !== activity(item)) {
+                forgetAffiliationHeight(affiliationViewKey(item, isUnits));
+            }
+            map.set(key, item);
+        });
+        merge(units, affiliationState.unitsByKey, prevUnits, true);
+        merge(talkgroups, affiliationState.talkgroupsByKey, prevTalkgroups, false);
+
+        affiliationState.units = Array.from(affiliationState.unitsByKey.values());
+        affiliationState.talkgroups = Array.from(affiliationState.talkgroupsByKey.values());
+        if (data.server_time) affiliationState.serverTime = data.server_time;
+        if (data.config && data.config.timeout_hours) affiliationState.timeoutHours = data.config.timeout_hours;
+
+        if (isFull) {
+            // Populate WACN:SYSID filter dropdown
+            populateWacnSysidFilter();
+        }
+        // Redraw even for an empty delta: "last active" ages and idle states change over time
         renderAffiliationTable();
     } catch (e) {
         console.error('[Affiliations] Exception caught:', e);
-        console.error('[Affiliations] Stack:', e.stack);
-        if (tbody) {
+        if (tbody && full) {
             tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:20px; color:var(--error);">Error loading data</td></tr>';
         }
+    } finally {
+        affiliationState.loading = false;
     }
 }
 
@@ -3175,9 +2840,7 @@ function renderTxCount(txCount) {
 }
 
 function renderStatusBadge(item, isUnit) {
-    const now = Math.floor(Date.now() / 1000);
-    const idleThreshold = 12 * 3600;
-    const isIdle = (now - item.last_active) > idleThreshold;
+    const isIdle = affiliationIsIdle(item);
     
     if (isUnit && !item.registered) {
         return '<span class="status-badge deregistered">⚪ Deregistered</span>';
@@ -3204,7 +2867,7 @@ function renderStatusBadges(item, isUnit) {
     
     if (isUnit && !item.registered) {
         badges.push('<span class="status-badge deregistered">⚪ Deregistered</span>');
-    } else if (item.is_idle) {
+    } else if (affiliationIsIdle(item)) {
         badges.push('<span class="status-badge idle">⚫ Idle</span>');
     } else {
         badges.push('<span class="status-badge active">● Active</span>');
@@ -3239,6 +2902,7 @@ function sortAffiliationTable(view, column) {
         affiliationState.sortColumn = column;
         affiliationState.sortDirection = 'desc';
     }
+    scrollAffiliationsToTop();
     renderAffiliationTable();
 }
 
@@ -3317,74 +2981,178 @@ function filterAndSortData(items) {
     return filtered;
 }
 
-function renderAffiliationTable() {
-    const startTime = performance.now();
-    const view = affiliationState.currentView;
-    const isUnits = view === 'units';
-    const data = isUnits ? affiliationState.units : affiliationState.talkgroups;
-    
-    const filtered = filterAndSortData(data);
-    
-    const tbody = document.getElementById(isUnits ? 'unitTableBody' : 'talkgroupTableBody');
-    
-    // CRITICAL: Save scroll position before DOM update
-    const container = document.querySelector('.tab-content');
-    const scrollPos = container ? container.scrollTop : 0;
-    
-    // Create lookup maps for O(1) access instead of O(n) find() calls
-    const unitMap = new Map();
-    const tgMap = new Map();
-    affiliationState.units.forEach(u => unitMap.set(`${u.wacn}:${u.sysid}:${u.id}`, u));
-    affiliationState.talkgroups.forEach(tg => tgMap.set(`${tg.wacn}:${tg.sysid}:${tg.id}`, tg));
-    
-    // Build HTML in memory first
-    const rowsHtml = filtered.map((item, idx) => {
-        const associatedCounts = isUnits ? item.tg_activity : item.unit_activity;
-        const itemKey = `${item.wacn}:${item.sysid}:${item.id}`;
-        const rowId = `aff-row-${item.wacn}-${item.sysid}-${item.id}`;
-        const detailsId = `aff-details-${item.wacn}-${item.sysid}-${item.id}`;
-        const hasAssociations = associatedCounts && Object.keys(associatedCounts).length > 0;
-        
-        return `<tr id="${rowId}" class="affiliation-main-row" style="cursor: pointer; font-size: 15px;"
-            onclick="toggleAffiliationDetails('${detailsId}')"
-            onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
-            onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">
-            <td><strong style="font-size: 1.25em;">${escapeHtml(item.id)}</strong></td>
-            <td><code style="color: var(--text-secondary); font-size: 12px;">${escapeHtml(formatAffHex(item.wacn, 5))}</code></td>
-            <td><code style="color: var(--text-secondary); font-size: 12px;">${escapeHtml(formatAffHex(item.sysid, 3))}</code></td>
-            <td>${item.alias ? '<span style="font-size: 1.15em; font-weight: 600;">' + escapeHtml(item.alias) + '</span>' : '<span style="color: var(--text-secondary);">—</span>'}</td>
-            <td>${renderStatusBadge(item, isUnits)}</td>
-            <td>${renderEncryptionBadge(item)}</td>
-            <td>${formatTimestamp(item.last_active)}</td>
-            <td><strong>${renderTxCount(item.tx_count)}</strong></td>
-        </tr>
-        <tr id="${detailsId}" class="affiliation-details-row" style="display:${hasAssociations ? 'table-row' : 'none'};"
-            onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
-            onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">
-            <td colspan="8" style="padding: 0; background: var(--bg-tertiary);">
-                <div style="padding: 12px 16px; border-top: 1px solid var(--border);">
-                    <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; text-transform: uppercase; font-weight: 600;">
-                        Associated ${isUnits ? 'Talkgroups' : 'Units'} (${Object.keys(associatedCounts).length})
-                    </div>
-                    <div style="display: flex; flex-wrap: wrap; gap: 6px;">
-                        ${renderAssociatedItemsCompact(associatedCounts, isUnits, item, unitMap, tgMap)}
-                    </div>
-                </div>
-            </td>
-        </tr>`;
-    }).join('');
-    
-    // Single DOM update
-    tbody.innerHTML = rowsHtml;
-    
-    // CRITICAL: Restore scroll position after DOM update
-    if (container && scrollPos > 0) {
-        container.scrollTop = scrollPos;
-    }
-    
-    const endTime = performance.now();
-    console.log(`[Affiliations] Rendered ${filtered.length} items in ${(endTime - startTime).toFixed(2)}ms`);
+function affiliationItemKey(item) {
+    return `${item.wacn}:${item.sysid}:${item.id}`;
 }
+
+// Per-view key for cached heights and collapsed state: unit 1234 and talkgroup 1234 differ
+function affiliationViewKey(item, isUnits) {
+    return (isUnits ? 'u:' : 't:') + affiliationItemKey(item);
+}
+
+// Height to assume for an item until it has been rendered and measured
+function estimateAffiliationHeight(item, isUnits) {
+    const key = affiliationViewKey(item, isUnits);
+    const measured = affiliationState.heights.get(key);
+    if (measured) return measured;
+    const cached = affiliationState.estimates.get(key);
+    if (cached) return cached;
+    const counts = (isUnits ? item.tg_activity : item.unit_activity) || {};
+    const n = Object.keys(counts).length;
+    const mainRow = 46;
+    let estimate = mainRow;
+    if (n > 0 && !affiliationState.collapsed.has(key)) {
+        const chipsPerLine = Math.max(1, Math.floor((window.innerWidth - 120) / 150));
+        estimate = mainRow + 44 + 30 * Math.ceil(n / chipsPerLine);
+    }
+    affiliationState.estimates.set(key, estimate);
+    return estimate;
+}
+
+// Forget cached sizes for one item (its content or collapsed state changed), or for all
+function forgetAffiliationHeight(key) {
+    if (key === undefined) {
+        affiliationState.heights.clear();
+        affiliationState.estimates.clear();
+    } else {
+        affiliationState.heights.delete(key);
+        affiliationState.estimates.delete(key);
+    }
+}
+
+function renderAffiliationItem(item, isUnits, unitMap, tgMap) {
+    const associatedCounts = (isUnits ? item.tg_activity : item.unit_activity) || {};
+    const itemKey = affiliationViewKey(item, isUnits);
+    const rowId = `aff-row-${item.wacn}-${item.sysid}-${item.id}`;
+    const detailsId = `aff-details-${item.wacn}-${item.sysid}-${item.id}`;
+    const hasAssociations = Object.keys(associatedCounts).length > 0;
+    const showDetails = hasAssociations && !affiliationState.collapsed.has(itemKey);
+
+    return `<tr id="${rowId}" class="affiliation-main-row" data-key="${itemKey}" style="cursor: pointer; font-size: 15px;"
+        onclick="toggleAffiliationDetails('${detailsId}', '${itemKey}')"
+        onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
+        onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">
+        <td><strong style="font-size: 1.25em;">${escapeHtml(item.id)}</strong></td>
+        <td><code style="color: var(--text-secondary); font-size: 12px;">${escapeHtml(formatAffHex(item.wacn, 5))}</code></td>
+        <td><code style="color: var(--text-secondary); font-size: 12px;">${escapeHtml(formatAffHex(item.sysid, 3))}</code></td>
+        <td>${item.alias ? '<span style="font-size: 1.15em; font-weight: 600;">' + escapeHtml(item.alias) + '</span>' : '<span style="color: var(--text-secondary);">—</span>'}</td>
+        <td>${renderStatusBadge(item, isUnits)}</td>
+        <td>${renderEncryptionBadge(item)}</td>
+        <td>${formatTimestamp(item.last_active)}</td>
+        <td><strong>${renderTxCount(item.tx_count)}</strong></td>
+    </tr>
+    <tr id="${detailsId}" class="affiliation-details-row" style="display:${showDetails ? 'table-row' : 'none'};"
+        onmouseover="highlightAffiliationRows('${rowId}', '${detailsId}', true)"
+        onmouseout="highlightAffiliationRows('${rowId}', '${detailsId}', false)">
+        <td colspan="8" style="padding: 0; background: var(--bg-tertiary);">
+            <div style="padding: 12px 16px; border-top: 1px solid var(--border);">
+                <div style="font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; text-transform: uppercase; font-weight: 600;">
+                    Associated ${isUnits ? 'Talkgroups' : 'Units'} (${Object.keys(associatedCounts).length})
+                </div>
+                <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+                    ${showDetails ? renderAssociatedItemsCompact(associatedCounts, isUnits, item, unitMap, tgMap) : ''}
+                </div>
+            </div>
+        </td>
+    </tr>`;
+}
+
+// Recompute the filtered, sorted list and redraw the visible slice
+function renderAffiliationTable() {
+    const isUnits = affiliationState.currentView === 'units';
+    const data = isUnits ? affiliationState.units : affiliationState.talkgroups;
+    affiliationState.filtered = filterAndSortData(data);
+
+    // A jump link asked for a specific row: scroll to where it will be, then draw
+    if (affiliationState.ensureKey) {
+        const key = affiliationState.ensureKey;
+        affiliationState.ensureKey = null;
+        const idx = affiliationState.filtered.findIndex(item => affiliationItemKey(item) === key);
+        const tbody = document.getElementById(isUnits ? 'unitTableBody' : 'talkgroupTableBody');
+        if (idx >= 0 && tbody) {
+            let offset = 0;
+            for (let i = 0; i < idx; i++) offset += estimateAffiliationHeight(affiliationState.filtered[i], isUnits);
+            const tbodyTop = tbody.getBoundingClientRect().top + window.scrollY;
+            window.scrollTo({ top: Math.max(0, tbodyTop + offset - window.innerHeight / 3) });
+        }
+    }
+
+    renderAffiliationWindow(true);
+}
+
+// Draw items within AFFILIATION_BUFFER_PX of the viewport, between two spacer rows
+function renderAffiliationWindow(force) {
+    const isUnits = affiliationState.currentView === 'units';
+    const tbody = document.getElementById(isUnits ? 'unitTableBody' : 'talkgroupTableBody');
+    if (!tbody || !tbody.offsetParent) return; // tab or view not showing
+    const items = affiliationState.filtered;
+
+    if (items.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:20px; color:var(--text-secondary);">No matching entries</td></tr>';
+        affiliationState.rendered = null;
+        return;
+    }
+
+    // Viewport position relative to the top of the list
+    const tbodyTop = tbody.getBoundingClientRect().top + window.scrollY;
+    const viewTop = window.scrollY - tbodyTop;
+    const viewBottom = viewTop + window.innerHeight;
+
+    // Items actually visible, and the buffered range to draw
+    let y = 0, visStart = -1, visEnd = -1, start = -1, end = items.length - 1;
+    for (let i = 0; i < items.length; i++) {
+        const h = estimateAffiliationHeight(items[i], isUnits);
+        if (start < 0 && y + h > viewTop - AFFILIATION_BUFFER_PX) start = i;
+        if (visStart < 0 && y + h > viewTop) visStart = i;
+        if (visEnd < 0 && y > viewBottom) visEnd = i;
+        if (y > viewBottom + AFFILIATION_BUFFER_PX) { end = i; break; }
+        y += h;
+    }
+    if (start < 0) start = Math.max(0, items.length - 1);
+    if (visStart < 0) visStart = start;
+    if (visEnd < 0) visEnd = items.length - 1;
+
+    // Scrolling within the already-drawn range needs no work
+    const r = affiliationState.rendered;
+    if (!force && r && visStart >= r.start && visEnd <= r.end) return;
+
+    let topSpace = 0, bottomSpace = 0;
+    for (let i = 0; i < start; i++) topSpace += estimateAffiliationHeight(items[i], isUnits);
+    for (let i = end + 1; i < items.length; i++) bottomSpace += estimateAffiliationHeight(items[i], isUnits);
+
+    const unitMap = affiliationState.unitsByKey;
+    const tgMap = affiliationState.talkgroupsByKey;
+    const spacer = (h, cls) => h > 0 ? `<tr class="${cls}" aria-hidden="true"><td colspan="8" style="height:${h}px; padding:0; border:0;"></td></tr>` : '';
+    let html = spacer(topSpace, 'aff-spacer-top');
+    for (let i = start; i <= end; i++) html += renderAffiliationItem(items[i], isUnits, unitMap, tgMap);
+    html += spacer(bottomSpace, 'aff-spacer-bottom');
+    tbody.innerHTML = html;
+    affiliationState.rendered = { start, end };
+
+    // Measure what was drawn so later spacers (and the scrollbar) use real heights
+    tbody.querySelectorAll('tr.affiliation-main-row').forEach(row => {
+        const details = row.nextElementSibling;
+        const h = row.offsetHeight + (details && details.style.display !== 'none' ? details.offsetHeight : 0);
+        if (h > 0) affiliationState.heights.set(row.dataset.key, h);
+    });
+}
+
+// Redraw the slice as the page scrolls (at most once per frame) or resizes
+let affiliationScrollPending = false;
+window.addEventListener('scroll', () => {
+    if (!affiliationState.tabActive || affiliationScrollPending) return;
+    affiliationScrollPending = true;
+    requestAnimationFrame(() => {
+        affiliationScrollPending = false;
+        renderAffiliationWindow(false);
+    });
+}, { passive: true });
+window.addEventListener('resize', () => {
+    if (!affiliationState.tabActive) return;
+    forgetAffiliationHeight(); // widths changed, so wrapped rows changed height
+    renderAffiliationWindow(true);
+});
+
 // Highlight both header and detail row on mouseover
 function highlightAffiliationRows(rowId, detailsId, highlight) {
     const mainRow = document.getElementById(rowId);
@@ -3401,12 +3169,16 @@ function highlightAffiliationRows(rowId, detailsId, highlight) {
 }
 window.highlightAffiliationRows = highlightAffiliationRows;
 
-function toggleAffiliationDetails(detailsId) {
-    const row = document.getElementById(detailsId);
-    if (row) {
-        const isVisible = row.style.display !== 'none';
-        row.style.display = isVisible ? 'none' : 'table-row';
+// Remember the choice by key so refreshes and re-renders keep the row as the user left it
+function toggleAffiliationDetails(detailsId, itemKey) {
+    if (!itemKey) return;
+    if (affiliationState.collapsed.has(itemKey)) {
+        affiliationState.collapsed.delete(itemKey);
+    } else {
+        affiliationState.collapsed.add(itemKey);
     }
+    forgetAffiliationHeight(itemKey);
+    renderAffiliationWindow(true);
 }
 
 function renderAssociatedItemsCompact(counts, isUnits, parentItem, unitMap, tgMap) {
@@ -3460,7 +3232,7 @@ function renderAssociatedItemsCompact(counts, isUnits, parentItem, unitMap, tgMa
                  onclick="event.stopPropagation(); ${clickHandler};" 
                  onmouseover="this.style.background='var(--bg-hover)'" 
                  onmouseout="this.style.background='var(--bg-secondary)'"
-                 title="${associatedItem && associatedItem.alias ? `${id}: ${associatedItem.alias}` : id}">
+                 title="${escapeHtml(associatedItem && associatedItem.alias ? `${id}: ${associatedItem.alias}` : id)}">
                 ${statusBadge}
                 <strong style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;">${escapeHtml(displayText)}</strong>
                 <span style="color: var(--text-secondary); margin-left: 2px;">(${formatCount(count)})</span>
@@ -3470,9 +3242,7 @@ function renderAssociatedItemsCompact(counts, isUnits, parentItem, unitMap, tgMa
 }
 
 function getStatusBadge(item, isUnit) {
-    const now = Math.floor(Date.now() / 1000);
-    const idleThreshold = 12 * 3600;
-    const isIdle = (now - item.last_active) > idleThreshold;
+    const isIdle = affiliationIsIdle(item);
     
     if (isUnit && !item.registered) {
         return '<span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #666;" title="Deregistered"></span>';
@@ -3504,6 +3274,7 @@ function jumpToTalkgroup(tgId, wacn, sysid) {
     const clearBtn = document.getElementById('clearAffiliationSearch');
     if (searchInput) searchInput.value = '';
     if (clearBtn) clearBtn.style.display = 'none';
+    affiliationState.ensureKey = `${wacn}:${sysid}:${tgId}`;
     showAffiliationView('talkgroups');
     
     // Scroll to the specific row after a short delay for rendering
@@ -3540,6 +3311,7 @@ function jumpToUnit(unitId, wacn, sysid) {
     const clearBtn = document.getElementById('clearAffiliationSearch');
     if (searchInput) searchInput.value = '';
     if (clearBtn) clearBtn.style.display = 'none';
+    affiliationState.ensureKey = `${wacn}:${sysid}:${unitId}`;
     showAffiliationView('units');
     
     // Scroll to the specific row after a short delay for rendering
@@ -3576,6 +3348,7 @@ function clearAffiliationSearch() {
     if (searchInput) searchInput.value = '';
     if (clearBtn) clearBtn.style.display = 'none';
     // Force full re-render and reset
+    scrollAffiliationsToTop();
     renderAffiliationTable();
 }
 
@@ -3612,6 +3385,7 @@ function populateWacnSysidFilter() {
 
 function filterByWacnSysid(value) {
     affiliationState.filterWacnSysid = value;
+    scrollAffiliationsToTop();
     renderAffiliationTable();
 }
 
@@ -3668,6 +3442,7 @@ document.addEventListener("visibilitychange", function() {
                 if (data.unitAffiliations) state.unitAffiliations = data.unitAffiliations;
                 if (data.consoleLogs) {
                     state.consoleLogs = data.consoleLogs;
+                    if (typeof data.consoleSeq === 'number') state.consoleSeq = data.consoleSeq;
                     hasScrolledConsole = false;
                 }
 
@@ -3720,23 +3495,16 @@ document.addEventListener('DOMContentLoaded', () => {
             // Debounce rendering for better performance
             clearTimeout(searchDebounceTimer);
             searchDebounceTimer = setTimeout(() => {
+                scrollAffiliationsToTop();
                 renderAffiliationTable();
             }, 150); // 150ms delay
         });
     }
     
-    // Smart periodic updates: refresh data every 30s but preserve user's sort/scroll position
+    // Refresh every 30 s while the Affiliations tab is showing
     setInterval(() => {
-        if (affiliationState.currentView) {
-            // Save current scroll position
-            const container = document.querySelector('.tab-content');
-            const scrollPos = container ? container.scrollTop : 0;
-            
-            // Refresh data without changing sort
-            loadAffiliations().then(() => {
-                // Restore scroll position
-                if (container) container.scrollTop = scrollPos;
-            });
+        if (affiliationState.tabActive && document.visibilityState === 'visible') {
+            loadAffiliations();
         }
-    }, 30000); // Update every 30 seconds
+    }, 30000);
 });

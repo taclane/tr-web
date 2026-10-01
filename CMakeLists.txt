@@ -13,20 +13,36 @@ add_custom_command(
         ${EMBED_SCRIPT}
         ${TR_WEB_DIR}/index.html
         ${TR_WEB_DIR}/style.css
+        ${TR_WEB_DIR}/charts.js
         ${TR_WEB_DIR}/app.js
+        ${TR_WEB_DIR}/systems.js
+        ${TR_WEB_DIR}/vendor/preact.min.umd.js
+        ${TR_WEB_DIR}/vendor/preact-hooks.umd.js
+        ${TR_WEB_DIR}/vendor/htm.umd.js
+        ${TR_WEB_DIR}/vendor/uPlot.iife.min.js
+        ${TR_WEB_DIR}/vendor/uPlot.min.css
     COMMENT "Generating embedded web assets for tr-web"
 )
+
+# Vendored SQLite (third_party/sqlite)
+# Hidden symbols: another SQLite loaded in the process can't interpose on ours
+set(TR_WEB_SQLITE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite/sqlite3.c)
+set_source_files_properties(${TR_WEB_SQLITE} PROPERTIES
+  COMPILE_DEFINITIONS "SQLITE_THREADSAFE=1;SQLITE_DQS=0;SQLITE_DEFAULT_MEMSTATUS=0;SQLITE_OMIT_LOAD_EXTENSION;SQLITE_OMIT_DEPRECATED;SQLITE_OMIT_SHARED_CACHE;SQLITE_LIKE_DOESNT_MATCH_BLOBS"
+  COMPILE_OPTIONS "-w;-fvisibility=hidden;-g1")
 
 # Plugin library - web assets are embedded automatically
 add_library(tr_web_plugin
 MODULE
   tr_web_plugin.cc
+  ${TR_WEB_SQLITE}
   ${TR_WEB_ASSETS_HEADER}
 )
 
 include_directories(
   ${CMAKE_BINARY_DIR}/../
   ${CMAKE_CURRENT_BINARY_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite
 )
 
 target_link_libraries(tr_web_plugin 

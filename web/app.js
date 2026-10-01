@@ -116,10 +116,7 @@ function pruneCallCaches() {
     capMap(state.missingSince, 5000);
 }
 
-// Helper to add auth headers to fetch requests.
-// The browser authenticates with the HttpOnly session cookie, which page script cannot read.
-// The token is deliberately not kept in localStorage, where any injected script could take it.
-// Bearer tokens remain supported server-side for external tools.
+// Requests authenticate with the HttpOnly session cookie; the token is never stored in page script
 try { localStorage.removeItem('session_token'); } catch (e) { /* storage unavailable */ }
 function getAuthHeaders() {
     return {};
@@ -153,7 +150,7 @@ async function authenticatedFetch(url, options = {}) {
     return response;
 }
 
-// Authentication utilities  
+// 'unreachable' means the server didn't answer (restart, network, proxy 5xx): not a logout
 async function getCurrentAuthLevel() {
     try {
         const response = await fetch(`${BASE_PATH}api/whoami`, {
@@ -162,6 +159,9 @@ async function getCurrentAuthLevel() {
             cache: 'no-store'
         });
         
+        if (!response.ok && response.status !== 401 && response.status !== 403) {
+            return { level: 'unreachable', label: 'Server unreachable', username: '' };
+        }
         if (response.ok) {
             const data = await response.json();
             if (data.auth_level === 'admin') {
@@ -177,9 +177,52 @@ async function getCurrentAuthLevel() {
             }
         }
     } catch (err) {
-        console.error('Error detecting auth level:', err);
+        return { level: 'unreachable', label: 'Server unreachable', username: '' };
     }
     return { level: 'none', label: 'Unauthenticated', username: '' };
+}
+
+// ---------------------------------------------------------------- server restarts
+// When the server goes away (restart, reboot, network), show a banner and poll until it answers
+// again, then reload the page on the same tab: the server's state started over, and sessions
+// survive restarts, so no login is needed.
+let serverWaitTimer = null;
+let serverRestarting = false;
+
+function showServerBanner(text) {
+    let banner = document.getElementById('serverBanner');
+    if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'serverBanner';
+        banner.className = 'server-banner';
+        document.body.appendChild(banner);
+    }
+    banner.textContent = text;
+}
+
+function waitForServerAndReload() {
+    if (serverWaitTimer) return;
+    const started = Date.now();
+    const update = () => {
+        const secs = Math.round((Date.now() - started) / 1000);
+        showServerBanner(`${serverRestarting ? 'trunk-recorder is restarting' : 'Connection to trunk-recorder lost'}. Reconnecting… (${secs}s)`);
+    };
+    update();
+    const poll = async () => {
+        const authInfo = await getCurrentAuthLevel();
+        if (authInfo.level === 'unreachable') {
+            update();
+            serverWaitTimer = setTimeout(poll, 3000);
+            return;
+        }
+        showServerBanner('Reconnected. Reloading…');
+        const tab = document.querySelector('.main-tab.active');
+        if (tab && tab.dataset.tab) {
+            try { localStorage.setItem('postLoginTab', tab.dataset.tab); } catch (e) { /* storage unavailable */ }
+        }
+        window.location.reload();
+    };
+    serverWaitTimer = setTimeout(poll, 3000);
 }
 
 async function detectAuthLevelFromAdminAccess() {
@@ -319,6 +362,11 @@ function dismissLoginModal() {
 }
 
 async function checkAuthAndShowLogin() {
+    // Opened while the server is down: wait for it rather than asking for a login
+    if ((await getCurrentAuthLevel()).level === 'unreachable') {
+        waitForServerAndReload();
+        return false;
+    }
     const isAuthenticated = await updateAuthDisplay();
     if (!isAuthenticated) {
         showLoginModal();
@@ -432,6 +480,11 @@ function connect() {
         // Check if we're still authenticated before reconnecting
         try {
             const authInfo = await getCurrentAuthLevel();
+            if (serverRestarting || authInfo.level === 'unreachable') {
+                // Server restarting or unreachable: not a logout. Wait for it, then reload.
+                waitForServerAndReload();
+                return;
+            }
             if (authInfo.level === 'none') {
                 // Not authenticated anymore - show login modal instead of reconnecting
                 // (anonymous access is level 'anonymous', not 'none', so it won't trigger this)
@@ -576,12 +629,7 @@ function connect() {
         lastSseDataTime = Date.now(); // Track data reception
         const data = JSON.parse(e.data);
         state.systems = data.systems || [];
-        // Preserve active system index when updating
-        const activeIdx = Array.from(document.querySelectorAll('#systemTabs .tab')).findIndex(t => t.classList.contains('active'));
         updateSystemTabs();
-        if (activeIdx >= 0 && activeIdx < state.systems.length) {
-            showSystem(activeIdx);
-        }
     });
 
     eventSource.addEventListener('devices', (e) => {
@@ -629,6 +677,11 @@ function connect() {
         if (data.line) {
             addConsoleLine(data.line);
         }
+    });
+
+    eventSource.addEventListener('server_shutdown', () => {
+        serverRestarting = true;
+        showServerBanner('trunk-recorder is restarting. Reconnecting…');
     });
 
     eventSource.addEventListener('console_batch', (e) => {
@@ -824,8 +877,7 @@ function updateRecordersTable() {
     updateLastUpdate();
 }
 
-// Every trigger (SSE events, timers, selection) goes through here; the table itself is
-// rebuilt at most every 250 ms, and not at all while the browser tab is hidden.
+// Rebuilds the table at most every 250 ms, and not while the page is hidden
 let callsTableRenderPending = false;
 let lastCallsTableRender = 0;
 function updateCallsTable() {
@@ -839,8 +891,7 @@ function updateCallsTable() {
     }), wait);
 }
 
-// Seconds since the last `calls` snapshot: live calls' elapsed times tick forward locally
-// between snapshots without rebuilding the table (see tickCallElapsed()).
+// Live elapsed times tick locally between snapshots (see tickCallElapsed())
 function secondsSinceCallsSnapshot() {
     return state.callsReceivedAt ? Math.floor((Date.now() - state.callsReceivedAt) / 1000) : 0;
 }
@@ -1234,68 +1285,9 @@ function updateStats() {
         state.recorders.filter(r => r.rec_state_type === 'RECORDING').length;
 }
 
+// The Systems tab is rendered by systems.js (Preact); these hooks just ask it to redraw
 function updateSystemTabs() {
-    const tabs = document.getElementById('systemTabs');
-    const panels = document.getElementById('systemPanels');
-    
-    tabs.innerHTML = state.systems.map((s, i) => `
-        <div class="tab ${i === 0 ? 'active' : ''}" 
-             onclick="showSystem(${i})">${escapeHtml(s.sys_name)}</div>
-    `).join('');
-    
-    panels.innerHTML = state.systems.map((s, i) => `
-        <div class="system-panel ${i === 0 ? 'active' : ''}" id="system-${i}">
-            <div class="system-split">
-                <div class="system-left">
-                    <div class="stats-row">
-                        <div class="stat-box">
-                            <div class="stat-value">${s.sysid || '-'}</div>
-                            <div class="stat-label">SysID</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value" id="rate-${escapeHtml(s.sys_name)}">-</div>
-                            <div class="stat-label">Decode Rate</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value">${s.wacn || '-'}</div>
-                            <div class="stat-label">WACN</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value">${s.nac || '-'}</div>
-                            <div class="stat-label">NAC</div>
-                        </div>
-                    </div>
-                    <table>
-                        <tr><th>Type</th><td>${escapeHtml(s.type || '-')}</td></tr>
-                        <tr><th>RFSS</th><td>${s.rfss || '-'}</td></tr>
-                        <tr><th>Site ID</th><td>${s.site_id || '-'}</td></tr>
-                    </table>
-                    <h4>Control Channels</h4>
-                    <div class="control-channels">
-                        ${(Array.isArray(s.control_channels) && s.control_channels.length) ?
-                            s.control_channels.map(cc => `
-                                <div class="cc-item ${cc === s.control_channel ? 'active' : ''}">
-                                    ${formatFreq(cc)}
-                                </div>
-                            `).join('') :
-                            `<div class="cc-item active">${formatFreq(s.control_channel)}</div>`
-                        }
-                    </div>
-                    <h4>Data</h4>
-                    <div class="data-links">
-                        <button class="data-link" onclick="loadSystemData(${i}, 'talkgroups')">Talkgroups</button>
-                        <button class="data-link" onclick="loadSystemData(${i}, 'unit_tags')">Unit Tags</button>
-                        <button class="data-link" onclick="loadSystemData(${i}, 'unit_tags_ota')">OTA Aliases</button>
-                    </div>
-                </div>
-                <div class="system-right">
-                    <div class="system-display" id="system-display-${i}">Select a data type to display</div>
-                </div>
-            </div>
-        </div>
-    `).join('');
-    
-    updateStats();
+    if (typeof renderSystemsTab === 'function') renderSystemsTab();
 }
 
 function fmtNumber(v, digits) {
@@ -1387,128 +1379,7 @@ function updateDevicesTiles() {
 }
 
 function updateSystemRates() {
-    Object.keys(state.rates).forEach(sysName => {
-        const el = document.getElementById('rate-' + sysName);
-        if (el) {
-            el.textContent = (state.rates[sysName].decoderate || 0).toFixed(1);
-        }
-    });
-}
-
-function showSystem(index) {
-    document.querySelectorAll('#systemTabs .tab').forEach((t, i) => {
-        t.classList.toggle('active', i === index);
-    });
-    document.querySelectorAll('.system-panel').forEach((p, i) => {
-        p.classList.toggle('active', i === index);
-    });
-}
-
-function loadSystemData(index, type) {
-    const sys = state.systems[index];
-    if (!sys) return;
-
-    const display = document.getElementById(`system-display-${index}`);
-    if (!display) return;
-
-    display.innerHTML = '<div class="loading">Loading...</div>';
-
-    fetch(`${BASE_PATH}api/system/${type}?sys_num=${sys.sys_num}`, {
-        credentials: 'include'
-    })
-        .then(r => r.json())
-        .then(data => {
-            if (type === 'talkgroups') {
-                if (Array.isArray(data) && data.length) {
-                    display.innerHTML = `
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Number</th>
-                                    <th>Alpha Tag</th>
-                                    <th>Description</th>
-                                    <th>Tag</th>
-                                    <th>Group</th>
-                                    <th>Priority</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${data.map(tg => `
-                                    <tr>
-                                        <td class="tg-num">${escapeHtml(tg.number)}</td>
-                                        <td>${escapeHtml(tg.alpha_tag || '-')}</td>
-                                        <td>${escapeHtml(tg.description || '-')}</td>
-                                        <td>${escapeHtml(tg.tag || '-')}</td>
-                                        <td>${escapeHtml(tg.group || '-')}</td>
-                                        <td>${escapeHtml(tg.priority)}</td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                } else {
-                    display.innerHTML = '<p>No talkgroups configured</p>';
-                }
-            } else if (type === 'unit_tags') {
-                if (data.tags && Array.isArray(data.tags) && data.tags.length) {
-                    display.innerHTML = `
-                        <p><strong>File:</strong> ${escapeHtml(data.file || 'None')}</p>
-                        <p><strong>Mode:</strong> ${escapeHtml(data.mode || 'default')}</p>
-                        <p><strong>Count:</strong> ${escapeHtml(data.count || 0)}</p>
-                        <table style="margin-top: 1rem;">
-                            <thead>
-                                <tr>
-                                    <th>Pattern (Regex)</th>
-                                    <th>Tag</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${data.tags.map(t => `
-                                    <tr>
-                                        <td style="font-family: 'Courier New', monospace;">${escapeHtml(t.pattern || '')}</td>
-                                        <td>${escapeHtml(t.tag || '')}</td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                } else {
-                    display.innerHTML = `
-                        <p><strong>File:</strong> ${escapeHtml(data.file || 'None')}</p>
-                        <p><strong>Mode:</strong> ${escapeHtml(data.mode || 'default')}</p>
-                        <p style="margin-top: 1rem;">No manual unit tags defined.</p>
-                    `;
-                }
-            } else if (type === 'unit_tags_ota') {
-                if (Array.isArray(data.aliases) && data.aliases.length) {
-                    display.innerHTML = `
-                        <p><strong>OTA File:</strong> ${escapeHtml(data.file || 'None')}</p>
-                        <p><strong>Count:</strong> ${escapeHtml(data.count || 0)}</p>
-                        <table style="margin-top: 1rem;">
-                            <thead>
-                                <tr>
-                                    <th>Unit ID</th>
-                                    <th>Alias</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${data.aliases.map(a => `
-                                    <tr>
-                                        <td>${escapeHtml(a.unit)}</td>
-                                        <td>${escapeHtml(a.alias)}</td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    `;
-                } else {
-                    display.innerHTML = `<p><strong>OTA File:</strong> ${escapeHtml(data.file || 'None')}</p><p>No OTA aliases available</p>`;
-                }
-            }
-        })
-        .catch(err => {
-            display.innerHTML = `<p class="error">Error loading data: ${escapeHtml(err.message)}</p>`;
-        });
+    if (typeof renderSystemsTab === 'function') renderSystemsTab();
 }
 
 // Main tab navigation
@@ -1548,6 +1419,9 @@ function _activateMainTab(tabName) {
     if (tabName === 'status') {
         updateChart();
         updateCallRateChart();
+    } else if (tabName === 'systems') {
+        updateSystemTabs();
+        window.dispatchEvent(new Event('systems-tab-shown'));
     } else if (tabName === 'console') {
         // Scroll console to bottom when tab is opened
         setTimeout(() => {
@@ -1860,20 +1734,20 @@ function formatConsoleLine(line) {
 // Chart functionality
 let currentChartPeriod = '5m';
 let currentCallChartPeriod = '5m';
-let chartCanvas = null;
-let chartCtx = null;
-let callRateChartCanvas = null;
-let callRateChartCtx = null;
+// Status tab charts. Created on first update while visible: they need the container's width.
+let rateChart = null;
+let callRateChart = null;
 
 function initChart() {
-    chartCanvas = document.getElementById('rateChart');
-    if (chartCanvas) {
-        chartCtx = chartCanvas.getContext('2d');
-    }
-    
-    callRateChartCanvas = document.getElementById('callRateChart');
-    if (callRateChartCanvas) {
-        callRateChartCtx = callRateChartCanvas.getContext('2d');
+    if (!state.hiddenRateSystems) state.hiddenRateSystems = new Set();
+    if (!state.hiddenCallRateSystems) state.hiddenCallRateSystems = new Set();
+}
+
+function chartPeriodSeconds(period) {
+    switch (period) {
+        case '15m': return 15 * 60;
+        case '60m': return 60 * 60;
+        default: return 5 * 60;
     }
 }
 
@@ -1893,372 +1767,60 @@ function setCallChartPeriod(period) {
     updateCallRateChart();
 }
 
-function updateChart() {
-    if (!chartCtx) return;
-    
-    const canvas = chartCanvas;
-    const ctx = chartCtx;
-    
-    // Set canvas size
-    const container = canvas.parentElement;
-    canvas.width = container.clientWidth;
-    canvas.height = container.clientHeight;
-    
-    const width = canvas.width;
-    const height = canvas.height;
-    const padding = { top: 20, right: 20, bottom: 40, left: 50 };
-    const chartWidth = width - padding.left - padding.right;
-    const chartHeight = height - padding.top - padding.bottom;
-    
-    // Clear canvas (theme-driven)
-    ctx.fillStyle = cssVar('--bg-secondary', '#16213e');
-    ctx.fillRect(0, 0, width, height);
-    
-    // Determine time range
-    const now = Date.now();
-    let timeRange;
-    switch (currentChartPeriod) {
-        case '5m': timeRange = 5 * 60 * 1000; break;
-        case '15m': timeRange = 15 * 60 * 1000; break;
-        case '60m': timeRange = 60 * 60 * 1000; break;
-        default: timeRange = 5 * 60 * 1000;
-    }
-    const startTime = now - timeRange;
-    
-    // Y-axis: 0-40 fixed
-    const yMin = 0;
-    const yMax = 40;
-    
-    // Draw grid
-    ctx.strokeStyle = cssVar('--border', '#2a2a4e');
-    ctx.lineWidth = 1;
-    
-    // Horizontal grid lines
-    for (let y = 0; y <= 40; y += 10) {
-        const yPos = padding.top + chartHeight - (y / yMax * chartHeight);
-        ctx.beginPath();
-        ctx.moveTo(padding.left, yPos);
-        ctx.lineTo(width - padding.right, yPos);
-        ctx.stroke();
-        
-        // Y-axis labels
-        ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-        ctx.font = '11px sans-serif';
-        ctx.textAlign = 'right';
-        ctx.fillText(y.toString(), padding.left - 5, yPos + 4);
-    }
-    
-    // Time labels
-    ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-    ctx.font = '11px sans-serif';
-    ctx.textAlign = 'center';
-    const timeLabels = currentChartPeriod === '5m' ? 5 : currentChartPeriod === '15m' ? 5 : 6;
-    for (let i = 0; i <= timeLabels; i++) {
-        const t = startTime + (timeRange * i / timeLabels);
-        const x = padding.left + (chartWidth * i / timeLabels);
-        const date = new Date(t);
-        ctx.fillText(date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}), x, height - 10);
-    }
-    
-    // Y-axis title
-    ctx.save();
-    ctx.translate(15, height / 2);
-    ctx.rotate(-Math.PI / 2);
-    ctx.textAlign = 'center';
-    ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-    ctx.fillText('Decode Rate (msg/sec)', 0, 0);
-    ctx.restore();
-    
-    // Draw data lines for each system
-    const systems = Object.keys(state.rateHistory);
-    const legendContainer = document.getElementById('chartLegend');
-    if (legendContainer) {
-        legendContainer.innerHTML = '';
-    }
-    
-    // Initialize hidden systems set if not exists
-    if (!state.hiddenRateSystems) state.hiddenRateSystems = new Set();
-    
-    const palette = getChartPalette();
+// [{time: ms, <key>: value}] -> [[seconds, value]] within the window
+function chartPoints(history, key, xMin) {
+    return (history || []).filter(p => p.time / 1000 >= xMin).map(p => [p.time / 1000, p[key]]);
+}
 
-    systems.forEach((sysName, idx) => {
-        const data = state.rateHistory[sysName].filter(p => p.time >= startTime);
-        const color = palette[idx % palette.length];
-        const isHidden = state.hiddenRateSystems.has(sysName);
-        
-        // Draw line if not hidden and has enough data
-        if (!isHidden && data.length >= 2) {
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            
-            data.forEach((point, i) => {
-                const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
-                const y = padding.top + chartHeight - (point.rate / yMax * chartHeight);
-                
-                if (i === 0) {
-                    ctx.moveTo(x, y);
-                } else {
-                    ctx.lineTo(x, y);
-                }
-            });
-            
-            ctx.stroke();
-        }
-        
-        // Add to legend (always show, even if hidden)
-        if (legendContainer) {
-            const item = document.createElement('div');
-            item.className = 'legend-item' + (isHidden ? ' legend-hidden' : '');
-            item.style.cursor = 'pointer';
-            item.style.opacity = isHidden ? '0.4' : '1';
-            item.innerHTML = `<div class="legend-color" style="background: ${color}"></div>${escapeHtml(sysName)}`;
-            item.onclick = () => {
-                if (state.hiddenRateSystems.has(sysName)) {
-                    state.hiddenRateSystems.delete(sysName);
-                } else {
-                    state.hiddenRateSystems.add(sysName);
-                }
-                updateChart();
-            };
-            legendContainer.appendChild(item);
-        }
-    });
+function validSystemName(name) {
+    return name && name !== 'undefined' && name !== 'Unknown' && name.trim() !== '';
+}
+
+function updateChart() {
+    const el = document.getElementById('rateChart');
+    if (!el || !el.offsetParent) return; // Status tab not showing
+    initChart();
+    if (!rateChart) {
+        rateChart = new TimeChart(el, {
+            height: el.clientHeight || 220,
+            yStep: 10, yMinMax: 40, decimals: 1,
+            yLabel: 'Decode rate (msg/s)',
+            legendEl: document.getElementById('chartLegend'),
+            hidden: state.hiddenRateSystems,
+        });
+    }
+    const now = Date.now() / 1000;
+    const xMin = now - chartPeriodSeconds(currentChartPeriod);
+    const palette = getChartPalette();
+    const series = Object.keys(state.rateHistory).filter(validSystemName).map((name, idx) => ({
+        key: name, label: name, color: palette[idx % palette.length],
+        points: chartPoints(state.rateHistory[name], 'rate', xMin),
+    }));
+    rateChart.setData({ series, xMin, xMax: now });
 }
 
 function updateCallRateChart() {
-    if (!callRateChartCtx) return;
-    
-    const canvas = callRateChartCanvas;
-    const ctx = callRateChartCtx;
-    
-    // Set canvas size
-    const container = canvas.parentElement;
-    canvas.width = container.clientWidth;
-    canvas.height = container.clientHeight;
-    
-    const width = canvas.width;
-    const height = canvas.height;
-    const padding = { top: 20, right: 20, bottom: 40, left: 50 };
-    const chartWidth = width - padding.left - padding.right;
-    const chartHeight = height - padding.top - padding.bottom;
-    
-    // Clear canvas (theme-driven)
-    ctx.fillStyle = cssVar('--bg-secondary', '#16213e');
-    ctx.fillRect(0, 0, width, height);
-    
-    // Determine time range
-    const now = Date.now();
-    let timeRange;
-    switch (currentCallChartPeriod) {
-        case '5m': timeRange = 5 * 60 * 1000; break;
-        case '15m': timeRange = 15 * 60 * 1000; break;
-        case '60m': timeRange = 60 * 60 * 1000; break;
-        default: timeRange = 5 * 60 * 1000;
-    }
-    const startTime = now - timeRange;
-    
-    // Initialize hidden systems set if not exists
-    if (!state.hiddenCallRateSystems) state.hiddenCallRateSystems = new Set();
-    if (state.hiddenCallRateTotal === undefined) state.hiddenCallRateTotal = false;
-    
-    // Calculate total line first (needed for yMax calculation)
-    const systems = Object.keys(state.callRateHistory).filter(
-        name => name && name !== 'undefined' && name !== 'Unknown' && name.trim() !== ''
-    );
-    const totalData = [];
-    const allTimes = new Set();
-    systems.forEach(sysName => {
-        state.callRateHistory[sysName].forEach(p => {
-            if (p.time >= startTime) allTimes.add(p.time);
+    const el = document.getElementById('callRateChart');
+    if (!el || !el.offsetParent) return; // Status tab not showing
+    initChart();
+    if (!callRateChart) {
+        callRateChart = new TimeChart(el, {
+            height: el.clientHeight || 220,
+            yStep: 5, yMinMax: 5, decimals: 0, stepped: true,
+            yLabel: 'Active calls',
+            legendEl: document.getElementById('callChartLegend'),
+            hidden: state.hiddenCallRateSystems,
+            total: { label: 'Total', color: 'rgba(255, 255, 255, 0.45)' },
         });
-    });
-    
-    Array.from(allTimes).sort((a, b) => a - b).forEach(time => {
-        let sum = 0;
-        systems.forEach(sysName => {
-            const point = state.callRateHistory[sysName].find(p => p.time === time);
-            if (point) sum += point.count;
-        });
-        totalData.push({ time, count: sum });
-    });
-    
-    // Calculate max Y value from data (include visible systems and total if shown)
-    const yMin = 0;
-    const yStep = 2;  // Always use intervals of 2
-    let yMax = 10;  // Minimum range
-    
-    const visibleSystems = Object.keys(state.callRateHistory).filter(s => !state.hiddenCallRateSystems.has(s));
-    const allData = visibleSystems.flatMap(s => state.callRateHistory[s] || []).filter(p => p.time >= startTime);
-    
-    // Also include total data if total line is visible
-    const dataForScaling = allData.length > 0 ? allData.map(p => p.count) : [];
-    if (!state.hiddenCallRateTotal && totalData.length > 0) {
-        dataForScaling.push(...totalData.map(p => p.count));
     }
-    
-    if (dataForScaling.length > 0) {
-        const maxCount = Math.max(...dataForScaling);
-        // Round up to next even number (multiple of 2) with headroom
-        const targetMax = maxCount + 1;
-        yMax = Math.max(10, Math.ceil(targetMax / yStep) * yStep);
-    }
-    
-    // Draw grid
-    ctx.strokeStyle = cssVar('--border', '#2a2a4e');
-    ctx.lineWidth = 1;
-    
-    // Horizontal grid lines
-    for (let y = 0; y <= yMax; y += yStep) {
-        const yPos = padding.top + chartHeight - (y / yMax * chartHeight);
-        ctx.beginPath();
-        ctx.moveTo(padding.left, yPos);
-        ctx.lineTo(width - padding.right, yPos);
-        ctx.stroke();
-        
-        // Y-axis labels
-        ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-        ctx.font = '11px sans-serif';
-        ctx.textAlign = 'right';
-        ctx.fillText(y.toString(), padding.left - 5, yPos + 4);
-    }
-    
-    // Time labels
-    ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-    ctx.font = '11px sans-serif';
-    ctx.textAlign = 'center';
-    const timeLabels = currentCallChartPeriod === '5m' ? 5 : currentCallChartPeriod === '15m' ? 5 : 6;
-    for (let i = 0; i <= timeLabels; i++) {
-        const t = startTime + (timeRange * i / timeLabels);
-        const x = padding.left + (chartWidth * i / timeLabels);
-        const date = new Date(t);
-        ctx.fillText(date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}), x, height - 10);
-    }
-    
-    // Y-axis title
-    ctx.save();
-    ctx.translate(15, height / 2);
-    ctx.rotate(-Math.PI / 2);
-    ctx.textAlign = 'center';
-    ctx.fillStyle = cssVar('--text-secondary', '#a0a0a0');
-    ctx.fillText('Active Calls', 0, 0);
-    ctx.restore();
-    
-    // Draw data lines for each system + total
-    // Filter out invalid system names (undefined, Unknown, empty)
-    const legendContainer = document.getElementById('callChartLegend');
-    if (legendContainer) {
-        legendContainer.innerHTML = '';
-    }
-    
+    const now = Date.now() / 1000;
+    const xMin = now - chartPeriodSeconds(currentCallChartPeriod);
     const palette = getChartPalette();
-
-    // Draw individual system lines as step charts (calls are discrete)
-    systems.forEach((sysName, idx) => {
-        const data = state.callRateHistory[sysName].filter(p => p.time >= startTime);
-        const color = palette[idx % palette.length];
-        const isHidden = state.hiddenCallRateSystems.has(sysName);
-        
-        // Draw line if not hidden and has data
-        if (!isHidden && data.length >= 1) {
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            
-            // Step-based rendering: calls remain constant until they change
-            data.forEach((point, i) => {
-                const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
-                const y = padding.top + chartHeight - (point.count / yMax * chartHeight);
-                
-                if (i === 0) {
-                    // Start at first point
-                    ctx.moveTo(x, y);
-                } else {
-                    // Draw horizontal line from previous point, then vertical step to new value
-                    const prevPoint = data[i - 1];
-                    const prevX = padding.left + ((prevPoint.time - startTime) / timeRange * chartWidth);
-                    const prevY = padding.top + chartHeight - (prevPoint.count / yMax * chartHeight);
-                    
-                    // Horizontal plateau at previous value
-                    ctx.lineTo(x, prevY);
-                    // Vertical step to new value
-                    ctx.lineTo(x, y);
-                }
-                
-                // Extend plateau to next point or end of chart
-                if (i === data.length - 1) {
-                    ctx.lineTo(width - padding.right, y);
-                }
-            });
-            
-            ctx.stroke();
-        }
-        
-        // Add to legend (always show, even if hidden)
-        if (legendContainer) {
-            const item = document.createElement('div');
-            item.className = 'legend-item' + (isHidden ? ' legend-hidden' : '');
-            item.style.cursor = 'pointer';
-            item.style.opacity = isHidden ? '0.4' : '1';
-            item.innerHTML = `<div class="legend-color" style="background: ${color}"></div>${escapeHtml(sysName)}`;
-            item.onclick = () => {
-                if (state.hiddenCallRateSystems.has(sysName)) {
-                    state.hiddenCallRateSystems.delete(sysName);
-                } else {
-                    state.hiddenCallRateSystems.add(sysName);
-                }
-                updateCallRateChart();
-            };
-            legendContainer.appendChild(item);
-        }
-    });
-    
-    // Draw total line as step chart (subtle, semi-transparent)
-    if (!state.hiddenCallRateTotal && totalData.length >= 1) {
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        
-        totalData.forEach((point, i) => {
-            const x = padding.left + ((point.time - startTime) / timeRange * chartWidth);
-            const y = padding.top + chartHeight - (point.count / yMax * chartHeight);
-            
-            if (i === 0) {
-                ctx.moveTo(x, y);
-            } else {
-                // Step-based: horizontal plateau then vertical step
-                const prevPoint = totalData[i - 1];
-                const prevX = padding.left + ((prevPoint.time - startTime) / timeRange * chartWidth);
-                const prevY = padding.top + chartHeight - (prevPoint.count / yMax * chartHeight);
-                
-                ctx.lineTo(x, prevY);
-                ctx.lineTo(x, y);
-            }
-            
-            // Extend to end of chart on last point
-            if (i === totalData.length - 1) {
-                ctx.lineTo(width - padding.right, y);
-            }
-        });
-        
-        ctx.stroke();
-        ctx.setLineDash([]);
-    }
-        
-    // Add total to legend (always show, with toggle)
-    if (legendContainer) {
-        const item = document.createElement('div');
-        item.className = 'legend-item' + (state.hiddenCallRateTotal ? ' legend-hidden' : '');
-        item.style.cursor = 'pointer';
-        item.style.opacity = state.hiddenCallRateTotal ? '0.4' : '1';
-        item.innerHTML = `<div class="legend-color" style="background: rgba(255,255,255,0.35); border: 1px dashed rgba(255,255,255,0.5)"></div>Total`;
-        item.onclick = () => {
-            state.hiddenCallRateTotal = !state.hiddenCallRateTotal;
-            updateCallRateChart();
-        };
-        legendContainer.appendChild(item);
-    }
+    const series = Object.keys(state.callRateHistory).filter(validSystemName).map((name, idx) => ({
+        key: name, label: name, color: palette[idx % palette.length],
+        points: chartPoints(state.callRateHistory[name], 'count', xMin),
+    }));
+    callRateChart.setData({ series, xMin, xMax: now });
 }
 
 // Admin functions
@@ -2794,8 +2356,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
-    // Once a second: move expired STOPPED calls into Recent (redraw only if something moved)
-    // and advance live calls' elapsed times in place
+    // Once a second: move expired STOPPED calls to Recent and advance elapsed times
     setInterval(() => {
         const stoppedBefore = state.stoppedCalls.size;
         pruneStoppedCalls();
@@ -3062,8 +2623,7 @@ const affiliationState = {
     tabActive: false,       // refresh only while the Affiliations tab is showing
     loading: false,
 
-    // Virtual list: only rows near the viewport are in the DOM; spacer rows stand in for
-    // the rest so the page keeps its full height and the scrollbar stays true
+    // Virtual list: only rows near the viewport are in the DOM; spacer rows hold the rest's height
     filtered: [],           // current view after filter + sort
     heights: new Map(),     // measured height of each item (main + details row), by view key
     estimates: new Map(),   // cached estimates for items not yet measured
@@ -3074,8 +2634,7 @@ const affiliationState = {
 
 const AFFILIATION_FULL_RELOAD_MS = 10 * 60 * 1000;
 
-// After a view switch, sort, filter or search the list starts over: bring the top of the
-// table back into view if the page was scrolled past it
+// After a view, sort, filter or search change, scroll the table top back into view
 function scrollAffiliationsToTop() {
     const table = document.querySelector('.affiliation-view.active .affiliation-table');
     if (!table) return;
@@ -3084,8 +2643,7 @@ function scrollAffiliationsToTop() {
 }
 const AFFILIATION_BUFFER_PX = 1500;   // rendered above and below the viewport
 
-// Idle is computed here rather than taken from the server's is_idle: with delta updates,
-// records that haven't changed would otherwise keep a stale flag
+// Computed here: with delta updates the server's is_idle goes stale on unchanged records
 function affiliationIsIdle(item) {
     const now = Math.floor(Date.now() / 1000);
     return (now - item.last_active) > affiliationState.timeoutHours * 3600;
@@ -3177,8 +2735,7 @@ async function loadAffiliations(forceFull = false) {
         tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:20px; color:var(--text-secondary);">Loading...</td></tr>';
     }
 
-    // Full load the first time and every 10 minutes (a safety net); otherwise ask only for
-    // what changed since the previous response
+    // Full load at first and every 10 minutes; otherwise only changes since the last response
     const full = forceFull || !affiliationState.serverTime ||
                  (Date.now() - affiliationState.lastFullLoadAt) > AFFILIATION_FULL_RELOAD_MS;
     const url = full ? `${BASE_PATH}api/affiliations`
@@ -3222,8 +2779,7 @@ async function loadAffiliations(forceFull = false) {
             affiliationState.talkgroupsByKey = new Map();
             affiliationState.lastFullLoadAt = Date.now();
         }
-        // Keep each row's measured height unless what it displays changed; discarding heights
-        // wholesale would shift the rows under the user's scroll position
+        // Keep measured heights of unchanged rows, so rows don't shift under the scroll position
         const merge = (items, map, prevMap, isUnits) => items.forEach(item => {
             const key = affiliationItemKey(item);
             const prev = prevMap.get(key);
@@ -3501,8 +3057,7 @@ function renderAffiliationItem(item, isUnits, unitMap, tgMap) {
     </tr>`;
 }
 
-// Recompute the filtered/sorted list and redraw the visible slice. Called for new data,
-// sorting, searching, filtering and view changes.
+// Recompute the filtered, sorted list and redraw the visible slice
 function renderAffiliationTable() {
     const isUnits = affiliationState.currentView === 'units';
     const data = isUnits ? affiliationState.units : affiliationState.talkgroups;
@@ -3525,8 +3080,7 @@ function renderAffiliationTable() {
     renderAffiliationWindow(true);
 }
 
-// Draw only the items within AFFILIATION_BUFFER_PX of the viewport, between two spacer rows
-// sized to the (measured or estimated) height of everything above and below.
+// Draw items within AFFILIATION_BUFFER_PX of the viewport, between two spacer rows
 function renderAffiliationWindow(force) {
     const isUnits = affiliationState.currentView === 'units';
     const tbody = document.getElementById(isUnits ? 'unitTableBody' : 'talkgroupTableBody');
@@ -3947,8 +3501,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
     
-    // Refresh every 30 s, only while the Affiliations tab is showing and the page is visible.
-    // Deltas keep this cheap; sort, filter, scroll and rendered rows are preserved.
+    // Refresh every 30 s while the Affiliations tab is showing
     setInterval(() => {
         if (affiliationState.tabActive && document.visibilityState === 'visible') {
             loadAffiliations();

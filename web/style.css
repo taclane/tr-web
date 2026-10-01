@@ -587,6 +587,171 @@ tr.selected {
     border-color: var(--accent-blue);
 }
 
+.data-link.active {
+    background: var(--accent-blue);
+    border-color: var(--accent-blue);
+}
+
+/* Systems tab (systems.js) */
+.sys-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    padding-top: 1rem;
+}
+
+.sys-sparks {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+}
+
+.sys-spark-box,
+.sys-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.75rem 1rem;
+    min-width: 0;
+}
+
+.sys-card h4 {
+    margin: 0 0 0.75rem 0;
+}
+
+.sys-card h4 + .control-channels,
+.sys-kv + h4 {
+    margin-top: 1rem;
+}
+
+.sys-spark-title {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 0.25rem;
+}
+
+.sys-spark-readout {
+    font-variant-numeric: tabular-nums;
+}
+
+.sys-spark-readout.hovering {
+    color: var(--text-primary);
+}
+
+.sys-spark {
+    width: 100%;
+}
+
+.sys-columns {
+    display: grid;
+    grid-template-columns: minmax(260px, 1fr) 2fr;
+    gap: 1rem;
+    align-items: start;
+}
+
+@media (max-width: 900px) {
+    .sys-columns {
+        grid-template-columns: 1fr;
+    }
+}
+
+.sys-card {
+    overflow-x: auto;
+}
+
+.sys-table {
+    width: 100%;
+}
+
+.sys-table .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.sys-table th {
+    user-select: none;
+    white-space: nowrap;
+}
+
+.sys-kv th {
+    text-align: left;
+    color: var(--text-secondary);
+    font-weight: normal;
+    width: 40%;
+}
+
+.sys-good {
+    color: var(--accent-green);
+}
+
+.sys-bad {
+    color: var(--accent-orange);
+}
+
+.sys-note {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin: 0.5rem 0 0 0;
+}
+
+.sys-empty {
+    text-align: center;
+    color: var(--text-secondary);
+    padding: 1rem;
+}
+
+.sys-ref {
+    margin-top: 0.75rem;
+}
+
+.sys-window {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.sys-ref-bar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.sys-ref-bar .sys-note {
+    margin: 0;
+}
+
+.sys-ref-bar input {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.35rem 0.6rem;
+    min-width: 220px;
+}
+
+/* Long lists (1000+ talkgroups) scroll inside the card instead of stretching the page */
+.sys-ref-scroll {
+    max-height: 480px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+}
+
+.sys-ref-scroll .sys-table thead th {
+    position: sticky;
+    top: 0;
+    background: var(--bg-secondary);
+    z-index: 1;
+}
+
 .system-right {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -1121,6 +1286,19 @@ tr.selected {
     border-radius: 2px;
 }
 
+/* Chart readout (charts.js): the time under the cursor, and each series' value */
+.legend-time {
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+    min-width: 5.5em;
+}
+
+.legend-value {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+    margin-left: 0.25rem;
+}
+
 .json-view {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -1510,3 +1688,169 @@ tr.selected {
     font-weight: 600;
 }
 
+
+/* Shown while the server is restarting or unreachable (app.js waitForServerAndReload) */
+.server-banner {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10000;
+    padding: 0.6rem 1.2rem;
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--accent-orange);
+    color: var(--text-primary);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    font-size: 14px;
+}
+
+/* ---- Systems tab layout: picker badges, tiles, side tabs, details */
+
+.sys-badge {
+    display: inline-block;
+    margin-left: 0.5rem;
+    padding: 0 0.35rem;
+    border: 1px solid currentColor;
+    border-radius: 3px;
+    font-size: 0.65rem;
+    font-weight: bold;
+    letter-spacing: 0.03em;
+    line-height: 1.4;
+    opacity: 0.75;
+    vertical-align: middle;
+}
+
+/* Grid items default to their content's width; let charts shrink with the page */
+.status-grid > * {
+    min-width: 0;
+}
+
+.sys-single-chart {
+    grid-template-columns: 1fr;
+}
+
+.sys-tiles .stat-value {
+    font-variant-numeric: tabular-nums;
+}
+
+.sys-tiles .stat-value.sys-good {
+    color: var(--accent-green);
+}
+
+.sys-tiles .stat-value.sys-bad {
+    color: var(--accent-orange);
+}
+
+.sys-lower {
+    display: grid;
+    grid-template-columns: 170px minmax(0, 1fr) 340px;
+    gap: 1rem;
+    margin-top: 1rem;
+    align-items: start;
+}
+
+.sys-sidenav {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.5rem;
+}
+
+.sys-sidenav button {
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: 0.9rem;
+}
+
+.sys-sidenav button:hover {
+    background: var(--bg-secondary);
+}
+
+.sys-sidenav button.active {
+    background: var(--accent-blue);
+    border-color: var(--accent-blue);
+}
+
+.sys-sidenav-group {
+    margin: 0.75rem 0.75rem 0.25rem;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+}
+
+.sys-main,
+.sys-details {
+    min-width: 0;
+    overflow-x: auto;
+}
+
+.sys-table tr.sys-clickable {
+    cursor: pointer;
+}
+
+.sys-table tr.sys-clickable:hover td {
+    background: var(--bg-secondary);
+}
+
+.sys-table tr.sys-selected td {
+    background: rgba(33, 150, 243, 0.2);
+}
+
+.sys-details h4,
+.sys-main h4 {
+    margin: 1rem 0 0.5rem;
+}
+
+.sys-history {
+    margin-top: 1rem;
+}
+
+@media (max-width: 1300px) {
+    .sys-lower {
+        grid-template-columns: 170px minmax(0, 1fr);
+    }
+    .sys-details {
+        grid-column: 1 / -1;
+    }
+}
+
+@media (max-width: 800px) {
+    .sys-lower {
+        grid-template-columns: 1fr;
+    }
+    .sys-sidenav {
+        flex-direction: row;
+        flex-wrap: wrap;
+    }
+    .sys-sidenav-group {
+        display: none;
+    }
+}
+
+/* Bit error rate: 1-2% audible, above 2% degraded */
+.ber-fair {
+    color: var(--accent-orange);
+}
+
+.ber-poor {
+    color: var(--accent-pink, var(--accent));
+    font-weight: bold;
+}
+
+.stat-value.ber-fair {
+    color: var(--accent-orange);
+}
+
+.stat-value.ber-poor {
+    color: var(--accent-pink, var(--accent));
+}
+
+.sys-errors-by {
+    margin-bottom: 0.75rem;
+}

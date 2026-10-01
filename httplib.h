@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstring>
 #include <cerrno>
+#include <chrono>
 #include <ctime>
 #include <deque>
 #include <functional>
@@ -109,9 +110,7 @@ namespace httplib
         virtual int fd() const = 0;
         virtual bool is_valid() const = 0;
 
-        // Wake any thread blocked on this socket (its read returns 0) without releasing the fd.
-        // Only the thread that owns the connection calls close(), so the fd number can't be
-        // reused underneath it.
+        // Wake a thread blocked on this socket without releasing the fd (so it can't be reused)
         void shutdown_io()
         {
             if (fd() >= 0)
@@ -147,10 +146,8 @@ namespace httplib
         return true;
     }
 
-    // OpenSSL writes with plain write(), so a peer that has gone away raises SIGPIPE, whose
-    // default action kills the whole trunk-recorder process. Block it in every thread that
-    // writes to clients (threads started afterwards inherit the mask); the write then fails
-    // with EPIPE instead.
+    // OpenSSL writes with write(): a closed peer raises SIGPIPE, which kills trunk-recorder.
+    // Block it in threads that write to clients (new threads inherit the mask).
     inline void block_sigpipe_in_this_thread()
     {
         sigset_t set;
@@ -163,6 +160,11 @@ namespace httplib
     {
     public:
         explicit PlainSocket(int fd) : fd_(fd), valid_(fd >= 0) {}
+
+        ~PlainSocket()
+        {
+            close();
+        }
 
         ssize_t read(void *buf, size_t len) override
         {
@@ -376,8 +378,7 @@ namespace httplib
             }
             message += "\n";
 
-            // A failed, timed-out or partial write marks the client dead: a stalled client must
-            // not hold up broadcasts, and a partial SSE frame would corrupt the stream
+            // Any failed or partial write drops the client: a partial frame corrupts the stream
             if (!write_all(*socket, message.data(), message.size()))
             {
                 connected = false;
@@ -393,11 +394,19 @@ namespace httplib
             socket->shutdown_io();
         }
 
-        // Called only by the connection's own handler thread
+        // Other threads may still hold this client, so only shut the socket down; its
+        // destructor frees the fd and TLS state after the last user.
         void close()
         {
             connected = false;
-            socket->close();
+            socket->shutdown_io();
+        }
+
+        // Serialized with writes: OpenSSL can't read and write one connection from two threads
+        ssize_t read(void *buf, size_t len)
+        {
+            std::lock_guard<std::mutex> lock(write_mutex);
+            return socket->read(buf, len);
         }
     };
 
@@ -497,11 +506,12 @@ namespace httplib
         }
 
         // Track login attempt manually (for session-based auth)
-        void track_login_attempt(const std::string &username, const std::string &client_ip, bool success, const std::string &access_level)
+        // `when` defaults to now; history restored at startup passes the original time
+        void track_login_attempt(const std::string &username, const std::string &client_ip, bool success, const std::string &access_level, time_t when = 0)
         {
             std::lock_guard<std::mutex> lock(login_history_mutex_);
             LoginAttempt attempt;
-            attempt.timestamp = time(nullptr);
+            attempt.timestamp = when ? when : time(nullptr);
             attempt.username = username;
             attempt.client_ip = client_ip;
             attempt.success = success;
@@ -556,9 +566,7 @@ namespace httplib
             sse_username_callback_ = callback;
         }
 
-        // Send SSE event to all connected clients (except raw stream clients).
-        // Writes happen outside sse_mutex_ on a snapshot of the client list, so one slow
-        // client delays only this broadcast, never connection setup or the client counts.
+        // Send an SSE event to all SSE clients. Writes to a snapshot, outside sse_mutex_.
         void broadcast_sse(const std::string &event, const std::string &data)
         {
             std::vector<std::shared_ptr<SSEClient>> failed;
@@ -707,8 +715,8 @@ namespace httplib
             return running_;
         }
 
-        // Stop accepting, disconnect stream clients and wait (bounded) for connection threads
-        // to finish, since they call back into this object and into the plugin.
+        // Stop accepting, drop stream clients and wait (bounded) for connection threads, which
+        // call back into the plugin
         void stop()
         {
             running_ = false;
@@ -726,8 +734,7 @@ namespace httplib
                 server_thread_.join();
             }
 
-            // Handler threads exit within one poll interval (streams) or one receive
-            // timeout (requests); allow a little longer than the 5 s receive timeout
+            // Threads exit within one poll interval or the 5 s receive timeout
             auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
             while (active_connections_.load() > 0 && std::chrono::steady_clock::now() < deadline)
             {
@@ -931,8 +938,7 @@ namespace httplib
 
         std::shared_ptr<SocketWrapper> wrap_socket(int client_fd)
         {
-            // Receive timeout must be set before the TLS handshake, or a client that
-            // connects and never sends a ClientHello holds this thread forever
+            // Set before the TLS handshake, or a silent client holds this thread forever
             struct timeval tv;
             tv.tv_sec = 5;
             tv.tv_usec = 0;
@@ -959,8 +965,7 @@ namespace httplib
             }
         }
 
-        // Runs on a detached thread inside the trunk-recorder process: an escaping exception
-        // would call std::terminate and stop all recording, so nothing may leave this function.
+        // No exception may escape: std::terminate would stop trunk-recorder
         void handle_client(int client_fd)
         {
             // listen() counted this connection before starting the thread
@@ -1002,11 +1007,17 @@ namespace httplib
 
         void handle_request(std::shared_ptr<SocketWrapper> socket)
         {
-            // Read request with size limit to prevent DoS
+            // Applied before authentication; the largest body is a config file
+            static constexpr size_t MAX_HEADER_BYTES = 64 * 1024;
+            static constexpr size_t MAX_BODY_BYTES = 1024 * 1024;
+            // Bounds the whole request: each read resets the 5 s receive timeout
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            auto expired = [&]
+            { return std::chrono::steady_clock::now() > deadline; };
+
             char buffer[8192];
             std::string request_data;
             ssize_t bytes_read;
-            const size_t MAX_REQUEST_SIZE = 10 * 1024 * 1024; // 10MB limit (generous for config files)
             bool headers_complete = false;
 
             // Read until we have complete headers
@@ -1014,56 +1025,63 @@ namespace httplib
             {
                 request_data.append(buffer, static_cast<size_t>(bytes_read));
 
-                // Enforce size limit
-                if (request_data.size() > MAX_REQUEST_SIZE)
+                size_t header_end = request_data.find("\r\n\r\n");
+                if (header_end == std::string::npos)
+                {
+                    if (request_data.size() > MAX_HEADER_BYTES)
+                    {
+                        send_error(socket, Request(), 431, "Request Header Fields Too Large");
+                        return;
+                    }
+                    if (expired())
+                    {
+                        socket->close();
+                        return;
+                    }
+                    continue;
+                }
+                if (header_end > MAX_HEADER_BYTES)
+                {
+                    send_error(socket, Request(), 431, "Request Header Fields Too Large");
+                    return;
+                }
+                headers_complete = true;
+
+                // Parse Content-Length to see if we need to read more body data
+                size_t content_length = 0;
+                if (!parse_content_length(request_data.substr(0, header_end), content_length))
+                {
+                    send_error(socket, Request(), 400, "Bad Request");
+                    return;
+                }
+                if (content_length > MAX_BODY_BYTES)
                 {
                     send_error(socket, Request(), 413, "Request Entity Too Large");
                     return;
                 }
 
-                // Check if we have complete headers
-                size_t header_end = request_data.find("\r\n\r\n");
-                if (header_end != std::string::npos)
+                size_t body_start = header_end + 4;
+                size_t body_received = request_data.size() - body_start;
+                if (body_received > MAX_BODY_BYTES)
                 {
-                    headers_complete = true;
-
-                    // Parse Content-Length to see if we need to read more body data
-                    size_t content_length = 0;
-                    if (!parse_content_length(request_data.substr(0, header_end), content_length))
-                    {
-                        send_error(socket, Request(), 400, "Bad Request");
-                        return;
-                    }
-                    if (content_length > MAX_REQUEST_SIZE)
-                    {
-                        send_error(socket, Request(), 413, "Request Entity Too Large");
-                        return;
-                    }
-
-                    size_t body_start = header_end + 4;
-                    size_t body_received = request_data.size() - body_start;
-
-                    // Continue reading until we have the complete body
-                    while (body_received < content_length)
-                    {
-                        bytes_read = socket->read(buffer, sizeof(buffer));
-                        if (bytes_read <= 0)
-                        {
-                            // Timed out or closed before the declared body arrived
-                            send_error(socket, Request(), 400, "Bad Request (incomplete body)");
-                            return;
-                        }
-                        request_data.append(buffer, static_cast<size_t>(bytes_read));
-                        body_received += static_cast<size_t>(bytes_read);
-
-                        if (request_data.size() > MAX_REQUEST_SIZE)
-                        {
-                            send_error(socket, Request(), 413, "Request Entity Too Large");
-                            return;
-                        }
-                    }
-                    break;
+                    send_error(socket, Request(), 413, "Request Entity Too Large");
+                    return;
                 }
+
+                // Continue reading until we have the complete body
+                while (body_received < content_length)
+                {
+                    bytes_read = socket->read(buffer, sizeof(buffer));
+                    if (bytes_read <= 0 || expired())
+                    {
+                        // Timed out or closed before the declared body arrived
+                        send_error(socket, Request(), 400, "Bad Request (incomplete body)");
+                        return;
+                    }
+                    request_data.append(buffer, static_cast<size_t>(bytes_read));
+                    body_received += static_cast<size_t>(bytes_read);
+                }
+                break;
             }
 
             if (!headers_complete)
@@ -1076,9 +1094,7 @@ namespace httplib
             req.remote_addr = get_client_ip(socket->fd());
             Response res;
 
-            // All POST endpoints take JSON. Requiring the JSON content type forces a CORS
-            // preflight for cross-origin requests (which this server never approves), so a
-            // third-party page cannot drive POST endpoints with a "simple" form/text request.
+            // JSON-only POSTs force a CORS preflight (never approved), so other sites can't post
             if (req.method == "POST" && !is_json_content_type(req))
             {
                 send_error(socket, req, 415, "Unsupported Media Type (expected application/json)");
@@ -1177,8 +1193,7 @@ namespace httplib
             // Check if this is a raw stream (like Gephi)
             bool is_raw_stream = std::find(raw_stream_paths_.begin(), raw_stream_paths_.end(), req.path) != raw_stream_paths_.end();
 
-            // Same-origin only: no Access-Control-Allow-Origin, so other websites can't read the
-            // streams through a visitor's browser (Gephi and other non-browser clients don't care)
+            // No Access-Control-Allow-Origin: other sites can't read the streams
             const std::string response = is_raw_stream
                                              ? "HTTP/1.1 200 OK\r\n"
                                                "Content-Type: application/json\r\n"
@@ -1241,8 +1256,7 @@ namespace httplib
                 raw_stream_connect_notify_();
             }
 
-            // Keep connection alive until the client disconnects or is dropped (mark_dead()
-            // shuts the socket down, which makes poll/read return immediately)
+            // Hold until the client disconnects or is dropped (mark_dead() wakes poll)
             char dummy[1];
             while (running_ && client->connected)
             {
@@ -1254,7 +1268,7 @@ namespace httplib
                 if (ret > 0)
                 {
                     // Client sent something (probably closed)
-                    ssize_t n = socket->read(dummy, 1);
+                    ssize_t n = client->read(dummy, 1);
                     if (n <= 0)
                     {
                         break;
@@ -1335,8 +1349,7 @@ namespace httplib
         {
             Response final_res = res;
 
-            // Opportunistic gzip for large bodies (e.g., /api/status) when the client accepts it.
-            // Keep this conservative and avoid compressing tiny responses.
+            // Gzip large bodies when the client accepts it
             const bool already_encoded = final_res.headers.find("Content-Encoding") != final_res.headers.end();
             if (!already_encoded && final_res.status == 200 && final_res.body.size() >= 16 * 1024 && request_accepts_gzip(req))
             {
@@ -1404,6 +1417,8 @@ namespace httplib
                 return "Payload Too Large";
             case 415:
                 return "Unsupported Media Type";
+            case 431:
+                return "Request Header Fields Too Large";
             case 429:
                 return "Too Many Requests";
             case 500:

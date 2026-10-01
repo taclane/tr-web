@@ -117,6 +117,7 @@
     function HistoryChart({ title, points, xMin, color, yStep, yMinMax, stepped = false, decimals = 1, unit = '' }) {
         const ref = useRef(null);
         const chart = useRef(null);
+        const lastBucket = useRef(null);
         const [readout, setReadout] = useState(null);
 
         useEffect(() => {
@@ -128,14 +129,22 @@
         }, []);
 
         useEffect(() => {
+            // Hour buckets: start the axis on an hour boundary and draw each bucket to its end
+            const hourStart = t => Math.floor(t / 3600) * 3600;
+            const end = hourStart(Date.now() / 1000) + 3600;
+            const last = points.length ? points[points.length - 1] : null;
+            lastBucket.current = last ? last[0] : null;
+            const stepped = last ? [...points, [last[0] + 3600, last[1]]] : points;
             chart.current.setData({
-                series: [{ key: 'value', label: title, color, points }],
-                xMin, xMax: Date.now() / 1000,
+                series: [{ key: 'value', label: title, color, points: stepped }],
+                xMin: Math.min(hourStart(xMin), end - 3600), xMax: end,
             });
         });
 
         const v = readout && readout.values[0] ? readout.values[0].value : null;
-        const when = readout ? new Date(readout.time * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+        // The added end point belongs to the last bucket
+        const bucket = readout && lastBucket.current !== null && readout.time > lastBucket.current ? lastBucket.current : readout && readout.time;
+        const when = readout ? new Date(bucket * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
         const text = v === null || v === undefined ? 'no data' : `${Number(v).toFixed(decimals)}${unit ? ' ' + unit : ''} · ${when}`;
         return html`
             <div class="sys-history">
@@ -520,14 +529,13 @@
         const [history, setHistory] = useState(null);
         useEffect(() => {
             setHistory(null);
-            if (!selection) return;
-            const [kind, id] = selection.split(':');
+            const [kind, id] = selection ? selection.split(':') : ['system', ''];
             let cancelled = false;
             const load = async () => {
                 if (!systemsTabActive()) return;
                 try {
                     const r = await authenticatedFetch(`${BASE_PATH}api/system/history?sys_num=${sys.sys_num}` +
-                        `&kind=${{ tg: 'talkgroup', unit: 'unit' }[kind] || 'freq'}&id=${id}&window=${statsWindow}`);
+                        `&kind=${{ tg: 'talkgroup', unit: 'unit', system: 'system' }[kind] || 'freq'}&id=${id}&window=${statsWindow}`);
                     const data = r.ok ? await r.json() : { unavailable: true };
                     if (!cancelled) setHistory(data);
                 } catch (e) {
@@ -547,10 +555,7 @@
 
     function DetailsPanel({ sys, stats, statsWindow, selection }) {
         const history = useHistory(sys, selection, statsWindow);
-        if (!selection) {
-            return html`<div><${ViewHeader} title="Details" /><p class="sys-empty">Select a channel, talkgroup or radio to see details</p></div>`;
-        }
-        const [kind, id] = selection.split(':');
+        const [kind, id] = selection ? selection.split(':') : ['system', ''];
         const hours = history && history.hours ? history.hours : [];
         const xMin = stats ? stats.since : Date.now() / 1000 - 86400;
         const green = cssVar('--accent-green', '#66bb6a');
@@ -562,6 +567,18 @@
         const historyOrNote = charts => history && history.unavailable
             ? html`<p class="sys-note">Hourly history needs tr-web's database.</p>` : charts;
         let body, charts;
+
+        if (kind === 'system') {
+            charts = html`
+                <${HistoryChart} title="Calls per hour" points=${callsPerHour} xMin=${xMin} color=${cyan} yStep=${5} yMinMax=${5} stepped=${true} decimals=${0} />
+                ${berChart}`;
+            return html`
+                <div>
+                    <${ViewHeader} title=${sys.sys_name} />
+                    ${historyOrNote(charts)}
+                    <p class="sys-note">Select a channel, talkgroup or radio for its details.</p>
+                </div>`;
+        }
 
         if (kind === 'freq') {
             const r = frequencyRows(stats).find(x => String(x.freq) === id);
@@ -646,15 +663,17 @@
     function SystemPanel({ sys, statsWindow, setStatsWindow, sideTab, setSideTab, errorsBy, setErrorsBy }) {
         const [stats, statsError] = useSystemStats(sys.sys_num, statsWindow);
         const [selection, setSelection] = useState(null); // 'freq:<hz>', 'tg:<id>' or 'unit:<id>'
+        // Clicking the selected row again returns the details panel to the whole system
+        const toggleSelection = key => setSelection(current => (current === key ? null : key));
         const name = sys.unique_sys_name;
         const conventional = isConventional(sys);
         const tabs = SIDE_TABS.filter(([key]) => key !== 'site' || !conventional);
         const tab = tabs.some(t => t[0] === sideTab) ? sideTab : 'channels';
 
         let main;
-        if (tab === 'channels') main = html`<${ChannelsView} stats=${stats} statsWindow=${statsWindow} setStatsWindow=${setStatsWindow} selection=${selection} select=${setSelection} />`;
-        else if (tab === 'talkgroups') main = html`<${TalkgroupsView} stats=${stats} statsWindow=${statsWindow} setStatsWindow=${setStatsWindow} selection=${selection} select=${setSelection} />`;
-        else if (tab === 'errors') main = html`<${ErrorsView} stats=${stats} statsWindow=${statsWindow} setStatsWindow=${setStatsWindow} selection=${selection} select=${setSelection} errorsBy=${errorsBy} setErrorsBy=${setErrorsBy} />`;
+        if (tab === 'channels') main = html`<${ChannelsView} stats=${stats} statsWindow=${statsWindow} setStatsWindow=${setStatsWindow} selection=${selection} select=${toggleSelection} />`;
+        else if (tab === 'talkgroups') main = html`<${TalkgroupsView} stats=${stats} statsWindow=${statsWindow} setStatsWindow=${setStatsWindow} selection=${selection} select=${toggleSelection} />`;
+        else if (tab === 'errors') main = html`<${ErrorsView} stats=${stats} statsWindow=${statsWindow} setStatsWindow=${setStatsWindow} selection=${selection} select=${toggleSelection} errorsBy=${errorsBy} setErrorsBy=${setErrorsBy} />`;
         else if (tab === 'site') main = html`<${SiteView} sys=${sys} />`;
         else main = html`<${ReferenceView} sys=${sys} kind=${tab.slice(4)} />`;
 

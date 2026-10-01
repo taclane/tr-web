@@ -168,10 +168,10 @@ Open `http://your-server:8080` (or `https://` with HTTPS configured).
   - **Top errors:** the talkgroups or radios with the most decoder errors
   - **Site:** system IDs, control channels and file names
   - the talkgroup list, unit tags and over-the-air aliases
-  - a details panel with hourly charts for the selected channel, talkgroup or radio
+  - a details panel with hourly calls and bit error rate for the system, or for the selected channel, talkgroup or radio
 - **Console:** Trunk Recorder's log, with ANSI colors and filtering
 - **Omnitrunker:** trunking messages (grants, affiliations, registrations)
-- **Affiliations:** units and talkgroups with their activity, and JSON export
+- **Affiliations:** units and talkgroups with their activity, and JSON export. Names follow Trunk Recorder's current unit tag or talkgroup alias (`unitTagsMode` decides between user tags and over-the-air aliases); a unit keeps its last name until a new one is found.
 - **Admin:** login history, config editor, restart
 
 ### Bit Error Rate
@@ -209,7 +209,7 @@ All `/api` endpoints return JSON. Endpoints that need a login accept the session
 | `/api/console` | GET | Console lines |
 | `/api/affiliations` | GET | Units and talkgroups. `view=units` or `talkgroups`, `since=<server_time>` for changes only, `limit=N`. |
 | `/api/system/stats?sys_num=N` | GET | Channel, talkgroup and radio statistics. `window=restart` (default), `24h`, `7d`, `30d` or `all`. |
-| `/api/system/history?sys_num=N` | GET | Hourly history. `kind=freq`, `talkgroup` or `unit`, `id=X`, `window` as above. |
+| `/api/system/history?sys_num=N` | GET | Hourly history. `kind=system`, or `freq`, `talkgroup` or `unit` with `id=X`; `window` as above. |
 | `/api/system/talkgroups?sys_num=N` | GET | Talkgroup list |
 | `/api/system/unit_tags?sys_num=N` | GET | Unit tags |
 | `/api/system/unit_tags_ota?sys_num=N` | GET | Over-the-air unit aliases |

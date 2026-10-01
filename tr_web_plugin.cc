@@ -1172,6 +1172,12 @@ public:
             return;
         }
 
+        // Current names from trunk-recorder (unitTagsMode decides user tags vs OTA aliases).
+        // An empty lookup keeps the stored name.
+        const std::string unit_alias = sys->find_unit_tag(unit_id);
+        Talkgroup *talkgroup = sys->find_talkgroup(tg_id);
+        const std::string tg_alias = talkgroup ? talkgroup->alpha_tag : "";
+
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
         time_t now = time(NULL);
 
@@ -1185,10 +1191,8 @@ public:
         unit.id = unit_id;
         unit.wacn = wacn;
         unit.sysid = sysid;
-        if (unit.alias.empty())
-        { // Only set alias if not already stored
-            unit.alias = sys->find_unit_tag(unit_id);
-        }
+        if (!unit_alias.empty())
+            unit.alias = unit_alias;
         unit.last_active = now;
         unit.registered = true; // Active transmission means registered
         unit.tx_count.voice++;  // Voice transmission
@@ -1203,11 +1207,8 @@ public:
         tg.id = tg_id;
         tg.wacn = wacn;
         tg.sysid = sysid;
-        if (tg.alias.empty())
-        { // Only set alias if not already stored
-            Talkgroup *talkgroup = sys->find_talkgroup(tg_id);
-            tg.alias = talkgroup ? talkgroup->alpha_tag : "";
-        }
+        if (!tg_alias.empty())
+            tg.alias = tg_alias;
         tg.last_active = now;
         tg.tx_count.voice++;  // Voice transmission
         tg.unit_activity[unit_id].voice++; // Track per-unit voice frequency
@@ -1228,6 +1229,11 @@ public:
             return;
         }
 
+        // Current names, as in update_affiliation_state()
+        const std::string unit_alias = sys->find_unit_tag(unit_id);
+        Talkgroup *talkgroup = sys->find_talkgroup(tg_id);
+        const std::string tg_alias = talkgroup ? talkgroup->alpha_tag : "";
+
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
         time_t now = time(NULL);
 
@@ -1241,10 +1247,8 @@ public:
         unit.id = unit_id;
         unit.wacn = wacn;
         unit.sysid = sysid;
-        if (unit.alias.empty())
-        {
-            unit.alias = sys->find_unit_tag(unit_id);
-        }
+        if (!unit_alias.empty())
+            unit.alias = unit_alias;
         unit.last_active = now;
         unit.registered = true; // Active means registered
         unit.tx_count.data++;  // Data transmission
@@ -1255,11 +1259,8 @@ public:
         tg.id = tg_id;
         tg.wacn = wacn;
         tg.sysid = sysid;
-        if (tg.alias.empty())
-        {
-            Talkgroup *talkgroup = sys->find_talkgroup(tg_id);
-            tg.alias = talkgroup ? talkgroup->alpha_tag : "";
-        }
+        if (!tg_alias.empty())
+            tg.alias = tg_alias;
         tg.last_active = now;
         tg.tx_count.data++;  // Data transmission
         tg.unit_activity[unit_id].data++; // Track per-unit data frequency
@@ -1275,6 +1276,9 @@ public:
             return;
         }
 
+        // Current names, as in update_affiliation_state()
+        const std::string unit_alias = sys->find_unit_tag(unit_id);
+
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
         time_t now = time(NULL);
 
@@ -1286,10 +1290,8 @@ public:
         unit.id = unit_id;
         unit.wacn = wacn;
         unit.sysid = sysid;
-        if (unit.alias.empty())
-        {
-            unit.alias = sys->find_unit_tag(unit_id);
-        }
+        if (!unit_alias.empty())
+            unit.alias = unit_alias;
         unit.last_active = now;
         unit.registered = registered;
 
@@ -1306,6 +1308,9 @@ public:
             return;
         }
 
+        // Current names, as in update_affiliation_state()
+        const std::string unit_alias = sys->find_unit_tag(unit_id);
+
         std::lock_guard<std::mutex> lock(affiliation_state_mutex_);
         time_t now = time(NULL);
 
@@ -1317,10 +1322,8 @@ public:
         unit.id = unit_id;
         unit.wacn = wacn;
         unit.sysid = sysid;
-        if (unit.alias.empty())
-        {
-            unit.alias = sys->find_unit_tag(unit_id);
-        }
+        if (!unit_alias.empty())
+            unit.alias = unit_alias;
         unit.last_active = now;
         // Note: Don't change registration status - only explicit reg/dereg messages do that
         if (encrypted)
@@ -4594,7 +4597,8 @@ private:
         return system_stats_json(sys->get_sys_num(), stats, since, window, top_talkgroups, &totals);
     }
 
-    // Hourly history of one frequency, talkgroup or radio; first_hour 0 means all time
+    // Hourly history of the whole system or one frequency, talkgroup or radio; first_hour 0
+    // means all time
     json get_system_history(System *sys, const std::string &kind, int64_t id, int64_t first_hour)
     {
         const std::string name = db_system_key(sys->get_sys_num());
@@ -4610,6 +4614,18 @@ private:
                 hours.push_back({{"hour", q.col_int(0)}, {"calls", q.col_int(1)}, {"seconds", q.col_double(2)},
                                  {"errors", q.col_int(3)}, {"encrypted", q.col_int(4)}, {"emergency", q.col_int(5)},
                                  {"voice_bits", q.col_double(6)}});
+            }
+        }
+        else if (kind == "system")
+        {
+            auto q = db_read_->prepare(R"SQL(
+                SELECT hour, SUM(calls), SUM(seconds), SUM(errors), SUM(voice_bits) FROM frequency_hours
+                WHERE system = ?1 AND hour >= ?2 GROUP BY hour ORDER BY hour)SQL");
+            q.bind(1, name).bind(2, first_hour);
+            while (q.ok() && q.step() == SQLITE_ROW)
+            {
+                hours.push_back({{"hour", q.col_int(0)}, {"calls", q.col_int(1)}, {"seconds", q.col_double(2)},
+                                 {"errors", q.col_int(3)}, {"voice_bits", q.col_double(4)}});
             }
         }
         else if (kind == "unit")
@@ -5163,7 +5179,7 @@ private:
                     { serve_system_snapshot(req, res, unit_tags_json_); });
         server_.Get("/api/system/unit_tags_ota", [this](const httplib::Request &req, httplib::Response &res)
                     { serve_system_snapshot(req, res, ota_json_); });
-        // Hourly history of one frequency, talkgroup or radio: ?sys_num=N&kind=freq|talkgroup|unit&id=X&window=...
+        // Hourly history: ?sys_num=N&kind=system|freq|talkgroup|unit&id=X&window=...
         server_.Get("/api/system/history", [this](const httplib::Request &req, httplib::Response &res)
                     {
       if (!require_auth(req, res)) return;
@@ -5176,17 +5192,19 @@ private:
       }
       std::string kind = req.params.count("kind") ? req.params.at("kind") : "";
       int64_t id = 0;
-      try {
-        size_t used = 0;
-        const std::string &raw = req.params.at("id");
-        id = std::stoll(raw, &used);
-        if (used != raw.size()) throw std::invalid_argument("id");
-      } catch (...) {
-        kind.clear();
+      if (kind != "system") {
+        try {
+          size_t used = 0;
+          const std::string &raw = req.params.at("id");
+          id = std::stoll(raw, &used);
+          if (used != raw.size()) throw std::invalid_argument("id");
+        } catch (...) {
+          kind.clear();
+        }
       }
-      if (kind != "freq" && kind != "talkgroup" && kind != "unit") {
+      if (kind != "system" && kind != "freq" && kind != "talkgroup" && kind != "unit") {
         res.status = 400;
-        res.set_content("{\"error\": \"kind must be freq, talkgroup or unit, with a numeric id\"}", "application/json");
+        res.set_content("{\"error\": \"kind must be system, or freq, talkgroup or unit with a numeric id\"}", "application/json");
         return;
       }
       static const std::map<std::string, int> window_hours = {{"24h", 24}, {"7d", 7 * 24}, {"30d", 30 * 24}, {"all", 0}};
